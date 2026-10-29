@@ -1,17 +1,29 @@
 [project]
 name = "taosc-llm"
 version = "0.1.0"
-description = "Add your description here"
+description = "Build manual generic binary guards from prepared Taosc metadata"
 readme = "README.md"
 authors = [
     { name = "hsh814", email = "shhan@unist.ac.kr" }
 ]
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["binradar>=0.2.0"]
 
 [project.scripts]
-taosc-llm = "taosc_llm:main"
+taosc-llm = "taosc_llm.cli:main"
 
 [build-system]
-requires = ["uv_build>=0.13.5,<0.14.0"]
-build-backend = "uv_build"
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+taosc_llm = ["runtime.c"]
+
+[tool.uv.sources]
+binradar = { path = "../..", editable = true }
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

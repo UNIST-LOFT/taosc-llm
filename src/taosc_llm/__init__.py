@@ -1,2 +1,1 @@
-def main() -> None:
-    print("Hello from taosc-llm!")
+"""Manual generic binary guards built from prepared Taosc metadata."""
