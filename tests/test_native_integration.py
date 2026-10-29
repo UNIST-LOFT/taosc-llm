@@ -1,5 +1,6 @@
 """Real E9 proof on a harmless return-code fixture, not a vulnerable benchmark."""
 
+import asyncio
 import hashlib
 import json
 import os
@@ -10,6 +11,10 @@ from pathlib import Path
 import pytest
 from elftools.elf.elffile import ELFFile
 from taosc_llm.builder import generate_patch
+from taosc_llm.context import prepare_context
+from taosc_llm.fixture import prepare_fixture
+from taosc_llm.native import run_native
+from taosc_llm.synthesis import _build
 
 ASSEMBLY = """\
 .text
@@ -123,3 +128,18 @@ def test_real_fixed_and_selected_patch_semantics(tmp_path, link_mode):
         assert returncode(selected, argument_count, "1") == repaired
 
     assert original.read_bytes() == original_bytes
+
+
+def test_fresh_build_worker_preserves_runtime_dependency_closure(tmp_path):
+    require_native_tools()
+    prepared = prepare_fixture(tmp_path / "caller")
+    context = prepare_context(prepared["config"], prepared["workdir"], prepared["context"])
+    built = asyncio.run(_build(context, {"jump_if": "rax <= 0"}, tmp_path / "candidate"))
+    scratch = tmp_path / "execution"
+    scratch.mkdir()
+    fixed = built["artifacts"]["fixture.patched"]
+    # This crosses the fresh Python process and real native build boundaries.
+    # Guix must resolve dependencies outside the interpreter's own site-packages.
+    for value, expected in (("-1", 23), ("1", 17)):
+        result = run_native([fixed, value], scratch, timeout=5, check=False)
+        assert result.returncode == expected

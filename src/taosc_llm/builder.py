@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from contextlib import redirect_stdout
 from importlib.resources import files
 from pathlib import Path
@@ -55,13 +56,14 @@ def _run(command: list[str], stage: Path) -> None:
 
 
 def _instrument(stage: Path, binary: str, suffix: str,
-                location: int, action: str) -> None:
+                location: int, action: str,
+                run: Callable[[list[str], Path], None]) -> None:
     original = stage / f"{binary}.orig"
     output = stage / f"{binary}.{suffix}"
     metadata = Path(f"{output}.json")
     spec = predicates.InstrumentationSpec(((f"0x{location:x}", action),))
-    _run(predicates.e9tool_command(spec, metadata, original, fmt="json"), stage)
-    _run(predicates.e9tool_command(spec, output, original), stage)
+    run(predicates.e9tool_command(spec, metadata, original, fmt="json"), stage)
+    run(predicates.e9tool_command(spec, output, original), stage)
     # Sidecars are extracted from this exact binary/JSON pair, never copied
     # between the fixed and selector-based artifacts.
     with redirect_stdout(sys.stderr):
@@ -69,13 +71,16 @@ def _instrument(stage: Path, binary: str, suffix: str,
             output, metadata, original, location)
 
 
-def generate_patch(config: Path, workdir: Path, predicate: str) -> dict[str, object]:
+def generate_patch(config: Path, workdir: Path, predicate: str, *,
+                   native_runner: Callable[[list[str], Path], None] | None = None
+                   ) -> dict[str, object]:
     """Compile ``if (predicate != 0) goto destination`` at a prepared location.
 
     Existing candidates are replaced only after both builds and metadata checks
     succeed. No target executions or correctness verdicts occur here. A caller
     must not build concurrently with another producer/verifier in this workdir.
     """
+    run = native_runner if native_runner is not None else _run
     config = Path(config).resolve(strict=True)
     workdir = Path(workdir).resolve(strict=True)
     if not workdir.is_dir():
@@ -136,12 +141,12 @@ def generate_patch(config: Path, workdir: Path, predicate: str) -> dict[str, obj
         (stage / "taosc-llm-selector.c").write_text(
             '#include "predicate.h"\n#include "brpatch.c"\n', encoding="utf-8")
         compiler = paths.e9compile()
-        _run([compiler, "taosc-llm-selector.c"], stage)
+        run([compiler, "taosc-llm-selector.c"], stage)
         _instrument(stage, binary, "brpatched", location,
-                    "if dest(state)@taosc-llm-selector goto")
-        _run([compiler, "taosc-llm-runtime.c"], stage)
+                    "if dest(state)@taosc-llm-selector goto", run)
+        run([compiler, "taosc-llm-runtime.c"], stage)
         _instrument(stage, binary, "patched", location,
-                    "if llm_dest(state)@taosc-llm-runtime goto")
+                    "if llm_dest(state)@taosc-llm-runtime goto", run)
         # Check the complete set before publishing, including the exact E9 maps.
         for name in names:
             if not (stage / name).is_file():

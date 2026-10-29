@@ -1,0 +1,14 @@
+{
+  "name": "taosc-llm-pi-sdk",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pinned SDK dependency closure for the taosc-llm adapter",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0"
+  }
+}
