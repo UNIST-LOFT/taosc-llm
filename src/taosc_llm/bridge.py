@@ -150,11 +150,19 @@ async def run_adapter(context: SynthesisContext, provider: ProviderConfig,
                 if len(seen) > provider.max_tool_calls:
                     raise AdapterError("adapter tool limit exceeded")
                 record("adapter", frame)
-                result = context.call_tool(frame["tool"], frame["arguments"])
+                # One host tool at a time. Cancellation does not abandon a native
+                # worker: drain it before releasing the provider reservation; the
+                # evaluator owns bounded process-group execution and worker limits.
+                task = asyncio.create_task(asyncio.to_thread(context.call_tool, frame["tool"], frame["arguments"]))
+                try:
+                    result = await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    await task
+                    raise
                 if result.get("ok"):
-                    if frame["tool"] == "check_predicate" and result.get("valid_syntax"):
-                        checked.add(frame["arguments"]["jump_if"])
-                    elif frame["tool"] != "check_predicate":
+                    if frame["tool"] in ("evaluate_predicate", "test_candidate") and result.get("valid_syntax"):
+                        checked.add(frame["arguments"]["predicate"])
+                    elif frame["tool"] not in ("evaluate_predicate", "test_candidate", "get_candidate_result"):
                         inspected = True
                 await send({**envelope, "type": "tool_result", "request_id": frame["request_id"], "result": result})
 

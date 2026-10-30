@@ -1,4 +1,4 @@
-"""Build one manual generic predicate; discovering or verifying it is separate."""
+"""Build one validated ERM candidate; discovering or verifying it is separate."""
 
 from __future__ import annotations
 
@@ -18,6 +18,8 @@ from elftools.elf.elffile import ELFFile
 
 import binradar.binradar_taosc_predicates as predicates
 from binradar import binradar_setup, paths
+
+from .family import parse_candidate
 
 
 def _address(path: Path) -> int:
@@ -57,11 +59,16 @@ def _run(command: list[str], stage: Path) -> None:
 
 def _instrument(stage: Path, binary: str, suffix: str,
                 location: int, action: str,
-                run: Callable[[list[str], Path], None]) -> None:
+                run: Callable[[list[str], Path], None], *,
+                allocator: predicates.AllocatorTrace | None = None,
+                plugin: str) -> None:
     original = stage / f"{binary}.orig"
     output = stage / f"{binary}.{suffix}"
     metadata = Path(f"{output}.json")
-    spec = predicates.InstrumentationSpec(((f"0x{location:x}", action),))
+    spec = (predicates.build_instrumentation_spec(
+        allocator, f"0x{location:x}", action, plugin_name=plugin)
+        if allocator is not None else
+        predicates.InstrumentationSpec(((f"0x{location:x}", action),)))
     run(predicates.e9tool_command(spec, metadata, original, fmt="json"), stage)
     run(predicates.e9tool_command(spec, output, original), stage)
     # Sidecars are extracted from this exact binary/JSON pair, never copied
@@ -74,7 +81,7 @@ def _instrument(stage: Path, binary: str, suffix: str,
 def generate_patch(config: Path, workdir: Path, predicate: str, *,
                    native_runner: Callable[[list[str], Path], None] | None = None
                    ) -> dict[str, object]:
-    """Compile ``if (predicate != 0) goto destination`` at a prepared location.
+    """Compile a family-typed repair predicate at a prepared location.
 
     Existing candidates are replaced only after both builds and metadata checks
     succeed. No target executions or correctness verdicts occur here. A caller
@@ -89,19 +96,28 @@ def generate_patch(config: Path, workdir: Path, predicate: str, *,
     binary = env.get("BINARY", "")
     if not binary or Path(binary).name != binary or binary in (".", ".."):
         raise ValueError(f"{config}: BINARY must be a nonempty executable basename")
-    format_file = workdir / "patch-format"
-    if format_file.exists() and format_file.read_text(encoding="utf-8").strip() != "ERM generic":
-        raise ValueError("only ERM generic is supported; prepare a separate generic workdir")
+    patch_format = (workdir / "patch-format").read_text(encoding="utf-8").strip()
+    candidate = parse_candidate(patch_format, predicate)
     location = _address(workdir / "patch-location")
     destination = _address(workdir / "patch-destination")
     original = workdir / f"{binary}.orig"
-    # Whitespace is insignificant in the expression grammar. Keep the persisted
-    # candidate on one physical line, as required by Taosc/BinRadar readers.
-    jump_if = " ".join(predicate.split())
-    predicates.predicate_to_patch_str(jump_if)
-    safe_predicate = f"({jump_if}) == 0"
-    branch = predicates.predicate_to_branch_patch_str(safe_predicate)
     _check_original(original, location, destination)
+    allocator = None
+    if candidate.family == predicates.PredicateFamily.CWE805_ERM:
+        allocator = predicates.parse_allocator_trace(workdir / "trace")
+        if allocator is None:
+            raise ValueError("ERM CWE-805 requires a complete allocator trace")
+        stack_text = (workdir / "stack-size").read_text(encoding="utf-8").strip()
+        if not re.fullmatch(r"[0-9]+", stack_text) or not 0 <= int(stack_text) <= 1048576:
+            raise ValueError("stack-size must be decimal bytes in 0..1048576")
+        if candidate.required_stack_bytes > int(stack_text):
+            raise ValueError("candidate stack cell exceeds prepared stack-size")
+        for _, address in allocator.calls:
+            _check_original(original, int(address, 16), destination)
+        for address in allocator.returns:
+            _check_original(original, int(address, 16), destination)
+    safe_predicate = candidate.source_predicate
+    branch = candidate.descriptor
     if not paths.BRPATCH_SOURCE.is_file():
         raise FileNotFoundError(
             f"BinRadar native runtime missing: {paths.BRPATCH_SOURCE}; "
@@ -120,7 +136,7 @@ def generate_patch(config: Path, workdir: Path, predicate: str, *,
         stage = Path(temporary)
         shutil.copy2(original, stage / original.name)
         shutil.copyfile(paths.BRPATCH_SOURCE, stage / "brpatch.c")
-        (stage / "patch-format").write_text("ERM generic\n", encoding="utf-8")
+        (stage / "patch-format").write_text(patch_format + "\n", encoding="utf-8")
         (stage / "predicates").write_text(safe_predicate + "\n", encoding="utf-8")
         # This table is deliberately just one validated candidate plus id0.
         # No source expression is interpolated into C.
@@ -128,10 +144,9 @@ def generate_patch(config: Path, workdir: Path, predicate: str, *,
             f"case 1: return {json.dumps(branch)};\ndefault: return \"p0\";\n",
             encoding="utf-8")
         predicates.write_runtime_predicates(
-            stage / "brpatches.json", predicates.PredicateFamily.GENERIC_ERM,
-            [predicates.PredicateRecord(1, 1, safe_predicate, branch)])
+            stage / "brpatches.json", candidate.family,
+            [predicates.PredicateRecord(1, 1, safe_predicate, candidate.parsed)])
         (stage / "predicate.h").write_text(
-            f"#define TAOSC_LLM_BRANCH {json.dumps(branch)}\n"
             # STATE.rip is the matching instruction's runtime address. A static
             # ELF destination alone is not a valid process address for PIE.
             f"#define TAOSC_DEST ((uintptr_t)state->rip + 0x{destination:x} - 0x{location:x})\n",
@@ -141,12 +156,16 @@ def generate_patch(config: Path, workdir: Path, predicate: str, *,
         (stage / "taosc-llm-selector.c").write_text(
             '#include "predicate.h"\n#include "brpatch.c"\n', encoding="utf-8")
         compiler = paths.e9compile()
-        run([compiler, "taosc-llm-selector.c"], stage)
+        defines = ([] if allocator is None else
+                   ["-DBRPATCH_CWE805", f"-DBRPATCH_ALLOC_{allocator.kind.upper()}"])
+        run([compiler, "taosc-llm-selector.c", *defines], stage)
         _instrument(stage, binary, "brpatched", location,
-                    "if dest(state)@taosc-llm-selector goto", run)
-        run([compiler, "taosc-llm-runtime.c"], stage)
+                    "if dest(state)@taosc-llm-selector goto", run,
+                    allocator=allocator, plugin="taosc-llm-selector")
+        run([compiler, "taosc-llm-runtime.c", *defines], stage)
         _instrument(stage, binary, "patched", location,
-                    "if llm_dest(state)@taosc-llm-runtime goto", run)
+                    "if llm_dest(state)@taosc-llm-runtime goto", run,
+                    allocator=allocator, plugin="taosc-llm-runtime")
         # Check the complete set before publishing, including the exact E9 maps.
         for name in names:
             if not (stage / name).is_file():
@@ -160,7 +179,12 @@ def generate_patch(config: Path, workdir: Path, predicate: str, *,
         "binary": binary,
         "patch_location": f"0x{location:x}",
         "patch_destination": f"0x{destination:x}",
-        "jump_if": jump_if,
+        "predicate": candidate.expression,
+        "source_predicate": candidate.source_predicate,
+        "descriptor": candidate.descriptor,
+        "patch_format": patch_format,
+        "family": candidate.family.value,
+        "required_stack_bytes": candidate.required_stack_bytes,
         "artifacts": {name: str(workdir / name) for name in names},
         "binradar_activation": {"PATCH_ID": "1"},
     }

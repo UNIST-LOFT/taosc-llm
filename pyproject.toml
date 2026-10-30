@@ -1,7 +1,7 @@
 [project]
 name = "taosc-llm"
 version = "0.1.0"
-description = "Synthesize and build generic binary guards from prepared Taosc metadata"
+description = "Prepare, evaluate and refine ERM binary guards with isolated Pi sessions"
 readme = "README.md"
 authors = [
     { name = "hsh814", email = "shhan@unist.ac.kr" }
@@ -11,6 +11,8 @@ dependencies = ["binradar>=0.2.0"]
 
 [project.scripts]
 taosc-llm = "taosc_llm.cli:main"
+taosc-llm-setup = "taosc_llm.cli:setup_main"
+taosc-llm-evaluate = "taosc_llm.cli:evaluate_main"
 taosc-llm-fixture = "taosc_llm.fixture:main"
 
 [build-system]

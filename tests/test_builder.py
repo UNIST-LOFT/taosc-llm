@@ -48,6 +48,9 @@ def snapshot(workdir: Path) -> dict[str, bytes]:
     "invalid",
     [
         "unsupported_family",
+        "missing_format",
+        "zero_destination",
+        "missing_allocator",
         "missing_location",
         "malformed_destination",
         "empty_location",
@@ -60,7 +63,14 @@ def test_invalid_inputs_preserve_previous_artifacts(tmp_path, monkeypatch, inval
     config, workdir = prepared_workdir(tmp_path)
     guard = "rax <= 0"
     if invalid == "unsupported_family":
+        (workdir / "patch-format").write_text("Single CWE-805\n")
+    elif invalid == "missing_format":
+        (workdir / "patch-format").unlink()
+    elif invalid == "zero_destination":
+        (workdir / "patch-destination").write_text("0\n")
+    elif invalid == "missing_allocator":
         (workdir / "patch-format").write_text("ERM CWE-805\n")
+        guard = "1 * s->rax < i->end - i->begin"
     elif invalid == "missing_location":
         (workdir / "patch-location").unlink()
     elif invalid == "malformed_destination":
@@ -85,6 +95,28 @@ def test_invalid_inputs_preserve_previous_artifacts(tmp_path, monkeypatch, inval
 
     assert snapshot(workdir) == before
     assert config.read_bytes() == config_before
+
+
+@pytest.mark.parametrize("stack_size", ["7", "-1", "1048577", "unknown"])
+def test_cwe805_stack_bounds_preserve_previous_artifacts(tmp_path, stack_size):
+    config, workdir = prepared_workdir(tmp_path)
+    (workdir / "patch-format").write_text("ERM CWE-805\n")
+    (workdir / "stack-size").write_text(stack_size + "\n")
+    trace = workdir / "trace"
+    trace.mkdir()
+    address = (workdir / "patch-location").read_text().strip().removeprefix("0x")
+    (trace / "malloc.calls").write_text(f"0 {address}\n1 {address}\n")
+    (trace / "malloc.returns").write_text(address + "\n")
+    before = snapshot(workdir)
+
+    def forbidden_runner(command, stage):
+        pytest.fail("invalid stack access must be rejected before native work")
+
+    with pytest.raises(ValueError):
+        generate_patch(config, workdir,
+                       "1 * ((uint32_t *)s->rsp)[1] < i->end - i->begin",
+                       native_runner=forbidden_runner)
+    assert snapshot(workdir) == before
 
 
 def test_native_failure_preserves_previous_artifacts(tmp_path, monkeypatch):

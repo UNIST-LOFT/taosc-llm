@@ -48,7 +48,7 @@ def test_nonsecret_override_precedence(tmp_path):
     "export OPENAI_API_KEY=secret-value\n", "TAOSC_LLM_WORKERS=0\n",
     "TAOSC_LLM_MAX_IN_FLIGHT=0\n", "TAOSC_LLM_MAX_IN_FLIGHT=4\n",
     "TAOSC_LLM_MAX_IN_FLIGHT=-1\n", "TAOSC_LLM_WORKERS=inf\n",
-    "TAOSC_LLM_TIMEOUT_SECONDS=1.5\n", "TAOSC_LLM_MAX_TOKENS=40000\n",
+    "TAOSC_LLM_TIMEOUT_SECONDS=1.5\n",
 ])
 def test_invalid_fields_do_not_echo_values(tmp_path, extra):
     with pytest.raises(ProviderConfigError) as error:
@@ -77,6 +77,18 @@ def test_placeholders_and_shell_substitutions_rejected(tmp_path, value):
 def test_unsupported_routing_and_invalid_overrides(tmp_path, overrides):
     with pytest.raises(ProviderConfigError):
         load_provider(provider_file(tmp_path), **overrides)
+
+
+@pytest.mark.parametrize("output_tokens", [64000, 64001])
+def test_output_budget_respects_explicit_context(tmp_path, output_tokens):
+    path = provider_file(tmp_path, "TAOSC_LLM_CONTEXT_WINDOW=64000\n"
+                         f"TAOSC_LLM_MAX_TOKENS={output_tokens}\n")
+    if output_tokens > 64000:
+        with pytest.raises(ProviderConfigError):
+            load_provider(path)
+    else:
+        config = load_provider(path)
+        assert config.max_tokens == config.context_window == 64000
 
 
 def test_no_ambient_fallback_for_missing_credentials(tmp_path, monkeypatch):

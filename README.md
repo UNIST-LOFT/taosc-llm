@@ -1,224 +1,246 @@
 # taosc-llm
 
-Synthesize one generic binary guard with an isolated Pi SDK session, or build a
-manually supplied predicate. The live path uses an explicitly selected provider
-file and caller-prepared evidence; it is **not a BinRadar evidence importer or
-repair verifier**. Existing Taosc scripts do not yet invoke this package.
+Prepare immutable BinRadar evidence, evaluate an ERM predicate, and build a manual
+or isolated Pi-driven candidate. Only explicit `ERM generic` and `ERM CWE-805`
+families are supported. This is a standalone backend: existing `taosc-fix` and
+`taosc-refine` orchestration is unchanged. Candidate evaluation is rejection-only,
+not final BinRadar verification or proof of repair.
 
-## Live harmless fixture
+## Setup: import explicit producer runs
 
-From the repository root, prepare the pinned development SDK once (Node >=22.19):
+```sh
+uv run --project utils/taosc-llm taosc-llm-setup \
+  --config /path/to/config.env --workdir /path/to/prepared-workdir \
+  --concrete-run /path/to/concrete-run \
+  --output /path/to/new-dataset --rea /path/to/rea
+```
+
+Optionally add `--mutation-run /path/to/mutation-run` for committed patch-zero
+mutation evidence. Setup does not call an LLM or generate fresh mutation tests.
+`--analysis-provider` defaults to `ghidra`; REA/Ghidra are local static analysis
+backends, not model-accessible services. Setup freezes function, instruction,
+decompilation and reference views with availability/provenance records.
+
+Required workdir inputs:
+
+```text
+<BINARY>.orig                  little-endian x86-64 ELF
+<BINARY>.brcached               existing cached-state executable
+<BINARY>.brcached.json          its E9 command stream
+<BINARY>.brcached.e9map.json     exact artifact/original-bound instruction map
+brpatches.json
+patch-format                   exactly ERM generic or ERM CWE-805
+patch-location                 one nonzero hexadecimal ELF virtual address
+patch-destination              one selected nonzero hexadecimal ELF virtual address
+generate-concrete.env
+```
+
+`config.env` is loaded as data, not executed. It must supply `BINARY` and an
+invocation/POC consistent with generation metadata; the POC must resolve locally.
+Address files accept an optional `0x` prefix and must identify executable,
+file-backed original ELF ranges. The caller owns instruction boundaries and
+handler/frame compatibility. CWE-805 additionally requires complete allocator
+traces under `trace/` and `stack-size`. Mutation import also requires
+`generate-binradar.env` and artifact-bound capture context plus committed evidence.
+
+The concrete run supplies `minimizer.sbsv` original-only baseline v1 observations
+and matching hashed inputs under `minimized/`; incomplete or replaced producer
+rows are not admitted. Optional `probe-results.sbsv` supplies original reference
+observations. Do not invent runtime states or substitute caller-written evidence
+JSON. See the [evidence contract](../../agent-docs/taosc-llm/PROMPTS_AND_EVIDENCE.md)
+for capture identities and the system/function domain distinction.
+
+Setup publishes a schema-2 dataset containing `manifest.json`, `cases.jsonl`,
+frozen workdir artifacts, input bytes, source records and static analysis. A new
+explicit output directory is required; existing revisions are not overwritten.
+Without `--output`, revisions live under `workdir/taosc-llm-datasets/<dataset-id>`.
+Later commands accept either the dataset directory or its `manifest.json`.
+
+## Evaluate, warm, and offline operation
+
+```sh
+uv run --project utils/taosc-llm taosc-llm-evaluate \
+  --dataset /path/to/new-dataset --warm --workers 4
+uv run --project utils/taosc-llm taosc-llm-evaluate \
+  --dataset /path/to/new-dataset --predicate 'rax <= 0' --workers 4
+uv run --project utils/taosc-llm taosc-llm-evaluate \
+  --dataset /path/to/new-dataset --predicate 'rax <= 0' --offline
+```
+
+`--warm` collects neutral `p0` concrete observations, including empty-manifest
+cases; it does not test a repair. It cannot be combined with `--offline` or
+`--case`. For predicate evaluation, repeat `--case system:ID` or
+`--case function:ID` to select prepared cases. `--cache-dir` selects private
+host-owned cache storage; the default is `~/.cache/taosc-llm`. Producer files are
+never modified.
+
+Reuse requires a complete, identity-bound capture, a valid evaluator mirror of
+its recorded descriptor, and an **equal full ordered branch vector** for the
+candidate. Missing, incomplete, mismatched or divergent concrete captures trigger
+candidate execution unless `--offline` is set. Each host worker owns copied
+artifacts, input, environment, cwd and runner. Offline missing/divergent evidence
+is `unavailable`, not an inferred successful execution. Mutation/function cases
+are always **OFFLINE, rejection-only**: no fresh mutation phase is run. A same-
+crash observation can reject a candidate; changed branches cannot establish its
+new outcome. Predicate traps (branch 2), missing stacks and missing oracle data
+are unavailable, never repair success.
+
+Concrete workers are bounded to 1–32 (`--workers` here, `--execution-workers` in
+synthesis). They are separate from provider session workers and the provider cap.
+A supplied PIE `.brcached` cannot currently execute a nonneutral descriptor:
+literal-destination relocation is unproven, so that path explicitly reports
+`unavailable`. This is distinct from the fixed/selectable builder's PIE support.
+
+## Manual and Pi synthesis
+
+```sh
+uv run --project utils/taosc-llm taosc-llm \
+  --dataset /path/to/new-dataset --predicate 'rax <= 0' \
+  --output /path/to/manual-runs --execution-workers 4
+uv run --project utils/taosc-llm taosc-llm \
+  --dataset /path/to/new-dataset --provider-env /absolute/path/to/provider.env \
+  --pi-sdk-root utils/taosc-llm/thirdparty/pi \
+  --output /path/to/model-runs --execution-workers 4 --max-rounds 4
+```
+
+`python -m taosc_llm` is the synthesis CLI. Manual mode loads no provider and
+makes no model request; it uses the same mandatory native isolation and
+candidate-owned outputs as model mode. There is no manual unsandboxed CLI switch.
+Both paths build and evaluate the family-specific candidate. Generic predicates
+are signed-i64 register expressions: **nonzero means jump to the selected repair
+destination**. The builder lowers the safe condition `(expression) == 0` through
+BinRadar's parser, never interpolating model text as C. CWE-805 instead accepts
+the existing closed pointer/size safe-clamp grammar; it is not generic C or an
+arbitrary memory-expression interface. Inspect the dataset's family grammar.
+
+Pi SDK 1.4.0 receives exactly seven restricted host tools:
+`get_patch_context`, `get_function_analysis`, `list_cases`, `get_case`,
+`evaluate_predicate`, `test_candidate`, and `get_candidate_result`.
+`evaluate_predicate` is offline; `test_candidate` requests bounded host-controlled
+concrete evaluation. No shell, arbitrary file access, debugger, built-in tools,
+extensions, MCP, REA invocation or subagents are exposed. REA views were frozen at
+setup. Candidate proposals require context inspection and evaluation of the exact
+expression. Strict response parsing, native builds and actual evaluation feedback
+feed bounded refinement rounds (`--max-rounds` 1–16, default 4, provider-only);
+manual mode rejects provider options instead of ignoring them. Abstention stops
+without a candidate. No final BinRadar verification is run.
+
+Provider routing, credential-file syntax, isolated SDK setup, the unchanged
+Ollama cap of three, session `--workers`, nonsecret overrides and durable quota
+recovery are specified in [PROVIDER_AND_PI.md](../../agent-docs/taosc-llm/PROVIDER_AND_PI.md).
+Use an explicit provider file; no home credentials, ambient provider defaults or
+fallback models are discovered. Guix supplies its SDK root automatically.
+
+### Results and artifacts
+
+Stdout contains one JSON result; diagnostics go to stderr. Common CLI exits:
+
+| Exit | Meaning |
+|---|---|
+| 0 | `prepared`, `built`, `abstained`, `not_rejected` (or `warmed` if returned); not repair success |
+| 2 | `reject_same_crash` |
+| 3 | `unavailable` |
+| 1 | Other terminal failure, including exhausted refinement or infrastructure/parser/build error |
+| 130 | Interrupted; unresolved provider operations remain quarantined |
+
+`--warm` currently returns the ordinary evaluation status, not a guaranteed
+`warmed` status. Rejection takes precedence over unavailable cases; absent any
+rejection, any unavailable case (or no cases) makes the aggregate unavailable.
+`not_rejected` only means admitted observations did not reject this candidate.
+`unavailable` is not evidence of improvement. Synthesis results retain
+`verified=false` and `binradar_verification=not_run` even when a build exists.
+
+Synthesis uses a private context/run root (temporary by default, or `--output`).
+Model runs contain `run.json`, `context.json`, `trials/<round>/` journals/final text,
+and `candidates/<round>/build-workdir/`, `build-result.json`, `evaluation.json`.
+Manual runs place `build-workdir/` and `run.json` in their own unique run directory.
+Source workdir candidate outputs are not overwritten.
+
+| Built artifact | Meaning |
+|---|---|
+| `<BINARY>.patched` | Fixed candidate; independent of `PATCH_ID` |
+| `<BINARY>.brpatched` | Unset/0 selects original; 1 selects candidate |
+| `<BINARY>.{patched,brpatched}.json` | Separate E9 command streams |
+| `<BINARY>.{patched,brpatched}.e9map.json` | Exact binary-bound relocation metadata |
+| `patch-format`, `predicates`, `brpatches.json`, native inputs | Family, lowered safe condition, descriptor and build sources |
+
+Consume a complete result and matching artifact hashes, not partial files.
+The low-level builder publishes per-file, not as an atomic directory transaction;
+do not share a candidate directory with another build/verifier. Fixed/selectable
+PIE support does not prove subsequent ordinary BinRadar literal-destination
+rebuilds are PIE-compatible.
+
+```python
+from pathlib import Path
+from taosc_llm.preparation import prepare_dataset
+from taosc_llm.evaluation import evaluate_dataset, warm_dataset
+from taosc_llm.synthesis import generate_manual, generate_with_pi
+
+dataset = prepare_dataset(Path("config.env"), Path("workdir"),
+                          Path("concrete-run"), None,
+                          output=Path("new-dataset"), rea="/path/to/rea")
+neutral = warm_dataset(dataset, workers=4)
+checked = evaluate_dataset(dataset, "rax <= 0", workers=4, execute=False)
+manual = generate_manual(dataset.root, "rax <= 0", execution_workers=4)
+proposed = generate_with_pi(dataset.root, Path("provider.env"),
+                           sdk_root=Path("utils/taosc-llm/thirdparty/pi"),
+                           execution_workers=4, max_rounds=4)
+```
+
+## Native isolation and harmless fixture
+
+Native builds and execution require Linux x86-64 Landlock + seccomp, private
+writable scratch, bounded resources and no networking. Isolation failure is
+fatal: no unsandboxed fallback. Credentials use a separate inherited pipe to
+Node and are absent from prompts, protocol journals, argv and native environments.
+QASAN admits only its own `/proc/PID/maps` and `/proc/sys/vm/mmap_min_addr`;
+`environ`, `mem`, other proc entries and private files remain denied. System trees
+remain readable; Landlock ABI 1 does not hide all path metadata. This is not a VM.
+
+For checkout development install the pinned SDK once (Node >=22.19):
 
 ```sh
 npm --prefix utils/taosc-llm/thirdparty/pi ci --ignore-scripts --no-audit --no-fund
 uv run --project utils/taosc-llm taosc-llm-fixture \
-  --directory /tmp/taosc-llm-example \
-  --provider-env utils/taosc-llm/.env \
-  --pi-sdk-root utils/taosc-llm/thirdparty/pi
+  --directory /tmp/taosc-llm-example --rea /path/to/rea
 ```
 
-The directory must not exist. Omit `--provider-env` to prepare inputs without a
-model request. Add `--pie` to exercise PIE. The fixture has no vulnerability:
-a signed input <=0 must return 23; positive inputs must return 17. Register data
-is explicitly source-derived, not an authenticated runtime snapshot. Six ordinary
-boundary inputs are held out from the model. The host checks original, fixed,
-fixed-with-selector, and selectable unset/0/1 behavior: 54 executions per run.
-`fixture_verification.status=passed` applies only to these cases; top-level
-`verified=false` and `binradar_verification=not_run` remain unchanged.
+The directory must not exist. Add `--provider-env /absolute/path/to/provider.env`
+and `--pi-sdk-root utils/taosc-llm/thirdparty/pi` to opt into a real model request
+and finite fixture replay. Add `--pie` for the PIE fixture, subject to the cached
+execution limitation above. The fixed source has an **intentional abort**, not a
+vulnerability: original signed inputs <=0 abort, positives return 17; the fixture
+repair route returns 23. It produces real original observations and a schema-2
+dataset, not asserted register JSON. Development values are -7, 0 and 5; six
+signed boundary inputs remain held out from the model. Replay checks original,
+fixed and selectable behavior; any fixture `passed` verdict is finite fixture
+scope only, not final BinRadar verification. Historical fixture results are not
+acceptance evidence for this cutover. Exercised package/build/smoke results and
+remaining gates are recorded in the
+[integration reference](../../agent-docs/taosc-llm/IMPLEMENTATION_PLAN.md#packaging-and-acceptance-evidence).
 
-The real Ollama smoke exercised streaming, custom tools, final JSON, native
-compilation and all 54 checks. This does not establish provider maximum context,
-model determinism, exhaustive correctness or research-subject repair quality.
-
-## Prepared target and evidence
-
-```sh
-uv run --project utils/taosc-llm taosc-llm \
-  --config /path/to/config.env --workdir /path/to/prepared-workdir \
-  --provider-env utils/taosc-llm/.env --context /path/to/evidence.json \
-  --pi-sdk-root utils/taosc-llm/thirdparty/pi
-```
-
-`python -m taosc_llm` has the same CLI. The local uv source uses the main checkout's
-BinRadar package, not PyPI. Python 3.10+ is required. Runtime resources come from
-`binradar.paths`; a Python-only wheel without native resources is insufficient.
-Guix supplies the SDK/root and Node automatically; outside Guix select the SDK
-root explicitly. No global Pi installation or home credentials are discovered.
-
-Required target inputs:
-
-```text
-config.env                  BINARY="example"; other keys are not executed
-prepared-workdir/
-  example.orig              original x86-64 ELF executable
-  patch-location            one hexadecimal ELF virtual address
-  patch-destination         one nonzero hexadecimal ELF virtual address
-  patch-format              optional; if present, must be ERM generic
-```
-
-Addresses can have a `0x` prefix and must belong to executable file-backed
-segments. Use the selected destination, not the list of possible `destinations`.
-The caller owns valid instruction boundaries and handler/frame compatibility.
-PIE and non-PIE are supported using E9's saved runtime `rip` plus the static
-location-to-destination delta. Target generation does not execute the target.
-
-Evidence JSON is a strict, bounded caller-prepared format, **not raw
-`--generate-binradar` output**. Its exact fields, limits and provenance rules are
-in [the evidence contract](../../agent-docs/taosc-llm/PROMPTS_AND_EVIDENCE.md).
-The fixture's generated `evidence.json` is a runnable example. System/function
-records remain distinct; unknown registers remain unavailable. A supplied source
-reference is an opaque string, never a path the model can open. Only admitted
-development data should be included: selected projections are sent to the cloud.
-
-The host freezes hashes and inputs under `workdir/taosc-llm/contexts/<digest>/`.
-One run under `workdir/taosc-llm/runs/<id>/` contains `run.json`, `context.json`,
-`trials/<attempt>.jsonl`, the final proposal, and candidate-owned
-`candidates/1/build-workdir/` plus build results. The original workdir's existing
-candidate outputs are not overwritten. A candidate requires context inspection,
-a successful check of the exact proposed expression, and final strict JSON/parser
-validation. Abstention and rejected responses produce no candidate.
-
-## Provider configuration and recovery
-
-The provider file is loaded explicitly as data, never sourced. Supported syntax:
-blank lines, whole-line `#` comments, and `KEY=value`; matching quotes are removed
-literally. No interpolation, `export`, executable substitutions or inline-comment
-processing. Required fields are `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`.
-The existing `.env.example` remains the public template; do not put a key in argv.
-
-Default `ollama-dev` policy requires `https://ollama.com/v1` and exact model
-`deepseek-v4.1-flash:1017`. `TAOSC_LLM_MAX_IN_FLIGHT` defaults to 3 and must be 1–3;
-`TAOSC_LLM_WORKERS` defaults to 3 and bounds simultaneous model sessions.
-Explicit nonsecret CLI overrides are `--base-url`, `--model`, `--max-in-flight`,
-`--workers`. Ambient provider variables, Pi defaults and fallback models are ignored.
-
-Other optional fields: `TAOSC_LLM_CONTEXT_WINDOW=32768`, `TAOSC_LLM_MAX_TOKENS=8192`,
-`TAOSC_LLM_TIMEOUT_SECONDS=600`, `TAOSC_LLM_MAX_TURNS=16`,
-`TAOSC_LLM_MAX_TOOL_CALLS=64`. Sizes are **client bounds, not advertised maxima**;
-pricing is unknown. An explicit `TAOSC_LLM_PROFILE=openai-compatible` permits a
-different HTTPS chat endpoint/model and provider cap 0, still with finite workers.
-It cannot bypass Ollama's cap. Other providers require their own live admission.
-
-One coordinator owns a private lock and durable reservations in the account's
-passwd-home `.local/state/taosc-llm/quota`, independent of `HOME`, workdir or key
-rotation. Another coordinator fails rather than multiplying the cap. Python users
-can share one `QuotaOwner` across asynchronous `synthesize_context` calls; the CLI
-runs one context at a time. This local owner cannot account for another host/user
-or unrelated client using the same cloud account: stop or coordinate those clients.
-
-A reservation covers the whole Pi operation, including tool continuations and
-bounded 429 retry-after handling. Truncated streams, timeout and uncertain aborts
-remain quarantined across process restarts. They are **not** automatically freed
-by a timer. Only after independently establishing that all remote work has stopped:
-
-```sh
-taosc-llm recover-quota --confirm-provider-settled
-```
-
-This flag is an operator assertion, not a remote cancellation API. Do not use it
-merely because a local process exited. Auth failures and unsupported responses
-are redacted errors, never another-model fallback.
-
-## Restricted tools and native execution
-
-Pi 1.4.0 receives exactly `get_patch_context`, `get_function_context`,
-`list_observations`, `get_observation`, `check_predicate`. No built-in tools,
-extensions, MCP/REA, shell, arbitrary files, debugger or target execution. Evidence
-and function views are frozen data; no REA process is required. The existing
-BinRadar parser/evaluator owns syntax, signed-i64 behavior and trap reporting.
-
-Credentials travel to Node through a separate inherited pipe. They are absent
-from protocol journals, prompts, argv and native child environments. Native model-
-selected builds and fixture executions use Linux x86-64 Landlock + seccomp, private
-writable scratch, bounded resources and no networking. Private files and `/proc`
-reads are denied. If isolation cannot start, the operation fails; there is no
-unsandboxed fallback. Runtime/system trees remain readable, and Landlock ABI 1
-does not hide all path metadata: this is not a VM or a generic hostile-kernel gate.
-
-## Manual predicate path and artifacts
-
-```sh
-uv run --project utils/taosc-llm taosc-llm \
-  --config /path/to/config.env --workdir /path/to/prepared-workdir \
-  --predicate 'rax == 0'
-```
-
-Manual mode does not load credentials or call a model. Add `--isolate-native` to
-use the same native sandbox; without it the previous manual execution policy is
-preserved. Its outputs are published directly in the supplied workdir.
-
-`--predicate` accepts signed-i64 register expressions, not arbitrary C/Python,
-stack/memory dereferences, calls or allocator-clamp predicates. **Nonzero means
-jump.** For `rax == 0`, the safe-condition file contains `(rax == 0) == 0`, lowered
-through BinRadar's parser; model text is never interpolated into generated C.
-Arithmetic traps follow original flow and report branch 2, not success.
-
-| Artifact | Meaning |
-|---|---|
-| `<binary>.patched` | Fixed candidate, independent of `PATCH_ID` |
-| `<binary>.brpatched` | Selector: unset/0 original; 1 candidate |
-| `<binary>.{patched,brpatched}.json` | Each binary's E9 command stream |
-| `<binary>.{patched,brpatched}.e9map.json` | Exact binary-bound relocation metadata |
-| `patch-format`, `predicates`, `brpatches.json` | Generic family, safe condition, id-1 descriptor |
-| `brpatch.c`, `brpatches.inc`, `predicate.h`, `taosc-llm-*.c` | Native evaluator/adapter inputs |
-
-Builds stage both artifacts before publishing, but final renames are per-file,
-not an atomic directory transaction. Consume only a complete success record and
-matching hashes, never partial files. Do not share a manual workdir with a build
-or verifier. Native commands have 300-second deadlines. Successful build JSON
-contains `status=built`, `verified=false` and artifact paths; LLM runs wrap this
-under `build` and add context/proposal/attempt records. Diagnostics go to stderr.
-
-```python
-from pathlib import Path
-from taosc_llm.builder import generate_patch
-from taosc_llm.synthesis import generate_with_pi
-
-manual = generate_patch(Path("config.env"), Path("workdir"), "rax == 0")
-# Live call: explicit provider file and caller-prepared development evidence.
-proposed = generate_with_pi(Path("config.env"), Path("workdir"),
-                           Path("evidence.json"), Path("provider.env"),
-                           sdk_root=Path("thirdparty/pi"))
-```
-
-Taosc can consume CLI JSON/exit status without a `taosc -> taosc-llm -> taosc`
-cycle. Authenticated BinRadar concrete/mutation import and verifier handoff are
-still P2/P3. Rerun fresh BinRadar setup before verification; this package does not
-refresh `binradar.env`, filters, cached artifacts or prior results. Existing
-BinRadar generic setup prepends `0x` to destination metadata and rebuilds with a
-literal destination: retain unprefixed hex for that handoff. This backend's PIE
-proof does **not** prove the subsequent BinRadar rebuild is PIE-compatible.
-
-## Guix and offline checks
+## Packaging and Guix
 
 ```sh
 guix build -L utils/loftix -f utils/taosc-llm/guix.scm
 guix shell -L utils/loftix -f utils/taosc-llm/guix.scm -- \
-  taosc-llm-fixture --directory /tmp/taosc-llm-guix-example \
-  --provider-env /absolute/path/to/provider.env
+  taosc-llm-fixture --directory /tmp/taosc-llm-guix-example
 ```
 
-The local recipe uses checkout BinRadar Python/resources with Loftix's native
-closure. It packages exact Pi SDK/AI 1.4.0, lockfile-pinned registry tarballs, a
-channel-selected compatible Node, prompts and adapter; runtime never runs npm.
-The SDK package extracts verified tarballs without lifecycle hooks. Outside Guix,
-run the same pinned `npm ci --ignore-scripts`; do not use `latest` or a global Pi.
+The local recipe uses checkout BinRadar Python/resources and Loftix native tools,
+with Node 26.12.1, REA 6.8.0 (149 nonoptional locked archives), Ghidra 12.1,
+OpenJDK 21's full JDK, and the Pi SDK/AI 1.4.0 locktree. Runtime never runs npm;
+SDK extraction does not run lifecycle hooks. Official binary license notices
+are preserved. This is not a published Loftix release. The integration reference
+records actual package-build and installed-smoke results separately from live
+provider acceptance and final BinRadar verification.
 
-Source allowlists exclude real `.env`, credentials, workdirs, node_modules and
-npm caches. The wheel includes Python, `runtime.c`, prompts and adapter, but not
-the SDK/native tools. E9 executables can be selected with `E9TOOL`/`E9COMPILE`;
-otherwise BinRadar resolves `e9patch@1.0.1`. `--help` needs neither auth nor native
-tool discovery. This is a local recipe, not a published Loftix release.
-
-```sh
-E9TOOL=/path/to/e9tool E9COMPILE=/path/to/e9compile \
-TAOSC_LLM_PI_SDK_ROOT=/absolute/path/to/utils/taosc-llm/thirdparty/pi \
-  uv run --project utils/taosc-llm python -m pytest utils/taosc-llm/tests
-```
-
-Tests exercise native PIE/non-PIE behavior, strict evidence/proposal boundaries,
-private state/crash recovery, concurrent admission, and the actual SDK with fake
-HTTP streams for tool continuation, auth/429, redirect, truncation and cancellation.
-No real credentials or provider requests enter package tests. SDK/native tests
-skip only when their explicit dependencies are absent; Guix supplies them.
-See [the maintained design and remaining gates](../../agent-docs/taosc-llm/README.md).
+Four installed wrappers are `taosc-llm`, `taosc-llm-setup`,
+`taosc-llm-evaluate`, and `taosc-llm-fixture`. Source allowlists and the wheel
+exclude real `.env` files, credentials, workdirs, node_modules and caches. The
+wheel ships Python, `runtime.c`, prompts and adapter, not the SDK/native closure.
+Python 3.10+ and BinRadar native resources are required; the local uv project uses
+the checkout BinRadar package. E9 overrides are `E9TOOL`/`E9COMPILE`; otherwise
+BinRadar resolves `e9patch@1.0.1`. Help does not require credentials/native discovery.
+See the [maintained reference](../../agent-docs/taosc-llm/README.md) for contracts
+and validation limits. Future Taosc orchestration remains a separate integration.

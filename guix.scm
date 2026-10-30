@@ -2,7 +2,6 @@
 
 (use-modules (gnu packages check)
              (gnu packages compression)
-             (gnu packages node)
              (gnu packages base)
              (gnu packages commencement)
              (gnu packages patchutils)
@@ -21,6 +20,10 @@
 (define package-directory (canonicalize-path (dirname (current-filename))))
 (define checkout-directory
   (canonicalize-path (string-append package-directory "/../..")))
+
+;; This file imports only the exact Node/Ghidra origins and the reviewed REA
+;; manifests/closure, never its development directory or npm installation.
+(primitive-load (string-append package-directory "/static-runtime.scm"))
 
 ;; Only these three reviewed files enter the SDK derivation. The development
 ;; npm cache and node_modules are never source inputs.
@@ -69,7 +72,8 @@ This package supplies SDK imports, not npm CLI executable shims.")
 (define (source-file? file stat)
   (not (or (member (basename file)
                    '(".git" ".venv" ".env" "build" "dist" "__pycache__"
-                     ".pytest_cache" ".ruff_cache" ".mypy_cache"))
+                     ".pytest_cache" ".ruff_cache" ".mypy_cache"
+                     "node_modules" ".npm" "scratch" "workdir" "workdirs"))
            (string-prefix? ".env." (basename file))
            (string-suffix? ".egg-info" file)
            (string-suffix? ".pyc" file))))
@@ -154,7 +158,7 @@ This package supplies SDK imports, not npm CLI executable shims.")
                (lambda _
                  (setenv "E9TOOL" (string-append #$e9patch "/bin/e9tool"))
                  (setenv "E9COMPILE" (string-append #$e9patch "/bin/e9compile"))
-                 (setenv "TAOSC_LLM_NODE" (string-append #$node "/bin/node"))
+                 (setenv "TAOSC_LLM_NODE" (string-append #$analysis-node "/bin/node"))
                  (setenv "TAOSC_LLM_PI_SDK_ROOT" #$pi-sdk)))
              (add-after 'install 'install-sdk-root
                (lambda _
@@ -166,22 +170,40 @@ This package supplies SDK imports, not npm CLI executable shims.")
                  (for-each
                   (lambda (program)
                     (wrap-program (string-append #$output "/bin/" program)
-                      `("PATH" prefix (,(string-append #$gcc-toolchain "/bin")
-                                        ,(string-append #$binutils "/bin")))
+                      `("PATH" = (,(string-append #$gcc-toolchain "/bin")
+                                   ,(string-append #$binutils "/bin")
+                                   ,(string-append #$e9patch "/bin")
+                                   ,(string-append #$coreutils "/bin")
+                                   ,(string-append #$bash-minimal "/bin")
+                                   ,(string-append #$analysis-node "/bin")
+                                   ,(string-append #$analysis-jdk "/bin")
+                                   ,(string-append #$rea-runtime "/bin")))
+                      `("E9TOOL" = (,(string-append #$e9patch "/bin/e9tool")))
+                      `("E9COMPILE" = (,(string-append #$e9patch "/bin/e9compile")))
+                      `("TAOSC_LLM_REA" = (,(string-append #$rea-runtime "/bin/rea")))
+                      `("JAVA_HOME" = (,#$analysis-jdk))
+                      `("GHIDRA_INSTALL_DIR" =
+                        (,(string-append #$ghidra-runtime "/share/ghidra")))
                       `("C_INCLUDE_PATH" = (,(string-append #$gcc-toolchain "/include")))
                       `("LIBRARY_PATH" = (,(string-append #$gcc-toolchain "/lib")))
-                      `("TAOSC_LLM_NODE" = (,(string-append #$node "/bin/node")))
+                      `("TAOSC_LLM_NODE" = (,(string-append #$analysis-node "/bin/node")))
                       `("TAOSC_LLM_PI_SDK_ROOT" =
                         (,(string-append #$output "/share/taosc-llm/pi-sdk")))))
-                  '("taosc-llm" "taosc-llm-fixture")))))))
-  (inputs (list node pi-sdk gcc-toolchain binutils))
+                  '("taosc-llm" "taosc-llm-setup" "taosc-llm-evaluate"
+                    "taosc-llm-fixture")))))))
+  (inputs (list analysis-node pi-sdk rea-runtime ghidra-runtime
+                `(,openjdk21 "jdk") gcc-toolchain binutils e9patch
+                coreutils bash-minimal))
   (native-inputs (list python-setuptools python-pytest gcc-toolchain e9patch))
   (propagated-inputs (list local-binradar))
+  (supported-systems '("x86_64-linux"))
   (home-page "https://github.com/UNIST-LOFT/binradar")
-  (synopsis "Synthesize and build generic guards from prepared Taosc metadata")
+  (synopsis "Prepare, evaluate and refine ERM binary guards with isolated Pi sessions")
   (description
-   "This command proposes a generic guard with an isolated Pi SDK session, or
-accepts a manual predicate, and compiles fixed and BinRadar-selectable binaries.
-It uses caller-prepared evidence and explicit provider configuration.  It neither
-discovers patch locations nor supplies BinRadar repair verification.")
+   "The setup command freezes host-selected artifacts, captures and REA/Ghidra
+static views into an immutable dataset.  Evaluation reuses exact ordered captures
+or executes concrete cases in isolated host workers.  Pi SDK 1.4.0 proposes and
+refines ERM generic or ERM CWE-805 guards using explicit provider configuration;
+it never owns native execution or establishes repair correctness.  The fixture
+command supplies a harmless runtime acceptance subject.")
   (license license:gpl2))

@@ -1,0 +1,6 @@
+{
+  "name": "taosc-llm-rea-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {"rea-agents": "6.8.0"}
+}

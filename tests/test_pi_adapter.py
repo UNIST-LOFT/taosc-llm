@@ -3,14 +3,11 @@
 import asyncio
 import json
 import os
-import shutil
-import sys
 from pathlib import Path
 
 import pytest
-from elftools.elf.elffile import ELFFile
 from taosc_llm.bridge import adapter_command, run_adapter
-from taosc_llm.context import digest, prepare_context
+from taosc_llm.context import prepare_context
 from taosc_llm.provider import ProviderConfig
 
 PRELOAD = r'''
@@ -38,12 +35,19 @@ globalThis.fetch = async (input, init) => {
   let data;
   if (mode === 'truncated') data = chunk({role:'assistant',content:'incomplete'},'stop');
   else if (count <= 2) {
-    const name = count === 1 ? 'get_patch_context' : 'check_predicate';
-    const args = count === 1 ? {context_id:context} : {context_id:context,jump_if:'rax <= 0'};
+    const name = count === 1 ? 'get_patch_context' : 'evaluate_predicate';
+    const args = count === 1 ? {context_id:context} : {context_id:context,predicate:'rax <= 0'};
     data = chunk({role:'assistant',tool_calls:[{index:0,id:'call-'+count,type:'function',function:{name,arguments:JSON.stringify(args)}}]});
     data += chunk({},'tool_calls') + 'data: [DONE]\n\n';
+  } else if (count === 3 && mode === 'results') {
+    const tool = body.messages.filter(m => m.role === 'tool').at(-1);
+    const result = JSON.parse(typeof tool.content === 'string' ? tool.content : tool.content[0].text);
+    if (!result.ok || !result.result_id) throw Error('missing host result');
+    const args = {context_id:context,result_id:result.result_id};
+    data = chunk({role:'assistant',tool_calls:[{index:0,id:'result-call',type:'function',function:{name:'get_candidate_result',arguments:JSON.stringify(args)}}]});
+    data += chunk({},'tool_calls') + 'data: [DONE]\n\n';
   } else {
-    const proposal = {schema_version:1,context_id:context,decision:'candidate',jump_if:'rax <= 0',evidence_ids:[],assumptions:[],reason:'Offline transport fixture only.'};
+    const proposal = {schema_version:1,context_id:context,decision:'candidate',predicate:'rax <= 0',evidence_ids:[],assumptions:[],reason:'Offline transport fixture only.'};
     data = chunk({role:'assistant',content:JSON.stringify(proposal)}) + chunk({},'stop') + 'data: [DONE]\n\n';
   }
   return new Response(new ReadableStream({start(c){c.enqueue(encode(data));c.close();}}),{headers:{'content-type':'text/event-stream'}});
@@ -56,21 +60,8 @@ def adapter_context(tmp_path):
     root = os.environ.get("TAOSC_LLM_PI_SDK_ROOT")
     if not root:
         pytest.skip("set TAOSC_LLM_PI_SDK_ROOT for offline pinned-SDK tests")
-    config = tmp_path / "config.env"
-    config.write_text("BINARY=fixture\n")
-    workdir = tmp_path / "workdir"
-    workdir.mkdir()
-    original = workdir / "fixture.orig"
-    shutil.copyfile(sys.executable, original)
-    with original.open("rb") as stream:
-        entry = ELFFile(stream).header["e_entry"]
-    for name in ("patch-location", "patch-destination"):
-        (workdir / name).write_text(f"{entry:x}")
-    evidence = tmp_path / "evidence.json"
-    evidence.write_text(json.dumps({"schema_version":1,"origin":"fixture","original_sha256":digest(original.read_bytes()),
-                                   "specification":"Offline transport fixture, not an executable repair oracle.",
-                                   "destination_semantics":"Caller-selected fixture destination.","functions":[],"observations":[]}))
-    return prepare_context(config, workdir, evidence), Path(root)
+    from test_context_tools import make_dataset
+    return prepare_context(make_dataset(tmp_path / "dataset"), run_dir=tmp_path / "run"), Path(root)
 
 
 def operation(adapter_context, tmp_path, mode):
@@ -95,8 +86,18 @@ def test_pi_custom_tools_and_settled_final_proposal(adapter_context, tmp_path):
     assert result["request_count"] == 3
     assert result["host_inspected_context"] is True
     assert result["host_checked_predicates"] == ["rax <= 0"]
-    assert set(result["active_tools"]) == {"get_patch_context", "get_function_context", "list_observations", "get_observation", "check_predicate"}
-    assert context.validate_proposal(result["final_text"])["jump_if"] == "rax <= 0"
+    assert set(result["active_tools"]) == {"get_patch_context", "get_function_analysis", "list_cases", "get_case", "evaluate_predicate", "test_candidate", "get_candidate_result"}
+    assert context.validate_proposal(result["final_text"])["predicate"] == "rax <= 0"
+
+
+def test_pi_continues_after_actual_offline_result_reference(adapter_context, tmp_path):
+    result, settlement, context = operation(adapter_context, tmp_path, "results")
+    assert result["type"] == "turn_complete"
+    assert result["request_count"] == 4
+    assert result["tool_calls"] == 3
+    assert settlement["remote_settled"] is True
+    assert context._results
+    assert all(item["verified"] is False for item in context._results.values())
 
 
 @pytest.mark.parametrize("mode,status,code", [

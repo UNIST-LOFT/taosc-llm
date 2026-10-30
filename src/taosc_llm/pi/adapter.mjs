@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url';
 
 const VERSION = 1;
 const MAX_FRAME = 4 * 1024 * 1024;
-const TOOL_NAMES = ['get_patch_context', 'get_function_context', 'list_observations', 'get_observation', 'check_predicate'];
+const TOOL_NAMES = ['get_patch_context', 'get_function_analysis', 'list_cases', 'get_case', 'evaluate_predicate', 'test_candidate', 'get_candidate_result'];
 const PROVIDER_ID = 'taosc-ollama-cloud';
 const nativeFetch = globalThis.fetch.bind(globalThis);
 const output = process.stdout.write.bind(process.stdout);
@@ -335,7 +335,7 @@ async function run(frame, options, keyPromise) {
     });
     session = result.session;
     const active = session.getActiveToolNames();
-    insist(active.length === 5 && TOOL_NAMES.every(name => active.includes(name)), 'tool_isolation_error');
+    insist(active.length === TOOL_NAMES.length && TOOL_NAMES.every(name => active.includes(name)), 'tool_isolation_error');
     unsubscribe = session.subscribe(event => {
       if (event.type === 'agent_settled') settledEvent = !event.aborted;
       if (event.type === 'message_end' && event.message.role === 'assistant') finalAssistant = event.message;

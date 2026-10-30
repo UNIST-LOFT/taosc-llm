@@ -16,12 +16,14 @@ _SYSTEM_READ = ("/usr", "/bin", "/lib", "/lib64", "/gnu/store", "/etc/ld.so.cach
 
 def run_native(command: list[str], scratch: Path, *, timeout: int = 300,
                extra_env: dict[str, str] | None = None, check: bool = True,
-               readable: tuple[Path, ...] = ()) -> subprocess.CompletedProcess:
+               readable: tuple[Path, ...] = (),
+               self_signals: bool = False) -> subprocess.CompletedProcess:
     """Run an argv, not a shell command; only scratch is writable.
 
     This deliberately fails closed when Landlock/seccomp is unavailable. Extra
     environment is restricted to the fixture selector, never arbitrary preload,
-    shell, dynamic-loader or provider configuration.
+    shell, dynamic-loader or provider configuration. Self-signaling is an
+    opt-in for childless fixture replay, not builds or concrete workers.
     """
     if not command:
         raise ValueError("empty native command")
@@ -43,6 +45,8 @@ def run_native(command: list[str], scratch: Path, *, timeout: int = 300,
         environment.update(HOME=temporary, TMPDIR=temporary, LC_ALL="C")
         argv = [sys.executable, "-I", "-S", launcher, "--scratch", str(scratch),
                 "--timeout", str(timeout)]
+        if self_signals:
+            argv.append("--self-signals")
         for root in roots:
             argv.extend(("--read", str(root)))
         argv.extend(("--", *command))
