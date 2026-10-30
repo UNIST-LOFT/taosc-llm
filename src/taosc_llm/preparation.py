@@ -168,12 +168,12 @@ def _mutation_cases(root: Path, workdir: Path, run: Path, binary: str, artifacts
     return cases, oracle
 
 
-def prepare_dataset(config: Path, workdir: Path, concrete_run: Path, mutation_run: Path | None, *,
+def prepare_dataset(config: Path, workdir: Path, concrete_run: Path, binradar_run: Path | None, *,
                     output: Path | None = None, rea: str | None = None,
                     analysis_provider: str = "ghidra") -> PreparedDataset:
     config, workdir, concrete_run = (Path(path).resolve(strict=True) for path in (config, workdir, concrete_run))
-    mutation_run = Path(mutation_run).resolve(strict=True) if mutation_run is not None else None
-    if not workdir.is_dir() or not concrete_run.is_dir() or (mutation_run is not None and not mutation_run.is_dir()):
+    binradar_run = Path(binradar_run).resolve(strict=True) if binradar_run is not None else None
+    if not workdir.is_dir() or not concrete_run.is_dir() or (binradar_run is not None and not binradar_run.is_dir()):
         raise ValueError("explicit workdir and run directories are required")
     env = binradar_setup.load_env(config)
     binary = env.get("BINARY", "")
@@ -193,7 +193,7 @@ def prepare_dataset(config: Path, workdir: Path, concrete_run: Path, mutation_ru
         required = [f"{binary}.orig", f"{binary}.brcached", f"{binary}.brcached.json",
                     f"{binary}.brcached.e9map.json", "brpatches.json", "patch-format", "patch-location",
                     "patch-destination", "generate-concrete.env"]
-        if mutation_run is not None:
+        if binradar_run is not None:
             required.append("generate-binradar.env")
         optional = ["binradar.env", "generate-binradar.env", "stack-size", "predicates"]
         for name in required + [name for name in optional if name not in required and (workdir / name).is_file()]:
@@ -246,8 +246,8 @@ def prepare_dataset(config: Path, workdir: Path, concrete_run: Path, mutation_ru
                 raise ValueError("invalid CWE-805 stack-size")
         cases = _original_cases(root, concrete_run, location)
         oracle = None
-        if mutation_run is not None:
-            mutations, oracle = _mutation_cases(root, workdir, mutation_run, binary, artifacts)
+        if binradar_run is not None:
+            mutations, oracle = _mutation_cases(root, workdir, binradar_run, binary, artifacts)
             cases.extend(mutations)
         case_path = root / "cases.jsonl"
         with case_path.open("wb") as stream:
@@ -258,7 +258,7 @@ def prepare_dataset(config: Path, workdir: Path, concrete_run: Path, mutation_ru
         manifest = {"schema_version": 2, "binary": binary, "patch_format": patch_format,
                     "patch": {"location": location, "destination": destination, "address_domain": "elf-va"},
                     "artifacts": artifacts, "sources": {"concrete_run": str(concrete_run),
-                    "mutation_run": str(mutation_run) if mutation_run else None}, "analysis": analysis,
+                    "binradar_run": str(binradar_run) if binradar_run else None}, "analysis": analysis,
                     "cases": {"path": "cases.jsonl", "sha256": sha256(case_path)},
                     "oracles": {"mutation_reference": oracle,
                                 "concrete": binradar_verifier.CONCRETE_ORACLE,

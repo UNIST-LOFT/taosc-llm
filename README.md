@@ -15,8 +15,9 @@ uv run --project utils/taosc-llm taosc-llm-setup \
   --output /path/to/new-dataset --rea /path/to/rea
 ```
 
-Optionally add `--mutation-run /path/to/mutation-run` for committed patch-zero
-mutation evidence. Setup does not call an LLM or generate fresh mutation tests.
+Optionally add `--binradar-run /path/to/binradar-run` for committed patch-zero
+mutation evidence from a `--generate-binradar` run. Setup does not call an LLM
+or generate fresh mutation tests.
 `--analysis-provider` defaults to `ghidra`; REA/Ghidra are local static analysis
 backends, not model-accessible services. Setup freezes function, instruction,
 decompilation and reference views with availability/provenance records.
@@ -71,8 +72,9 @@ uv run --project utils/taosc-llm taosc-llm-evaluate \
 cases; it does not test a repair. It cannot be combined with `--offline` or
 `--case`. For predicate evaluation, repeat `--case system:ID` or
 `--case function:ID` to select prepared cases. `--cache-dir` selects private
-host-owned cache storage; the default is `~/.cache/taosc-llm`. Producer files are
-never modified.
+host-owned cache storage; the default is `~/.cache/taosc-llm`. A relative cache
+directory is resolved before each worker starts, because the sandbox launcher
+runs with the scratch directory as its cwd. Producer files are never modified.
 
 Reuse requires a complete, identity-bound capture, a valid evaluator mirror of
 its recorded descriptor, and an **equal full ordered branch vector** for the

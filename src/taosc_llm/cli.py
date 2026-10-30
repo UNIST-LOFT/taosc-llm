@@ -104,7 +104,7 @@ def setup_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", "-c", type=Path, required=True, metavar="config.env")
     parser.add_argument("--workdir", "-w", type=Path, required=True)
     parser.add_argument("--concrete-run", type=Path, required=True, help="explicit run containing minimized inputs and original observations")
-    parser.add_argument("--mutation-run", type=Path, help="explicit run containing committed patch-zero mutation evidence")
+    parser.add_argument("--binradar-run", type=Path, help="explicit BinRadar run containing committed patch-zero mutation evidence")
     parser.add_argument("--output", type=Path, help="prepared dataset output root")
     parser.add_argument("--rea", help="explicit local REA executable; never a shell command")
     parser.add_argument("--analysis-provider", default="ghidra", help="local static analysis backend")
@@ -112,7 +112,7 @@ def setup_main(argv: list[str] | None = None) -> int:
 
     def execute():
         from .preparation import prepare_dataset
-        dataset = prepare_dataset(args.config, args.workdir, args.concrete_run, args.mutation_run,
+        dataset = prepare_dataset(args.config, args.workdir, args.concrete_run, args.binradar_run,
                                   output=args.output, rea=args.rea, analysis_provider=args.analysis_provider)
         return {"status": "prepared", "dataset_id": dataset.dataset_id,
                 "dataset": str(dataset.root), "manifest": str(dataset.root / "manifest.json"),

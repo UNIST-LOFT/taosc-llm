@@ -50,6 +50,10 @@ def execute_capture(dataset, case: dict, descriptor: str, directory: Path) -> di
     The ordinary collector's empty-manifest fallback is deliberately not used.
     """
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # The launcher resolves --scratch relative to its own cwd, which Popen sets
+    # to that same scratch. A relative cache directory would therefore be
+    # prefixed twice and fail as an unavailable execution rather than run.
+    directory = directory.resolve()
     with tempfile.TemporaryDirectory(prefix='execution-', dir=directory) as temporary:
         scratch = Path(temporary)
         work = scratch / 'work'

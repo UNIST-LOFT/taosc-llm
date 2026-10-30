@@ -36,7 +36,7 @@ def make_dataset(root, *, count=2, patch_format="ERM generic"):
     case_path.write_text("".join(json.dumps(c) + "\n" for c in cases))
     manifest = {"schema_version": 2, "binary": "fixture", "patch_format": patch_format,
                 "patch": {"location": 4096, "destination": 4097, "address_domain": "elf-va"},
-                "artifacts": artifacts, "sources": {"concrete_run": "/private/source-run", "mutation_run": None},
+                "artifacts": artifacts, "sources": {"concrete_run": "/private/source-run", "binradar_run": None},
                 "analysis": [{"function_id": "function:patch", "view": "instructions", "path": "instructions.txt",
                               "sha256": digest(analysis.read_bytes()), "availability": "available", "reason": None,
                               "complete": True, "backend": "fixture-static", "backend_version": "1"}],
