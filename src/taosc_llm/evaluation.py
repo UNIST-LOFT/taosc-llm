@@ -279,7 +279,39 @@ def _case_result(dataset, case, candidate, descriptor, execute, root, base_ident
             return {**base, 'reason': _reason(error)}
 
 
-def _evaluate(dataset, candidate, descriptor, *, case_ids, workers, execute, cache_dir):
+def _replay_evaluate(dataset, candidate, *, case_ids, socket_path):
+    from . import replay
+    function_ids = {case['id'] for case in dataset.cases('function')}
+    if case_ids is not None and any(case not in function_ids for case in case_ids):
+        raise ValueError('live replay selects only function cases')
+    result = replay.evaluate_replay(dataset, candidate, socket_path=socket_path)
+    if case_ids is not None:
+        selected = set(case_ids)
+        result['cases'] = [item for item in result['cases'] if item['case_id'] in selected]
+        counts = {status: sum(item['status'] == status for item in result['cases'])
+                  for status in ('reject_same_crash', 'not_rejected', 'unavailable')}
+        result['status'] = ('reject_same_crash' if counts['reject_same_crash'] else
+                            'unavailable' if not result['cases'] or counts['unavailable']
+                            else 'not_rejected')
+        result['summary'] = {'total': len(result['cases']), **counts}
+    result.update(dataset_id=dataset.dataset_id,
+                  candidate_id=_digest({'dataset': dataset.dataset_id,
+                                        'descriptor': candidate.descriptor,
+                                        'replay': result['replay']}),
+                  predicate=candidate.expression, descriptor=candidate.descriptor,
+                  verified=False)
+    return result
+
+
+def _evaluate(dataset, candidate, descriptor, *, case_ids, workers, execute, cache_dir,
+              replay_socket=None):
+    """Evaluate one candidate.
+
+    ``replay_socket`` selects the trusted live host bridge for **function**
+    cases.  It is a host-side option only: neither the model nor a public patch
+    entry can name a socket.  Concrete ``system`` cases keep their existing
+    capture/cache/execution path and never use the live mutation snapshot.
+    """
     if isinstance(dataset, (str, Path)):
         dataset = load_dataset(Path(dataset))
     if dataset.patch_format not in ('ERM generic', 'ERM CWE-805'):
@@ -290,6 +322,18 @@ def _evaluate(dataset, candidate, descriptor, *, case_ids, workers, execute, cac
     cases = dataset.cases() if case_ids is None else [dataset.case(case_id) for case_id in case_ids]
     if len({c['id'] for c in cases}) != len(cases):
         raise ValueError('duplicate case ids')
+    if replay_socket is not None and candidate is None:
+        raise ValueError('live replay requires a candidate predicate, not --warm')
+    live_cases = [c for c in cases if c['domain'] == 'function']
+    if replay_socket is not None:
+        from . import replay
+        # Requesting a bridge for a dataset without a frozen mutation run must
+        # not silently degrade to concrete-only evaluation.
+        replay.dataset_socket(dataset)
+    # A dataset with a mutation run can still retain zero useful cases.  The
+    # bridge then has nothing to evaluate, and concrete cases take their normal
+    # path instead of failing the whole candidate.
+    use_replay = replay_socket is not None and bool(live_cases)
     cache_base = Path(cache_dir) if cache_dir is not None else Path.home() / '.cache' / 'taosc-llm'
     root = cache_base / 'evaluation-v2' / _digest(dataset.dataset_id)
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -299,8 +343,18 @@ def _evaluate(dataset, candidate, descriptor, *, case_ids, workers, execute, cac
                      'runtime': execution_identity(), 'evaluator': sha256(Path(__file__))}
     def evaluate(case):
         return _case_result(dataset, case, candidate, descriptor, execute, root, base_identity)
+    live = {}
+    replay_result = None
+    if use_replay:
+        replay_result = _replay_evaluate(dataset, candidate,
+                                         case_ids=sorted(c['id'] for c in live_cases),
+                                         socket_path=replay_socket)
+        live = {item['case_id']: item for item in replay_result['cases']}
+    concrete = [case for case in cases if case['id'] not in live]
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        results = list(pool.map(evaluate, cases))
+        evaluated = {item['case_id']: item
+                     for item in pool.map(evaluate, concrete)}
+    results = [live.get(case['id']) or evaluated[case['id']] for case in cases]
     counts = {status: sum(c['status'] == status for c in results)
               for status in ('reject_same_crash', 'not_rejected', 'unavailable')}
     status = ('reject_same_crash' if counts['reject_same_crash'] else
@@ -309,6 +363,11 @@ def _evaluate(dataset, candidate, descriptor, *, case_ids, workers, execute, cac
               'predicate': candidate.expression if candidate is not None else None,
               'descriptor': descriptor, 'status': status, 'verified': False,
               'cases': results, 'summary': {'total': len(results), **counts}}
+    if replay_result is not None:
+        result['replay'] = replay_result['replay']
+        result['candidate_id'] = _digest({'base': base_identity,
+                                          'descriptor': descriptor,
+                                          'replay': replay_result['replay']})
     result_id = _digest(result)
     result['result_id'] = result_id
     _atomic(root / (result_id + '.result.json'), result)
@@ -316,12 +375,18 @@ def _evaluate(dataset, candidate, descriptor, *, case_ids, workers, execute, cac
 
 
 def evaluate_dataset(dataset, predicate: str, *, case_ids: list[str] | None = None,
-                     workers: int = 1, execute: bool = True, cache_dir: Path | None = None) -> dict:
+                     workers: int = 1, execute: bool = True, cache_dir: Path | None = None,
+                     replay_socket=None) -> dict:
+    """Evaluate a family predicate; ``replay_socket`` is trusted host input.
+
+    It is never serialized into a model tool argument or a public patch entry.
+    """
     if isinstance(dataset, (str, Path)):
         dataset = load_dataset(Path(dataset))
     candidate = parse_candidate(dataset.patch_format, predicate)
     return _evaluate(dataset, candidate, candidate.descriptor, case_ids=case_ids,
-                     workers=workers, execute=execute, cache_dir=cache_dir)
+                     workers=workers, execute=execute, cache_dir=cache_dir,
+                     replay_socket=replay_socket)
 
 
 def warm_dataset(dataset, *, workers: int = 1, cache_dir: Path | None = None) -> dict:

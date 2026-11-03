@@ -30,7 +30,7 @@ def tool_definitions():
          {"domain": {"type": "string", "enum": ["system", "function", "all"]}, "cursor": cursor}, ["domain"]),
         ("get_case", "Read case/capture provenance and paged states; optional state_id reads bounded stack pages.", {"case_id": identifier, "result_id": identifier, "state_id": identifier, "cursor": cursor}, ["case_id"]),
         ("evaluate_predicate", "Evaluate complete captures offline only; never proof of repair.", {"predicate": predicate}, ["predicate"]),
-        ("test_candidate", "Host-selected bounded concrete evaluation; function cases remain offline.", {"predicate": predicate}, ["predicate"]),
+        ("test_candidate", "Host-selected bounded evaluation; function cases are live only when the trusted host configured a resident replay bridge, otherwise offline.", {"predicate": predicate}, ["predicate"]),
         ("get_candidate_result", "Read a bounded page of a prior evaluation by opaque result ID.", {"result_id": identifier, "cursor": cursor}, ["result_id"]),
     ]
     return [{"name": name, "description": description, "parameters": {
@@ -202,7 +202,9 @@ def call_tool(context: SynthesisContext, name, args):
             from .evaluation import evaluate_dataset
             candidate = _candidate(context, args["predicate"])
             evaluation = evaluate_dataset(context.dataset, candidate.expression, workers=context.workers,
-                                          execute=name == "test_candidate", cache_dir=context.run_dir / "cache")
+                                          execute=name == "test_candidate",
+                                          cache_dir=context.cache_dir or context.run_dir / "cache",
+                                          replay_socket=context.replay_socket)
             result_id = digest(canonical(evaluation))
             context._results[result_id] = evaluation
             result = {"valid_syntax": True, "checked_predicate": args["predicate"], **_result(context, result_id)}

@@ -49,6 +49,9 @@ class SynthesisContext:
     workers: int
     _projection: bytes = field(repr=False)
     _feedback: bytes = field(repr=False)
+    # Trusted host options.  Never part of the model projection or tool schemas.
+    replay_socket: Path | None = field(default=None, repr=False, compare=False)
+    cache_dir: Path | None = field(default=None, repr=False, compare=False)
     _cursor_key: bytes = field(default_factory=lambda: os.urandom(32), repr=False)
     _results: dict = field(default_factory=dict, repr=False, compare=False)
 
@@ -98,13 +101,19 @@ class SynthesisContext:
 
 
 def prepare_context(dataset, *, run_dir: Path | None = None, workers: int = 1,
-                    feedback: list[dict] | None = None) -> SynthesisContext:
+                    feedback: list[dict] | None = None,
+                    replay_socket: Path | None = None,
+                    cache_dir: Path | None = None) -> SynthesisContext:
     from .dataset import PreparedDataset, load_dataset
     from .family import grammar_contract
     if not isinstance(dataset, PreparedDataset):
         dataset = load_dataset(Path(dataset))
     if type(workers) is not int or not 1 <= workers <= 32:
         raise ValueError("execution workers must be between 1 and 32")
+    if replay_socket is not None:
+        replay_socket = Path(replay_socket).expanduser()
+    if cache_dir is not None:
+        cache_dir = Path(cache_dir).expanduser()
     dataset.verify_artifacts()
     resources = files("taosc_llm")
     projection = {
@@ -121,7 +130,13 @@ def prepare_context(dataset, *, run_dir: Path | None = None, workers: int = 1,
         "implementation_hashes": {name: digest(resources.joinpath(name).read_bytes())
                                   for name in ("context.py", "tools.py", "prompts/system.txt", "family.py")},
         "limits": {"page_records": 32, "analysis_page_bytes": 8192, "expression_bytes": MAX_EXPRESSION},
-        "policy": "Concrete cases selected by host; mutation offline only. Not rejected is not proof of repair; final verification is not run.",
+        "policy": ("Concrete cases selected by host. Function mutation cases use the "
+                   "trusted host replay bridge when configured, otherwise offline. "
+                   "Not rejected is not proof of repair; final verification is not run."
+                   if replay_socket is None else
+                   "Concrete cases selected by host. Function mutation cases use the "
+                   "trusted host live replay bridge; the model never names its endpoint. "
+                   "Not rejected is not proof of repair; final verification is not run."),
     }
     identity = digest(canonical(projection))
     projection["context_id"] = identity
@@ -129,4 +144,5 @@ def prepare_context(dataset, *, run_dir: Path | None = None, workers: int = 1,
         run_dir = Path(mkdtemp(prefix="taosc-llm-context-"))
     run_dir = Path(run_dir).resolve()
     run_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return SynthesisContext(dataset, identity, run_dir, workers, canonical(projection), canonical(feedback or []))
+    return SynthesisContext(dataset, identity, run_dir, workers, canonical(projection),
+                            canonical(feedback or []), replay_socket, cache_dir)

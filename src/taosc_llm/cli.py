@@ -73,6 +73,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--execution-workers", type=_positive, default=1, help="concrete workers, independent of provider quota")
     parser.add_argument("--max-rounds", type=_positive, help="maximum proposal/build/refinement rounds (provider mode; default: 4)")
     parser.add_argument("--pi-sdk-root", type=Path, help="pinned SDK project; Guix supplies its own default")
+    parser.add_argument(
+        "--replay-socket", type=Path,
+        help=("trusted host bridge: evaluate function cases against the dataset's "
+              "resident --generate-binradar --replay-server snapshot; never a model "
+              "argument and never a tool-schema field"))
+    parser.add_argument(
+        "--cache-dir", type=Path,
+        help=("host-owned evaluation cache shared with taosc-llm-evaluate; default "
+              "is private to each run directory"))
     parser.add_argument("--base-url")
     parser.add_argument("--model")
     parser.add_argument("--max-in-flight", type=int, help="provider cap; Ollama permits 1..3")
@@ -86,13 +95,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.predicate is not None:
             from .synthesis import generate_manual
             return generate_manual(args.dataset, args.predicate,
-                                   execution_workers=args.execution_workers, output=args.output)
+                                   execution_workers=args.execution_workers, output=args.output,
+                                   replay_socket=args.replay_socket, cache_dir=args.cache_dir)
         from .synthesis import generate_with_pi
         return generate_with_pi(args.dataset, args.provider_env,
                                 sdk_root=args.pi_sdk_root, base_url=args.base_url, model=args.model,
                                 max_in_flight=args.max_in_flight, workers=args.workers,
                                 execution_workers=args.execution_workers, max_rounds=4 if args.max_rounds is None else args.max_rounds,
-                                output=args.output)
+                                output=args.output, replay_socket=args.replay_socket,
+                                cache_dir=args.cache_dir)
     return _run("taosc-llm", execute)
 
 
@@ -139,14 +150,22 @@ def evaluate_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--workers", type=_positive, default=1)
     parser.add_argument("--offline", action="store_true", help="never execute a target")
     parser.add_argument("--cache-dir", type=Path, help="private evaluator cache; does not modify source producer files")
+    parser.add_argument(
+        "--replay-socket", type=Path,
+        help=("trusted host bridge: evaluate function cases against the dataset's "
+              "resident --generate-binradar --replay-server snapshot; requires "
+              "--predicate and a dataset prepared with --binradar-run"))
     args = parser.parse_args(argv)
     if args.warm and (args.offline or args.case_ids):
         parser.error("--warm captures the dataset's concrete cases; it cannot be combined with --offline or --case")
+    if args.replay_socket is not None and (args.warm or args.offline):
+        parser.error("--replay-socket evaluates live function cases; it cannot be combined with --warm or --offline")
 
     def execute():
         from .evaluation import evaluate_dataset, warm_dataset
         if args.warm:
             return warm_dataset(args.dataset, workers=args.workers, cache_dir=args.cache_dir)
         return evaluate_dataset(args.dataset, args.predicate, case_ids=args.case_ids,
-                                workers=args.workers, execute=not args.offline, cache_dir=args.cache_dir)
+                                workers=args.workers, execute=not args.offline, cache_dir=args.cache_dir,
+                                replay_socket=args.replay_socket)
     return _run("taosc-llm-evaluate", execute)

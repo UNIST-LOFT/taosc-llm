@@ -105,11 +105,55 @@ its recorded descriptor, and an **equal full ordered branch vector** for the
 candidate. Missing, incomplete, mismatched or divergent concrete captures trigger
 candidate execution unless `--offline` is set. Each host worker owns copied
 artifacts, input, environment, cwd and runner. Offline missing/divergent evidence
-is `unavailable`, not an inferred successful execution. Mutation/function cases
-are always **OFFLINE, rejection-only**: no fresh mutation phase is run. A same-
-crash observation can reject a candidate; changed branches cannot establish its
-new outcome. Predicate traps (branch 2), missing stacks and missing oracle data
-are unavailable, never repair success.
+is `unavailable`, not an inferred successful execution.
+
+### Live function evaluation (trusted-host replay bridge)
+
+Function (`--binradar-run`) cases are **offline by default**. An explicit
+trusted-host option evaluates them against the dataset's own resident
+`--generate-binradar --replay-server` snapshot:
+
+```sh
+uv run --project utils/taosc-llm taosc-llm-evaluate \
+  --dataset /path/to/new-dataset --predicate 'rax <= 0' \
+  --replay-socket workdir/out/br-gen-bin-00000/replay.sock \
+  --cache-dir workdir/out/taosc-llm-cache --workers 4
+uv run --project utils/taosc-llm taosc-llm \
+  --dataset /path/to/new-dataset --provider-env /abs/provider.env \
+  --output /path/to/model-runs --execution-workers 4 \
+  --replay-socket workdir/out/br-gen-bin-00000/replay.sock \
+  --cache-dir workdir/out/taosc-llm-cache
+```
+
+- The socket must be the dataset's own `--binradar-run` endpoint; another
+  generation's path is rejected, not treated as an alias.
+- The service must report `ready`, and its `retained_mutations` must equal the
+  dataset's frozen `function:*` case count. A dead launcher fails immediately.
+- Concrete `system:*` cases keep their existing capture/cache/worker path and
+  never use the mutation snapshot.
+- The model never sees the socket, and no tool schema accepts a path, endpoint or
+  execution switch. `test_candidate` gains live function cases only because the
+  host configured the bridge; `evaluate_predicate` stays offline.
+- Status mapping reuses the existing vocabulary: `target-crash` (the artifact's
+  committed attempt-1 oracle) is `reject_same_crash`; `normal` and `other-crash`
+  are `not_rejected`; cancellation, timeout, trap, unsupported external state and
+  incomplete observation are `unavailable`. Every result keeps
+  `verified=false`; nothing is FINAL verification.
+- `busy` is retried within a bounded admission window so a debugging CLI
+  evaluation can finish first. Any other protocol error aborts the batch.
+
+Debug the wire directly, without building a candidate:
+
+```sh
+uv run --project utils/taosc-llm python -m taosc_llm.replay status   --socket <run>/replay.sock
+uv run --project utils/taosc-llm python -m taosc_llm.replay wait     --socket <run>/replay.sock --pid <launcher-pid> --timeout 7200
+uv run --project utils/taosc-llm python -m taosc_llm.replay evaluate --dataset <dataset> --predicate 'rax <= 0'
+uv run --project utils/taosc-llm python -m taosc_llm.replay shutdown --socket <run>/replay.sock
+```
+
+The server's own acceptance boundaries (fresh-target/multiwrite replay, large
+capture sets, measured cost) are unchanged; see the
+[replay plan](../../agent-docs/memo/BINRADAR_REPLAY_SERVER_PLAN.md).
 
 Concrete workers are bounded to 1–32 (`--workers` here, `--execution-workers` in
 synthesis). They are separate from provider session workers and the provider cap.
@@ -143,7 +187,8 @@ Pi SDK 1.4.0 receives exactly seven restricted host tools:
 `get_patch_context`, `get_function_analysis`, `list_cases`, `get_case`,
 `evaluate_predicate`, `test_candidate`, and `get_candidate_result`.
 `evaluate_predicate` is offline; `test_candidate` requests bounded host-controlled
-concrete evaluation. No shell, arbitrary file access, debugger, built-in tools,
+evaluation of concrete cases and, when the trusted host configured a replay
+bridge, of loaded function cases as well. No shell, arbitrary file access, debugger, built-in tools,
 extensions, MCP, REA invocation or subagents are exposed. REA views were frozen at
 setup. Candidate proposals require context inspection and evaluation of the exact
 expression. Strict response parsing, native builds and actual evaluation feedback
@@ -173,6 +218,9 @@ Stdout contains one JSON result; diagnostics go to stderr. Common CLI exits:
 `warmed` status. Rejection takes precedence over unavailable cases; absent any
 rejection, any unavailable case (or no cases) makes the aggregate unavailable.
 `not_rejected` only means admitted observations did not reject this candidate.
+With `--replay-socket`, a result also carries a `replay` block (endpoint,
+coverage, mutation count, unavailable count). The endpoint never enters the
+model projection or a tool result, and it is not a patch field.
 `unavailable` is not evidence of improvement. Synthesis results retain
 `verified=false` and `binradar_verification=not_run` even when a build exists.
 
@@ -212,6 +260,59 @@ proposed = generate_with_pi(dataset.root, Path("provider.env"),
                            sdk_root=Path("utils/taosc-llm/thirdparty/pi"),
                            execution_workers=4, max_rounds=4)
 ```
+
+## Debug orchestration example
+
+`run.sh` is a runnable example, not the production Taosc driver. It starts both
+generation modes together, waits on `status`, freezes one dataset from both
+producer runs, then evaluates and synthesizes against the live snapshot:
+
+```sh
+# Manual predicate: no model call, still uses the live replay bridge.
+utils/taosc-llm/run.sh --no-llm --predicate 'rax <= 0' --timeout 600
+
+# Model path: the host adds --replay-socket/--cache-dir; the model cannot.
+utils/taosc-llm/run.sh --provider-env /abs/provider.env --timeout 7200
+```
+
+Options: `--subject DIR`, `--workdir NAME`, `--outdir DIR`, `--rea PATH`,
+`--predicate`, `--no-llm`. When the joined run root plus
+`/br-gen-bin-00000/replay.sock` would exceed the 107-byte Unix socket limit
+(this happens under a deep subject path), the script switches the run root to
+`/tmp/binradar-debug-<timestamp>` and says so; pass `--outdir` on a short path to
+control it explicitly. Each invocation uses a fresh run root, so both
+generations start at run id 0 and cannot collide with an in-flight run.
+
+Two checkout-only requirements: export `JAVA_HOME` and `GHIDRA_INSTALL_DIR`
+for REA/Ghidra static analysis (the Guix wrapper sets them), and do not rely on
+a bare `rea` on `PATH` — a mise shim can exist without a selected version and
+exit nonzero. The script prefers an explicit `--rea`/`TAOSC_LLM_REA`, then a
+Guix `taosc-llm-rea-*/bin/rea` that actually runs, then `PATH`.
+
+Exit codes 2 (`reject_same_crash`) and 3 (`unavailable`) from `--warm` and
+synthesis are scoped results, not orchestration failures; the script reports
+them, still shuts the resident server down, and exits 0. A non-`ready` server,
+a dead launcher, a failed producer or a protocol error exits nonzero and keeps
+the logs.
+
+Order and failure rules the example encodes:
+
+1. `binradar-setup --generate-concrete` and `--generate-binradar` run first;
+   they prepare different `.env` files and do not run patches.
+2. Both `binradar` processes start together. They share the prepared workdir but
+   write separate `-o` run directories; `out/plt_info.txt` is published by
+   atomic rename so the two runs cannot interleave it.
+3. `python -m taosc_llm.replay wait` is the only readiness signal. A closed
+   socket, a log line or a missing socket is not completion, and a dead launcher
+   pid fails immediately.
+4. Concrete generation must exit successfully and publish `minimizer.sbsv`
+   before setup runs.
+5. `taosc-llm-setup` needs both runs; missing mutation evidence fails rather than
+   silently producing a concrete-only dataset.
+6. Warming and synthesis share one `--cache-dir`, so concrete captures are
+   reused instead of re-executed.
+7. On any exit path, the trap sends `shutdown` to the resident server, waits for
+   the launcher, then terminates leftovers.
 
 ## Native isolation and harmless fixture
 

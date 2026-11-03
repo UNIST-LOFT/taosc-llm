@@ -148,7 +148,9 @@ async def synthesize_context(context: SynthesisContext, provider: ProviderConfig
         for index in range(max_rounds):
             trials = run_dir / "trials" / str(index + 1)
             trials.mkdir(mode=0o700, parents=True)
-            current = prepare_context(context.dataset, run_dir=run_dir, workers=context.workers, feedback=feedback)
+            current = prepare_context(context.dataset, run_dir=run_dir, workers=context.workers,
+                                      feedback=feedback, replay_socket=context.replay_socket,
+                                      cache_dir=context.cache_dir)
             current._results.update(prior_results)
             terminal = await _model_round(current, provider, owner, command, run_id, trials, result["attempts"])
             prior_results.update(current._results)
@@ -179,7 +181,9 @@ async def synthesize_context(context: SynthesisContext, provider: ProviderConfig
                     write_record(candidate.parent / "build-result.json", build)
                     from .evaluation import evaluate_dataset
                     evaluation = await _blocking(evaluate_dataset, current.dataset, proposal["predicate"],
-                        workers=current.workers, execute=True, cache_dir=current.run_dir / "cache")
+                        workers=current.workers, execute=True,
+                        cache_dir=current.cache_dir or current.run_dir / "cache",
+                        replay_socket=current.replay_socket)
                     write_record(candidate.parent / "evaluation.json", evaluation)
                     result_id = hashlib.sha256(canonical(evaluation)).hexdigest()
                     prior_results[result_id] = evaluation
@@ -208,10 +212,12 @@ async def synthesize_context(context: SynthesisContext, provider: ProviderConfig
         raise
 
 
-def generate_manual(dataset: Path, predicate: str, *, execution_workers=1, output: Path | None = None) -> dict:
+def generate_manual(dataset: Path, predicate: str, *, execution_workers=1, output: Path | None = None,
+                    replay_socket: Path | None = None, cache_dir: Path | None = None) -> dict:
     """Build and evaluate a host-provided family predicate without any model call."""
     from .family import parse_candidate
-    context = prepare_context(dataset, run_dir=output, workers=execution_workers)
+    context = prepare_context(dataset, run_dir=output, workers=execution_workers,
+                              replay_socket=replay_socket, cache_dir=cache_dir)
     parsed = parse_candidate(context.dataset.patch_format, predicate)
     run_dir = context.run_dir / uuid.uuid4().hex
     run_dir.mkdir(mode=0o700)
@@ -227,7 +233,9 @@ def generate_manual(dataset: Path, predicate: str, *, execution_workers=1, outpu
         try:
             result["build"] = await _build(context, {"predicate": parsed.expression}, run_dir / "build-workdir")
             result["evaluation"] = await _blocking(evaluate_dataset, context.dataset, parsed.expression,
-                workers=context.workers, execute=True, cache_dir=context.run_dir / "cache")
+                workers=context.workers, execute=True,
+                cache_dir=context.cache_dir or context.run_dir / "cache",
+                replay_socket=context.replay_socket)
             result["status"] = result["evaluation"]["status"]
         except BaseException as error:
             result["status"] = "cancelled" if isinstance(error, (KeyboardInterrupt, asyncio.CancelledError)) else "infrastructure_error"
@@ -241,9 +249,12 @@ def generate_manual(dataset: Path, predicate: str, *, execution_workers=1, outpu
 
 def generate_with_pi(dataset: Path, provider_file: Path, *, sdk_root=None, base_url=None,
                      model=None, max_in_flight=None, workers=None, execution_workers=1,
-                     max_rounds=4, output: Path | None = None) -> dict:
+                     max_rounds=4, output: Path | None = None,
+                     replay_socket: Path | None = None,
+                     cache_dir: Path | None = None) -> dict:
     provider = load_provider(provider_file, base_url=base_url, model=model,
                              max_in_flight=max_in_flight, workers=workers)
-    context = prepare_context(dataset, run_dir=output, workers=execution_workers)
+    context = prepare_context(dataset, run_dir=output, workers=execution_workers,
+                              replay_socket=replay_socket, cache_dir=cache_dir)
     with QuotaOwner(provider) as owner:
         return asyncio.run(synthesize_context(context, provider, owner, sdk_root=sdk_root, max_rounds=max_rounds))
