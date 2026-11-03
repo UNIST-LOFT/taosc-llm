@@ -114,8 +114,8 @@ def _mutation_cases(root: Path, workdir: Path, run: Path, binary: str, artifacts
     context = read_json(root / context_record["path"])
     if context.get("version") != 1:
         raise ValueError("unsupported mutation capture context version")
+    # Generation patch-0 captures do not depend on the producer's predicate table.
     checks = {"artifact": artifacts[binary + ".brcached"]["sha256"], "artifact_name": binary + ".brcached",
-              "brpatches.json": artifacts["brpatches.json"]["sha256"],
               "generate-binradar.env": artifacts["generate-binradar.env"]["sha256"],
               "input_sha256": artifacts["poc"]["sha256"]}
     if any(context.get(key) != value for key, value in checks.items()):
@@ -170,7 +170,11 @@ def _mutation_cases(root: Path, workdir: Path, run: Path, binary: str, artifacts
 
 def prepare_dataset(config: Path, workdir: Path, concrete_run: Path, binradar_run: Path | None, *,
                     output: Path | None = None, rea: str | None = None,
-                    analysis_provider: str = "ghidra") -> PreparedDataset:
+                    analysis_provider: str = "ghidra", analysis_timeout: int = 900,
+                    analysis_query_timeout: int = 120) -> PreparedDataset:
+    if any(type(value) is not int or not 1 <= value <= 2147483
+           for value in (analysis_timeout, analysis_query_timeout)):
+        raise ValueError("static analysis timeouts must be 1..2147483 integer seconds")
     config, workdir, concrete_run = (Path(path).resolve(strict=True) for path in (config, workdir, concrete_run))
     binradar_run = Path(binradar_run).resolve(strict=True) if binradar_run is not None else None
     if not workdir.is_dir() or not concrete_run.is_dir() or (binradar_run is not None and not binradar_run.is_dir()):
@@ -254,7 +258,8 @@ def prepare_dataset(config: Path, workdir: Path, concrete_run: Path, binradar_ru
             for case in cases:
                 stream.write(canonical(case) + b"\n")
         analysis = prepare_analysis(root, root / "workdir" / f"{binary}.orig",
-                                    {"patch": location, "destination": destination}, rea=rea, provider=analysis_provider)
+                                    {"patch": location, "destination": destination}, rea=rea, provider=analysis_provider,
+                                    timeout=analysis_timeout, query_timeout=analysis_query_timeout)
         manifest = {"schema_version": 2, "binary": binary, "patch_format": patch_format,
                     "patch": {"location": location, "destination": destination, "address_domain": "elf-va"},
                     "artifacts": artifacts, "sources": {"concrete_run": str(concrete_run),

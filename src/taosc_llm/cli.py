@@ -108,12 +108,18 @@ def setup_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, help="prepared dataset output root")
     parser.add_argument("--rea", help="explicit local REA executable; never a shell command")
     parser.add_argument("--analysis-provider", default="ghidra", help="local static analysis backend")
+    parser.add_argument("--analysis-timeout", type=_positive, default=900, metavar="SECONDS",
+                        help="Ghidra initial analysis budget (default: 900 seconds)")
+    parser.add_argument("--analysis-query-timeout", type=_positive, default=120, metavar="SECONDS",
+                        help="budget per query after initial analysis (default: 120 seconds)")
     args = parser.parse_args(argv)
 
     def execute():
         from .preparation import prepare_dataset
         dataset = prepare_dataset(args.config, args.workdir, args.concrete_run, args.binradar_run,
-                                  output=args.output, rea=args.rea, analysis_provider=args.analysis_provider)
+                                  output=args.output, rea=args.rea, analysis_provider=args.analysis_provider,
+                                  analysis_timeout=args.analysis_timeout,
+                                  analysis_query_timeout=args.analysis_query_timeout)
         return {"status": "prepared", "dataset_id": dataset.dataset_id,
                 "dataset": str(dataset.root), "manifest": str(dataset.root / "manifest.json"),
                 "patch_format": dataset.patch_format, "verified": False}

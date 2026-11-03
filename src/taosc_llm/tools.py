@@ -6,7 +6,7 @@ import hmac
 import json
 from pathlib import Path
 
-from .context import MAX_EXPRESSION, canonical, digest, keys, strict_json
+from .context import MAX_EXPRESSION, canonical, digest, keys, strict_json, SynthesisContext
 
 PAGE_SIZE = 32
 FUNCTION_PAGE_BYTES = 8192
@@ -52,12 +52,12 @@ def _validate(value, schema):
         raise ToolError("invalid_arguments", "invalid argument value")
 
 
-def _cursor(context, scope, offset):
+def _cursor(context: SynthesisContext, scope, offset):
     payload = canonical([context.context_id, scope, offset])
     return base64.urlsafe_b64encode(payload + hmac.new(context._cursor_key, payload, hashlib.sha256).digest()).decode()
 
 
-def _offset(context, scope, cursor):
+def _offset(context: SynthesisContext, scope, cursor):
     if cursor is None:
         return 0
     try:
@@ -73,7 +73,7 @@ def _offset(context, scope, cursor):
         raise ToolError("invalid_cursor", "cursor does not belong to this query") from None
 
 
-def _page(context, scope, records, cursor):
+def _page(context: SynthesisContext, scope, records, cursor):
     offset = _offset(context, scope, cursor)
     if offset >= len(records) and offset:
         raise ToolError("invalid_cursor", "cursor outside result")
@@ -104,7 +104,7 @@ def _public(value):
     return result
 
 
-def _candidate(context, expression):
+def _candidate(context: SynthesisContext, expression):
     from .family import parse_candidate
     if not isinstance(expression, str) or not expression.strip() or len(expression.encode()) > MAX_EXPRESSION:
         raise ToolError("invalid_predicate", "predicate exceeds expression bound")
@@ -114,7 +114,7 @@ def _candidate(context, expression):
         raise ToolError("invalid_predicate", "canonical family parser rejected predicate") from error
 
 
-def _result(context, result_id, cursor=None):
+def _result(context: SynthesisContext, result_id, cursor=None):
     if result_id not in context._results:
         raise ToolError("out_of_scope", "unknown candidate result")
     result = context._results[result_id]
@@ -122,7 +122,7 @@ def _result(context, result_id, cursor=None):
             "cases": _page(context, "result:" + result_id, [_public(c) for c in result.get("cases", [])], cursor)}
 
 
-def call_tool(context, name, args):
+def call_tool(context: SynthesisContext, name, args):
     base = {"context_id": context.context_id, "truncated": False}
     try:
         definitions = {item["name"]: item for item in tool_definitions()}
@@ -239,7 +239,7 @@ def call_tool(context, name, args):
         return {**base, "ok": False, "error": {"code": "backend_error", "message": "prepared dataset query failed"}}
 
 
-def validate_proposal(context, value):
+def validate_proposal(context: SynthesisContext, value):
     if not isinstance(value, str) or len(value.encode()) > 16384:
         raise ValueError("proposal exceeds size bound")
     proposal = keys(strict_json(value), {"schema_version", "context_id", "decision", "predicate", "evidence_ids", "assumptions", "reason"})

@@ -19,8 +19,32 @@ Optionally add `--binradar-run /path/to/binradar-run` for committed patch-zero
 mutation evidence from a `--generate-binradar` run. Setup does not call an LLM
 or generate fresh mutation tests.
 `--analysis-provider` defaults to `ghidra`; REA/Ghidra are local static analysis
-backends, not model-accessible services. Setup freezes function, instruction,
-decompilation and reference views with availability/provenance records.
+backends, not model-accessible services. Setup keeps one private REA stdio session
+for the binary, rather than importing it for every view. It resolves both selected
+addresses to actual Ghidra function bodies (including stripped binaries). If they
+share a function, function/instruction/decompilation work is reused; exact-address
+references remain separate. A destination is a selected repair entry point, not
+an assertion that its function is a safe error handler.
+
+`--analysis-timeout SECONDS` controls initial Ghidra import/analysis (default
+**900**). `--analysis-query-timeout SECONDS` controls each subsequent query
+(default **120**). Both accept positive whole seconds, at most 2147483. The first
+native query gets both budgets because opening REA does not necessarily start
+Ghidra. Native decompilation gets 75% of the query budget (at least one second),
+leaving time to return its unavailable-facet diagnostics. For larger subjects:
+
+```sh
+# Add to the setup command; these are not provider/LLM timeouts.
+--analysis-timeout 1800 --analysis-query-timeout 240
+```
+
+Instructions and address references are frozen before the function dossier;
+pseudocode is extracted from that same dossier without a second decompile.
+Timeout cancellation retires the session, awaits REA's detached-backend cleanup,
+and leaves completed views intact; it does not repeat cold startup for each
+missing view. Unavailable/partial views stay explicitly unavailable. `prepared`
+means dataset publication, not that all static views succeeded. Inspect
+`manifest.json`'s `analysis` entries before relying on that context.
 
 Required workdir inputs:
 

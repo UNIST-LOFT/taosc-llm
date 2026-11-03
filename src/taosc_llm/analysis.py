@@ -1,34 +1,15 @@
-"""Host-selected local REA static views; never a generic command/MCP adapter."""
+"""Host-selected local REA static views; never a model-accessible analysis service."""
 from __future__ import annotations
 
-import json
 import os
-from pathlib import Path
-import re
 import shutil
-import subprocess
+from pathlib import Path
 
-from elftools.elf.elffile import ELFFile
-
+from ._rea import ReaSession
 from .dataset import canonical, sha256
 
-
-def _function_range(binary: Path, address: int) -> dict:
-    with binary.open("rb") as stream:
-        elf = ELFFile(stream)
-        matches = []
-        for section in elf.iter_sections():
-            if section["sh_type"] not in ("SHT_SYMTAB", "SHT_DYNSYM"):
-                continue
-            for symbol in section.iter_symbols():
-                start, size = int(symbol["st_value"]), int(symbol["st_size"])
-                if symbol["st_info"]["type"] == "STT_FUNC" and size and start <= address < start + size:
-                    matches.append((start, start + size))
-        unique = set(matches)
-        if len(unique) == 1:
-            start, end = unique.pop()
-            return {"start": start, "end": end, "address_domain": "elf-va", "confidence": "elf-symbol"}
-    return {"start": address, "end": None, "address_domain": "elf-va", "confidence": "unavailable"}
+_OPERATIONS = {"resolve": "resolve_containing_procedure", "function": "analyze_function",
+               "instructions": "read_function_instructions", "references": "xrefs"}
 
 
 def _unavailable(value) -> str | None:
@@ -70,22 +51,20 @@ def _backend_version(value):
 
 
 def _static_identity(payload, artifact_hash: str, address: int, command: str, provider: str) -> str | None:
-    """Validate the REA CLI evidence envelope, not incidental cache contents."""
+    """Validate original REA Evidence; never rewrite its bound query parameters."""
     if not isinstance(payload, dict) or payload.get("ok") is not True:
-        return "REA static evidence envelope unavailable"
+        return _unavailable(payload) or "REA static evidence envelope unavailable"
     data = payload.get("data")
     if not isinstance(data, dict):
         return "REA static evidence data unavailable"
-    operations = {"function": "analyze_function", "instructions": "read_function_instructions",
-                  "decompile": "procedure_pseudo_code", "xrefs": "xrefs"}
     subject, backend, parameters = (data.get(key) for key in ("subject", "provider", "parameters"))
     if (not isinstance(subject, dict) or not isinstance(subject.get("digest"), dict)
             or subject["digest"].get("sha256") != artifact_hash):
         return "REA static evidence artifact identity mismatch"
     if not isinstance(backend, dict) or backend.get("id") != provider:
         return "REA static evidence provider identity mismatch"
-    parameter = "address" if command == "xrefs" else "procedure"
-    if (data.get("operation") != operations[command] or not isinstance(parameters, dict)
+    parameter = "address" if command in ("resolve", "references") else "procedure"
+    if (data.get("operation") != _OPERATIONS[command] or not isinstance(parameters, dict)
             or parameters.get(parameter) != hex(address)):
         return "REA static evidence operation/address identity mismatch"
     if data.get("normalized_result") is None:
@@ -93,70 +72,139 @@ def _static_identity(payload, artifact_hash: str, address: int, command: str, pr
     return None
 
 
+def _resolve(payload: dict, digest: str, address: int, provider: str) -> tuple[int | None, dict, str | None]:
+    extent = {"start": address, "end": None, "address_domain": "elf-va", "confidence": "unavailable"}
+    reason = _static_identity(payload, digest, address, "resolve", provider) or _unavailable(payload)
+    if reason:
+        return None, extent, reason
+    value = payload["data"]["normalized_result"]
+    if (not isinstance(value, dict) or value.get("found") is not True
+            or value.get("query_address") != hex(address)):
+        return None, extent, "REA did not resolve the requested containing function"
+    procedure = value.get("procedure")
+    if not isinstance(procedure, dict):
+        return None, extent, "REA containing function identity unavailable"
+    try:
+        entry = int(procedure["address"], 16)
+        body = procedure["body"]
+        ranges = [(int(item["start"], 16), int(item["end"], 16)) for item in body["ranges"]]
+        if (body.get("available") is not True or not ranges or entry <= 0
+                or any(start < 0 or end < start or end >= 2**64 for start, end in ranges)
+                or not any(start <= address <= end for start, end in ranges)
+                or not any(start <= entry <= end for start, end in ranges)):
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        return None, extent, "REA containing function has no complete, matching body ranges"
+    extent = {"start": min(start for start, _ in ranges), "end": max(end for _, end in ranges) + 1,
+              "ranges": [{"start": start, "end": end + 1} for start, end in ranges],
+              "entry": entry, "address_domain": "elf-va", "confidence": "ghidra-function-body"}
+    return entry, extent, None
+
+
 def prepare_analysis(root: Path, binary: Path, addresses: dict[str, int], *,
-                     rea: str | None, provider: str) -> list[dict]:
+                     rea: str | None, provider: str, timeout: int = 900,
+                     query_timeout: int = 120) -> list[dict]:
     if provider != "ghidra":
         raise ValueError("static preparation currently supports only the explicit ghidra provider")
+    if any(type(value) is not int or not 1 <= value <= 2147483 for value in (timeout, query_timeout)):
+        raise ValueError("static analysis timeouts must be 1..2147483 integer seconds")
+    root, binary = root.resolve(), binary.resolve()
     executable = rea or os.environ.get("TAOSC_LLM_REA") or shutil.which("rea")
-    prefix = [executable] if executable else []
-    environment = {key: os.environ[key] for key in ("PATH", "JAVA_HOME", "GHIDRA_INSTALL_DIR", "LANG") if key in os.environ}
+    if executable:
+        executable = str(Path(executable).absolute()) if os.path.sep in executable else shutil.which(executable)
     cache = root / "analysis-cache"
     cache.mkdir()
+    (root / "analysis").mkdir()
+    environment = {key: os.environ[key] for key in ("PATH", "JAVA_HOME", "GHIDRA_INSTALL_DIR", "LANG") if key in os.environ}
     environment.update({"HOME": str(cache), "XDG_CACHE_HOME": str(cache / "cache"),
-                        "XDG_CONFIG_HOME": str(cache / "config"), "XDG_DATA_HOME": str(cache / "data")})
-    rea_version = None
-    if prefix:
-        try:
-            probe = subprocess.run([*prefix, "--help"], env=environment, capture_output=True, text=True, timeout=30)
-            match = re.search(r"rea@([0-9][^\s]*)", probe.stdout)
-            rea_version = match[1] if match else None
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-    directory = root / "analysis"
-    directory.mkdir()
-    records = []
+                        "XDG_CONFIG_HOME": str(cache / "config"), "XDG_DATA_HOME": str(cache / "data"),
+                        "REA_ANALYSIS_PROVIDER": provider,
+                        "REA_GHIDRA_STARTUP_TIMEOUT_MS": str(timeout * 1000),
+                        # Leave transport/dossier time after the native decompiler's own deadline.
+                        "REA_GHIDRA_DECOMPILE_TIMEOUT_SECONDS": str(max(1, query_timeout * 3 // 4))})
     artifact_hash = sha256(binary)
-    for function_id, address in addresses.items():
-        extent = _function_range(binary, address)
-        for view, command in (("function", "function"), ("instructions", "instructions"),
-                              ("decompilation", "decompile"), ("references", "xrefs")):
-            argv = [*prefix, command, str(binary), hex(address), "--provider", provider, "--format", "json", "--full-output"] if prefix else []
-            reason, payload = None, None
-            if not prefix:
-                reason = "REA executable unavailable"
+    records: list[dict] = []
+    resolutions: dict[str, tuple[dict, int | None, dict, str | None]] = {}
+    observations: dict[tuple[str, int], tuple[dict, str]] = {}
+    rea_version = None
+
+    def publish(function_id, view, payload, reason, analysis_address, reused_from=None):
+        resolution, _entry, extent, _resolution_reason = resolutions[function_id]
+        version = _backend_version(payload)
+        command = "function" if view == "decompilation" else view
+        record = {"function_id": function_id, "view": view,
+                  "path": f"analysis/{function_id}-{view}.json",
+                  "availability": "unavailable" if reason else "available", "reason": reason,
+                  "complete": reason is None, "backend": provider, "backend_version": version,
+                  "backend_version_availability": "available" if version else "unavailable",
+                  "rea_version": rea_version, "artifact_sha256": artifact_hash,
+                  "range": extent, "requested_address": addresses[function_id],
+                  "analysis_address": analysis_address,
+                  "provenance": {"operation": _OPERATIONS[command], "provider": provider, "local_static": True}}
+        if reused_from is not None:
+            record["reused_from"] = reused_from
+        output = {"metadata": record, "resolution": resolution, "evidence": payload}
+        if view == "decompilation":
+            record["provenance"]["facet"] = "pseudocode"
+            output["value"] = payload["data"]["normalized_result"].get("pseudocode") if reason is None else None
+        path = root / record["path"]
+        path.write_bytes(canonical(output) + b"\n")
+        record["sha256"] = sha256(path)
+        records.append(record)
+
+    def collect(session: ReaSession | None):
+        # Resolve actual Ghidra bodies, including stripped/non-contiguous functions.
+        # A selected destination is an entry point, not proof of a safe error handler.
+        for function_id, address in addresses.items():
+            payload = session.query(_OPERATIONS["resolve"], address) if session else {"ok": False, "error": failure}
+            entry, extent, reason = _resolve(payload, artifact_hash, address, provider)
+            resolutions[function_id] = (payload, entry, extent, reason)
+        # Preserve cheap listing/address facts before any bounded decompilation.
+        for view in ("instructions", "references", "function", "decompilation"):
+            for function_id, address in addresses.items():
+                _resolution, entry, _extent, resolution_reason = resolutions[function_id]
+                command = "function" if view == "decompilation" else view
+                analysis_address = address if view == "references" else entry
+                reused_from = None
+                payload: dict | None
+                if analysis_address is None:
+                    payload, reason = None, resolution_reason
+                else:
+                    key = (command, analysis_address)
+                    if key in observations:
+                        payload, source = observations[key]
+                        if source != function_id:
+                            reused_from = source
+                    else:
+                        payload = session.query(_OPERATIONS[command], analysis_address) if session else {"ok": False, "error": failure}
+                        observations[key] = (payload, function_id)
+                    reason = _static_identity(payload, artifact_hash, analysis_address, command, provider)
+                    if reason is None and view == "decompilation":
+                        value = payload["data"]["normalized_result"]
+                        facet = value.get("facet_availability", {}).get("pseudocode", {}) if isinstance(value, dict) else {}
+                        if facet.get("available") is not True or not isinstance(value.get("pseudocode"), str) or not value["pseudocode"].strip():
+                            reason = str(facet.get("reason") or "REA pseudocode unavailable")
+                    elif reason is None:
+                        reason = _unavailable(payload)
+                publish(function_id, view, payload, reason, analysis_address, reused_from)
+
+    try:
+        failure = "REA executable unavailable"
+        if executable:
+            session = ReaSession(executable, binary, artifact_hash, environment, cache, timeout, query_timeout)
+            try:
+                session.__enter__()
+            except (OSError, EOFError, ValueError) as exc:
+                failure = f"REA static initialization unavailable: {exc}"
             else:
                 try:
-                    completed = subprocess.run(argv, env=environment, cwd=cache, capture_output=True,
-                                               text=True, timeout=180)
-                    if completed.returncode:
-                        try:
-                            payload = json.loads(completed.stdout)
-                        except ValueError:
-                            pass
-                        error = payload.get("error") if isinstance(payload, dict) else None
-                        message = error.get("message") if isinstance(error, dict) else None
-                        detail = message if isinstance(message, str) else completed.stderr.strip()
-                        reason = f"REA exited {completed.returncode}: {detail}"
-                    else:
-                        payload = json.loads(completed.stdout)
-                        reason = (_unavailable(payload) or
-                                  _static_identity(payload, artifact_hash, address, command, provider))
-                except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
-                    reason = f"REA static view unavailable: {exc}"
-            record = {"function_id": function_id, "view": view,
-                      "path": f"analysis/{function_id}-{view}.json",
-                      "availability": "unavailable" if reason else "available", "reason": reason,
-                      "complete": reason is None, "backend": provider,
-                      "backend_version": _backend_version(payload),
-                      "backend_version_availability": "available" if _backend_version(payload) else "unavailable",
-                      "rea_version": rea_version, "artifact_sha256": artifact_hash,
-                      "range": extent, "requested_address": address,
-                      "provenance": {"command": command, "provider": provider, "local_static": True}}
-            output = {"metadata": record, "evidence": payload}
-            path = root / record["path"]
-            path.write_bytes(canonical(output) + b"\n")
-            record["sha256"] = sha256(path)
-            records.append(record)
-    # REA's incidental cache is not evidence and must not leak mutable source paths.
-    shutil.rmtree(cache)
-    return records
+                    rea_version = session.version
+                    collect(session)
+                finally:
+                    session.close()
+                return records
+        collect(None)
+        return records
+    finally:
+        # Incidental REA caches are not evidence. Completed views are already frozen.
+        shutil.rmtree(cache)

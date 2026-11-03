@@ -195,6 +195,28 @@ def test_imports_committed_mutation_and_typed_oracle(tmp_path, family):
     assert dataset.manifest["oracles"]["mutation_reference"]["address"] == 0x1234
 
 
+@pytest.mark.parametrize("family", ["ERM generic", "ERM CWE-805"])
+def test_imports_patch0_mutations_after_predicate_table_changes(tmp_path, family):
+    config, work, concrete = preparation_inputs(tmp_path, family)
+    mutation = mutation_inputs(tmp_path, work)
+    runtime_family, _ = predicates.load_runtime_predicates(work / "brpatches.json")
+    if family == "ERM generic":
+        source = "rax != 0"
+        parsed = predicates.predicate_to_branch_patch_str(source)
+    else:
+        source = "s->rax >= i->begin && s->rax < i->end"
+        parsed = predicates.parse_CWE805_predicate(source)
+    predicates.write_runtime_predicates(work / "brpatches.json", runtime_family,
+        [predicates.PredicateRecord(1, 1, source, parsed)])
+
+    dataset = prepare_dataset(config, work, concrete, mutation, output=tmp_path / "dataset")
+    capture = dataset.case("function:2")["capture"]
+    assert capture["descriptor"] == "p0"
+    assert capture["same_crash"] is True
+    assert [state.branch for state in dataset.snapshots(capture)] == [0]
+    assert predicates.evaluate_cached_predicate(parsed, dataset.snapshots(capture)) == [1]
+
+
 @pytest.mark.parametrize("defect", ["torn", "orphan", "malformed", "context"])
 def test_unpublished_or_bad_mutation_never_supplies_verdict(tmp_path, defect):
     config, work, concrete = preparation_inputs(tmp_path)
@@ -224,6 +246,45 @@ def test_untyped_normal_attempt1_does_not_authorize_same_crash(tmp_path):
     assert dataset.case("function:2")["capture"]["same_crash"] is None
 
 
+def static_session(monkeypatch, transform=lambda payload: payload):
+    calls = []
+
+    class Session:
+        version = "6.8.0"
+
+        def __init__(self, executable, binary, digest, environment, directory, timeout, query_timeout):
+            assert "PRIVATE_PROVIDER_TOKEN" not in environment
+            self.digest = digest
+
+        def __enter__(self):
+            return self
+
+        def close(self):
+            pass
+
+        def query(self, operation, address):
+            calls.append((operation, address))
+            entry = address & ~15
+            procedure = {"address": hex(entry), "body": {"available": True,
+                         "ranges": [{"start": hex(entry), "end": hex(entry + 15)}]}}
+            normalized = {
+                "resolve_containing_procedure": {"query_address": hex(address), "found": True, "procedure": procedure},
+                "analyze_function": {"procedure": procedure, "assembly": [f"{hex(entry)}: NOP"],
+                                     "pseudocode": "void fixture(void) { return; }",
+                                     "facet_availability": {"pseudocode": {"available": True}}},
+                "read_function_instructions": {"procedure": procedure, "instructions": [f"{hex(entry)}: NOP"]},
+                "xrefs": [{"to": hex(address)}],
+            }
+            data = {"subject": {"digest": {"sha256": self.digest}},
+                    "provider": {"id": "ghidra", "version": "12.1"}, "operation": operation,
+                    "parameters": {"address" if operation in ("resolve_containing_procedure", "xrefs") else "procedure": hex(address)},
+                    "normalized_result": normalized[operation]}
+            return transform({"ok": True, "data": data})
+
+    monkeypatch.setattr(analysis, "ReaSession", Session)
+    return calls
+
+
 @pytest.mark.parametrize("payload", [{"ok": False, "error": "backend failed"},
                                      {"success": False, "reason": "backend not installed"},
                                      {"complete": False, "reason": "partial function"},
@@ -231,15 +292,9 @@ def test_untyped_normal_attempt1_does_not_authorize_same_crash(tmp_path):
                                      {"facet_availability": {"pseudocode": {"available": False}}},
                                      {"relationship_coverage": {"status": "partial"}}])
 def test_analysis_backend_failure_and_partial_output_remain_unavailable(tmp_path, monkeypatch, payload):
-    from types import SimpleNamespace
     config, work, run = preparation_inputs(tmp_path)
     monkeypatch.setenv("PRIVATE_PROVIDER_TOKEN", "must-not-reach-static-child")
-    def invoke(argv, **kwargs):
-        assert "PRIVATE_PROVIDER_TOKEN" not in kwargs["env"]
-        if argv[-1] == "--help":
-            return SimpleNamespace(returncode=0, stdout="rea@6.8.0", stderr="")
-        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
-    monkeypatch.setattr(analysis.subprocess, "run", invoke)
+    static_session(monkeypatch, lambda _: payload)
     dataset = prepare_dataset(config, work, run, None, output=tmp_path / "dataset", rea="/host/rea")
     assert all(row["availability"] == "unavailable" and not row["complete"]
                for row in dataset.manifest["analysis"])
@@ -247,25 +302,10 @@ def test_analysis_backend_failure_and_partial_output_remain_unavailable(tmp_path
 
 @pytest.mark.parametrize("defect", [None, "artifact", "provider", "operation", "address", "missing-result", "facet"])
 def test_static_views_require_bound_producer_evidence(tmp_path, monkeypatch, defect):
-    from types import SimpleNamespace
     config, work, run = preparation_inputs(tmp_path)
-    operations = {"function": "analyze_function", "instructions": "read_function_instructions",
-                  "decompile": "procedure_pseudo_code", "xrefs": "xrefs"}
 
-    def invoke(argv, **kwargs):
-        if argv[-1] == "--help":
-            return SimpleNamespace(returncode=0, stdout="rea@6.8.0", stderr="")
-        command, binary, address = argv[1:4]
-        # REA 6.8 CLI envelope/operation names observed from its actual Ghidra outputs.
-        procedure = {"address": address, "body": {"available": True}}
-        normalized = {"function": {"procedure": procedure, "assembly": [f"{address}: NOP"]},
-                      "instructions": {"procedure": procedure, "instructions": [f"{address}: NOP"]},
-                      "decompile": "void fixture(void) { return; }", "xrefs": []}
-        data = {"subject": {"digest": {"sha256": sha256(Path(binary))}},
-                "provider": {"id": "ghidra", "version": "12.1"},
-                "operation": operations[command],
-                "parameters": {"address" if command == "xrefs" else "procedure": address},
-                "normalized_result": normalized[command]}
+    def corrupt(payload):
+        data = payload["data"]
         if defect == "artifact":
             data["subject"]["digest"]["sha256"] = "0" * 64
         elif defect == "provider":
@@ -278,12 +318,87 @@ def test_static_views_require_bound_producer_evidence(tmp_path, monkeypatch, def
             data.pop("normalized_result")
         elif defect == "facet":
             data["facet_availability"] = {"pseudocode": {"available": False}}
-        return SimpleNamespace(returncode=0, stdout=json.dumps({"ok": True, "data": data}), stderr="")
+        return payload
 
-    monkeypatch.setattr(analysis.subprocess, "run", invoke)
+    static_session(monkeypatch, corrupt)
     dataset = prepare_dataset(config, work, run, None, output=tmp_path / "dataset", rea="/host/rea")
     assert all(record["availability"] == ("available" if defect is None else "unavailable")
                and record["complete"] is (defect is None) for record in dataset.manifest["analysis"])
+
+
+def test_same_function_reuses_dossier_but_not_address_references(tmp_path, monkeypatch):
+    config, work, run = preparation_inputs(tmp_path)
+    calls = static_session(monkeypatch)
+    dataset = prepare_dataset(config, work, run, None, output=tmp_path / "dataset", rea="/host/rea")
+    records = {(row["function_id"], row["view"]): row for row in dataset.manifest["analysis"]}
+    patch = int((work / "patch-location").read_text(), 16)
+    destination = int((work / "patch-destination").read_text(), 16)
+    assert calls.count(("analyze_function", patch & ~15)) == 1
+    assert calls.count(("read_function_instructions", patch & ~15)) == 1
+    for view in ("function", "instructions", "decompilation"):
+        row = records["destination", view]
+        assert row["reused_from"] == "patch" and row["requested_address"] == destination
+        assert row["analysis_address"] == patch & ~15
+        output = json.loads((dataset.root / row["path"]).read_text())
+        assert output["resolution"]["data"]["parameters"]["address"] == hex(destination)
+        assert output["evidence"]["data"]["parameters"]["procedure"] == hex(patch & ~15)
+    for role, address in (("patch", patch), ("destination", destination)):
+        row = records[role, "references"]
+        assert "reused_from" not in row
+        output = json.loads((dataset.root / row["path"]).read_text())
+        assert output["evidence"]["data"]["normalized_result"] == [{"to": hex(address)}]
+
+
+def test_different_function_destination_is_collected_separately(tmp_path, monkeypatch):
+    config, work, run = preparation_inputs(tmp_path)
+    patch = int((work / "patch-location").read_text(), 16)
+    destination = patch + 32
+    (work / "patch-destination").write_text(hex(destination))
+    calls = static_session(monkeypatch)
+    dataset = prepare_dataset(config, work, run, None, output=tmp_path / "dataset", rea="/host/rea")
+    assert {address for operation, address in calls if operation == "analyze_function"} == {patch, destination}
+    assert all("reused_from" not in row for row in dataset.manifest["analysis"])
+
+
+def test_containment_does_not_infer_across_body_gaps(tmp_path, monkeypatch):
+    config, work, run = preparation_inputs(tmp_path)
+    patch = int((work / "patch-location").read_text(), 16)
+
+    def gap(payload):
+        data = payload["data"]
+        if data["operation"] == "resolve_containing_procedure":
+            data["normalized_result"]["procedure"]["body"]["ranges"] = [
+                {"start": hex(patch), "end": hex(patch)},
+                {"start": hex(patch + 2), "end": hex(patch + 15)}]
+        return payload
+
+    calls = static_session(monkeypatch, gap)
+    dataset = prepare_dataset(config, work, run, None, output=tmp_path / "dataset", rea="/host/rea")
+    for row in dataset.manifest["analysis"]:
+        if row["function_id"] == "destination" and row["view"] != "references":
+            assert row["availability"] == "unavailable" and "reused_from" not in row
+    assert calls.count(("analyze_function", patch)) == 1
+
+
+def test_native_decompile_failure_preserves_completed_listing_views(tmp_path, monkeypatch):
+    config, work, run = preparation_inputs(tmp_path)
+
+    def decompile_timeout(payload):
+        data = payload["data"]
+        if data["operation"] == "analyze_function":
+            data["normalized_result"]["pseudocode"] = ""
+            data["normalized_result"]["facet_availability"]["pseudocode"] = {
+                "available": False, "reason": "native decompile deadline exceeded"}
+        return payload
+
+    static_session(monkeypatch, decompile_timeout)
+    dataset = prepare_dataset(config, work, run, None, output=tmp_path / "dataset", rea="/host/rea")
+    for row in dataset.manifest["analysis"]:
+        if row["view"] in ("instructions", "references"):
+            assert row["availability"] == "available"
+        else:
+            assert row["availability"] == "unavailable"
+            assert row["reason"] == "native decompile deadline exceeded"
 
 
 def test_case_scope_must_match_domain_even_with_valid_hashes(tmp_path):
