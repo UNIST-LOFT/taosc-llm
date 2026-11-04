@@ -1,286 +1,276 @@
 #!/usr/bin/env bash
-#
-# Debug example: run both BinRadar generation modes concurrently and drive
-# taosc-llm against them.
-#
-#   1. binradar --generate-concrete        (original-only input corpus)
-#   2. binradar --generate-binradar --replay-server
-#   3. taosc-llm-setup / taosc-llm-evaluate / taosc-llm
-#
-# The two generation runs are independent producers.  They share the prepared
-# workdir (that is where patch-location/patch-format/patch-destination live)
-# but write different run directories, so they may run at the same time.
-#
-# Usage:
-#   utils/taosc-llm/run.sh [--subject DIR] [--workdir NAME] [--outdir DIR]
-#                          [--timeout SECONDS] [--provider-env FILE]
-#                          [--predicate PREDICATE] [--rea PATH]
-#                          [--no-llm]
-#
-# Environment:
-#   TAOSC_LLM_REA         REA binary (default: `rea` from PATH)
-#   JAVA_HOME             JDK required by REA/Ghidra
-#   GHIDRA_INSTALL_DIR    Ghidra install root required by REA
-#
-# The Guix-built taosc-llm wrappers set JAVA_HOME/GHIDRA_INSTALL_DIR
-# themselves.  A checkout `uv run` does not, so export them (or use the Guix
-# package) before taosc-llm-setup runs.
-#
-# What it demonstrates, in order:
-#   * concrete and mutation generation start together;
-#   * the replay socket is polled with `status` (never inferred from logs), and
-#     a dead launcher fails the wait instead of hanging;
-#   * taosc-llm-setup freezes the concrete run and the live mutation run;
-#   * taosc-llm-evaluate --warm fills the concrete cache once, then the
-#     candidate evaluation reuses it;
-#   * taosc-llm gets `--replay-socket` + `--cache-dir`, so function cases are
-#     evaluated by the resident snapshot and concrete cases by the trusted
-#     host worker.  Neither socket nor cache path is a model tool argument.
-#
+# Debug example only: concurrent concrete/resident generation, immutable dataset,
+# cache warm, then manual/provider synthesis. Scoped results are never FINAL.
 set -euo pipefail
 
-REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-TAOSC_LLM=$REPO/utils/taosc-llm
-SUBJECT=$REPO/benchmarks/loftix/binutils/CVE-2017-14745
-WORKDIR_NAME=workdir-0.1.24
-OUTDIR=""
-TIMEOUT=7200
-PROVIDER_ENV=""
-PREDICATE=""
-NO_LLM=0
-# Prefer an explicit path, then the Guix-built REA, then PATH.  A mise shim
-# named `rea` can exist without a selected version and exits nonzero, so a
-# bare `command -v rea` is not proof that the binary runs.
-default_rea() {
-  if [ -n "${TAOSC_LLM_REA:-}" ]; then
-    printf '%s' "$TAOSC_LLM_REA"
-    return
-  fi
-  local candidate
-  candidate=$(ls -d /gnu/store/*-taosc-llm-rea-*/bin/rea 2>/dev/null | sort | tail -1)
-  if [ -n "$candidate" ] && "$candidate" --version >/dev/null 2>&1; then
-    printf '%s' "$candidate"
-    return
-  fi
-  candidate=$(command -v rea || true)
-  if [ -n "$candidate" ] && "$candidate" --version >/dev/null 2>&1; then
-    printf '%s' "$candidate"
-  fi
+# Keep lexical aliases: resolving a short symlink can exceed sockaddr_un's limit.
+absolute_path() { realpath --canonicalize-missing --no-symlinks -- "$1"; }
+socket_path_fits() {
+  local LC_ALL=C path=$1
+  [ "${#path}" -le 107 ]
 }
-REA=$(default_rea)
-STAMP=debug-$(date +%Y%m%d-%H%M%S)
-CONCRETE_PREFIX=br-gen-con
-MUTATION_PREFIX=br-gen-bin
-# ``br-gen-bin-00000/replay.sock`` is 29 bytes, the widest deterministic suffix.
-SOCKET_SUFFIX=/br-gen-bin-00000/replay.sock
-MAX_SOCKET_PATH=107
-
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --subject) SUBJECT=$2; shift 2 ;;
-    --workdir) WORKDIR_NAME=$2; shift 2 ;;
-    --outdir) OUTDIR=$2; shift 2 ;;
-    --timeout) TIMEOUT=$2; shift 2 ;;
-    --provider-env) PROVIDER_ENV=$2; shift 2 ;;
-    --predicate) PREDICATE=$2; shift 2 ;;
-    --rea) REA=$2; shift 2 ;;
-    --no-llm) NO_LLM=1; shift ;;
-    -h|--help) sed -n '2,40p' "${BASH_SOURCE[0]}"; exit 0 ;;
-    *) echo "unknown option: $1" >&2; exit 2 ;;
-  esac
-done
-
-WORKDIR=$SUBJECT/$WORKDIR_NAME
-[ -d "$SUBJECT" ] || { echo "subject directory not found: $SUBJECT" >&2; exit 2; }
-[ -f "$WORKDIR/patch-location" ] || {
-  echo "$WORKDIR has no patch-location; run taosc-fix (or taosc-fix-prepare) first" >&2
-  exit 2
-}
-[ -n "$REA" ] || { echo "REA not found; pass --rea PATH or set TAOSC_LLM_REA" >&2; exit 2; }
-if [ -z "${JAVA_HOME:-}" ] || [ -z "${GHIDRA_INSTALL_DIR:-}" ]; then
-  echo "note: JAVA_HOME/GHIDRA_INSTALL_DIR are not both set; static analysis needs them" >&2
-  echo "      (the Guix taosc-llm wrapper supplies both; a checkout run must export them)" >&2
-fi
-if [ "$NO_LLM" -eq 1 ]; then
-  [ -n "$PREDICATE" ] || { echo "--no-llm needs --predicate" >&2; exit 2; }
-elif [ -z "$PROVIDER_ENV" ]; then
-  echo "model mode needs --provider-env; use --no-llm for the manual predicate path" >&2
-  exit 2
-fi
-
-# A fresh run root keeps run ids deterministic (0) for the whole example and
-# avoids reusing another operator's in-flight run directories.
-if [ -z "$OUTDIR" ]; then
-  OUTDIR=$WORKDIR/out
-fi
-RUNS=$OUTDIR/runs-$STAMP
-if [ $(( ${#RUNS} + ${#SOCKET_SUFFIX} )) -gt "$MAX_SOCKET_PATH" ]; then
-  SHORT=/tmp/binradar-debug-$STAMP
-  echo "note: $RUNS$SOCKET_SUFFIX exceeds the ${MAX_SOCKET_PATH}-byte Unix socket" >&2
-  echo "      limit; using $SHORT instead (override with --outdir on a short path)" >&2
-  RUNS=$SHORT
-fi
-[ $(( ${#RUNS} + ${#SOCKET_SUFFIX} )) -le "$MAX_SOCKET_PATH" ] || {
-  echo "output path still exceeds the Unix socket limit: $RUNS" >&2
-  exit 2
+allocate_runs() {
+  local out=$1 template
+  template=$out/runs-debug-XXXXXXXXXX
+  if ! socket_path_fits "$template/br-gen-bin-00000/replay.sock"; then
+    echo "note: output socket path exceeds 107 bytes; using an exclusive /tmp run root" >&2
+    template=/tmp/binradar-debug-XXXXXXXXXX
+  else
+    mkdir -p -- "$out"
+  fi
+  RUNS=$(mktemp -d -- "$template")
 }
 
-LOG=$RUNS/logs
-CONCRETE_RUN=$RUNS/$CONCRETE_PREFIX-00000
-MUTATION_RUN=$RUNS/$MUTATION_PREFIX-00000
-MUTATION_SOCKET=$MUTATION_RUN/replay.sock
-DATASET=$RUNS/dataset
-RESULT=$RUNS/taosc-llm-result
-CACHE=$RUNS/taosc-llm-cache
-mkdir -p "$LOG" "$CACHE"
-
-CONCRETE_PID=
-MUTATION_PID=
-cleanup() {
-  local status=$?
-  trap - EXIT INT TERM
-  # Ask the resident server to shut down before signalling anything: that path
-  # reaps the snapshot parent, solver and child and removes the socket.
-  if [ -n "$MUTATION_PID" ] && kill -0 "$MUTATION_PID" 2>/dev/null; then
-    if [ -S "$MUTATION_SOCKET" ]; then
-      uv run --project "$TAOSC_LLM" python -m taosc_llm.replay shutdown \
-        --socket "$MUTATION_SOCKET" >/dev/null 2>&1 || true
-    fi
-    for _ in $(seq 1 40); do
-      kill -0 "$MUTATION_PID" 2>/dev/null || break
-      sleep 0.5
+# Own each job's process group so cleanup still reaches descendants after its
+# launcher exits, and forced termination does not depend on uv's signal forwarding.
+start_job() {
+  setsid "$@" &
+  STARTED_PID=$!
+  OWNED_PIDS+=("$STARTED_PID")
+}
+retire_job() {
+  local pid=$1 index
+  # Keep a group while forwarded descendants survive its leader, but do not
+  # retain completed identities throughout a potentially unlimited generation.
+  if ! kill -0 -- "-$pid" 2>/dev/null; then
+    for index in "${!OWNED_PIDS[@]}"; do
+      if [ "${OWNED_PIDS[$index]}" = "$pid" ]; then unset 'OWNED_PIDS[index]'; fi
     done
-    kill -TERM "$MUTATION_PID" 2>/dev/null || true
   fi
-  [ -n "$CONCRETE_PID" ] && kill -TERM "$CONCRETE_PID" 2>/dev/null || true
-  wait 2>/dev/null || true
-  if [ "$status" -ne 0 ]; then
-    echo "logs kept for diagnosis: $LOG" >&2
+}
+producer_health() {
+  local status
+  if [ -n "$CONCRETE_PID" ] && ! kill -0 "$CONCRETE_PID" 2>/dev/null; then
+    if wait "$CONCRETE_PID"; then status=0; else status=$?; fi
+    retire_job "$CONCRETE_PID"
+    CONCRETE_PID=
+    if [ "$status" -ne 0 ]; then
+      echo "concrete generation failed (exit $status); see $LOG/concrete.log" >&2
+      return 1
+    fi
   fi
+  if [ -n "$MUTATION_PID" ] && ! kill -0 "$MUTATION_PID" 2>/dev/null; then
+    if wait "$MUTATION_PID"; then status=0; else status=$?; fi
+    retire_job "$MUTATION_PID"
+    MUTATION_PID=
+    echo "resident mutation generation exited before shutdown (exit $status); see $LOG/mutation.log" >&2
+    return 1
+  fi
+}
+wait_job() {
+  local pid=$1 status
+  while kill -0 "$pid" 2>/dev/null; do
+    producer_health || return 1
+    sleep 0.1
+  done
+  producer_health || return 1
+  if wait "$pid"; then status=0; else status=$?; fi
+  retire_job "$pid"
+  return "$status"
+}
+run_uv() {
+  local project=$1
+  shift
+  start_job uv run --project "$project" "$@"
+  wait_job "$STARTED_PID"
+}
+owned_groups_alive() {
+  local pid
+  for pid in "${OWNED_PIDS[@]}"; do
+    if kill -0 "$pid" 2>/dev/null || kill -0 -- "-$pid" 2>/dev/null; then return 0; fi
+  done
+  return 1
+}
+cleanup() {
+  local status=$? pid attempt
+  trap - EXIT
+  # Do not let a second signal interrupt bounded cleanup or replace its status.
+  trap '' INT TERM
+  if [ -n "$MUTATION_PID" ] && [ -S "$MUTATION_SOCKET" ]; then
+    # uv itself may still be forwarding: bound both the helper and its children.
+    start_job timeout --kill-after=1 3 uv run --project "$TAOSC_LLM" \
+      python -m taosc_llm.replay shutdown --socket "$MUTATION_SOCKET" >/dev/null 2>&1
+    for ((attempt=0; attempt<40; attempt++)); do
+      kill -0 "$STARTED_PID" 2>/dev/null || break
+      sleep 0.1
+    done
+  fi
+  for pid in "${OWNED_PIDS[@]}"; do
+    kill -TERM -- "-$pid" 2>/dev/null || true
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  for ((attempt=0; attempt<30; attempt++)); do
+    owned_groups_alive || break
+    sleep 0.1
+  done
+  for pid in "${OWNED_PIDS[@]}"; do
+    kill -KILL -- "-$pid" 2>/dev/null || true
+    kill -KILL "$pid" 2>/dev/null || true
+  done
+  # Never make an unbounded final wait, including after SIGKILL (D-state exists).
+  for ((attempt=0; attempt<10; attempt++)); do
+    owned_groups_alive || break
+    sleep 0.1
+  done
+  for pid in "${OWNED_PIDS[@]}"; do
+    if ! kill -0 "$pid" 2>/dev/null; then wait "$pid" 2>/dev/null || true; fi
+  done
+  if [ "$status" -ne 0 ]; then echo "logs kept for diagnosis: $LOG" >&2; fi
   exit "$status"
 }
-trap cleanup EXIT INT TERM
 
-run_uv() { uv run --project "$1" "${@:2}"; }
+default_rea() {
+  if [ -n "${TAOSC_LLM_REA:-}" ]; then printf '%s' "$TAOSC_LLM_REA"; return; fi
+  local candidate
+  candidate=$(ls -d /gnu/store/*-taosc-llm-rea-*/bin/rea 2>/dev/null | sort | tail -1) || true
+  if [ -n "$candidate" ] && "$candidate" --version >/dev/null 2>&1; then
+    printf '%s' "$candidate"; return
+  fi
+  candidate=$(command -v rea || true)
+  if [ -n "$candidate" ] && "$candidate" --version >/dev/null 2>&1; then printf '%s' "$candidate"; fi
+}
 
-# Background a generation in THIS shell so `wait "$pid"` sees it.  A command
-# substitution would background it in a subshell, and the returned pid would
-# no longer be a child of the orchestration shell.
-STARTED_PID=
-start_generation() {
-  local prefix=$1 log=$2
-  shift 2
+main() {
+  REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+  TAOSC_LLM=$REPO/utils/taosc-llm
+  SUBJECT=$REPO/benchmarks/loftix/binutils/CVE-2017-14745
+  WORKDIR_NAME=workdir-0.1.24
+  OUTDIR= TIMEOUT=7200 READY_TIMEOUT=0 PROVIDER_ENV= PREDICATE= NO_LLM=0 REA=
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --subject|--workdir|--outdir|--timeout|--ready-timeout|--provider-env|--predicate|--rea)
+        [ $# -ge 2 ] || { echo "missing value for $1" >&2; return 2; }
+        case "$1" in
+          --subject) SUBJECT=$2 ;; --workdir) WORKDIR_NAME=$2 ;; --outdir) OUTDIR=$2 ;;
+          --timeout) TIMEOUT=$2 ;; --ready-timeout) READY_TIMEOUT=$2 ;;
+          --provider-env) PROVIDER_ENV=$2 ;; --predicate) PREDICATE=$2 ;; --rea) REA=$2 ;;
+        esac
+        shift 2 ;;
+      --no-llm) NO_LLM=1; shift ;;
+      -h|--help)
+        cat <<'HELP'
+Usage: run.sh [--subject DIR] [--workdir NAME] [--outdir DIR]
+              [--timeout SECONDS] [--ready-timeout SECONDS]
+              [--provider-env FILE | --no-llm --predicate PREDICATE] [--rea PATH]
+Debug example: requires a prepared workdir, REA, JAVA_HOME and GHIDRA_INSTALL_DIR.
+--timeout controls native generation only (default 7200; 0 means unlimited).
+--ready-timeout bounds the whole readiness wait, including PROBE (default 0:
+unlimited). A failed producer always ends the wait promptly.
+Warm/synthesis exits 2/3 are scoped rejection/unavailable results, never FINAL.
+HELP
+        return 0 ;;
+      *) echo "unknown option: $1" >&2; return 2 ;;
+    esac
+  done
+  [[ "$READY_TIMEOUT" =~ ^[0-9]+([.][0-9]+)?$ ]] || {
+    echo "--ready-timeout must be nonnegative seconds" >&2; return 2;
+  }
+  SUBJECT=$(absolute_path "$SUBJECT")
+  WORKDIR=$SUBJECT/$WORKDIR_NAME
+  [ -d "$SUBJECT" ] || { echo "subject directory not found: $SUBJECT" >&2; return 2; }
+  [ -f "$WORKDIR/patch-location" ] || {
+    echo "$WORKDIR has no patch-location; run taosc-fix (or taosc-fix-prepare) first" >&2; return 2;
+  }
+  if [ -z "$REA" ]; then REA=$(default_rea); fi
+  [ -n "$REA" ] || { echo "REA not found; pass --rea PATH or set TAOSC_LLM_REA" >&2; return 2; }
+  if [[ "$REA" == */* ]]; then REA=$(absolute_path "$REA"); fi
+  if [ -n "$PROVIDER_ENV" ]; then PROVIDER_ENV=$(absolute_path "$PROVIDER_ENV"); fi
+  if [ -z "${JAVA_HOME:-}" ] || [ -z "${GHIDRA_INSTALL_DIR:-}" ]; then
+    echo "note: checkout static analysis needs JAVA_HOME/GHIDRA_INSTALL_DIR (Guix wrappers supply both)" >&2
+  fi
+  if [ "$NO_LLM" -eq 1 ]; then
+    [ -n "$PREDICATE" ] || { echo "--no-llm needs --predicate" >&2; return 2; }
+  elif [ -z "$PROVIDER_ENV" ]; then
+    echo "model mode needs --provider-env; use --no-llm for the manual predicate path" >&2; return 2
+  fi
+  OUTDIR=$(absolute_path "${OUTDIR:-$WORKDIR/out}")
+  allocate_runs "$OUTDIR"
+  LOG=$RUNS/logs
+  CONCRETE_RUN=$RUNS/br-gen-con-00000
+  MUTATION_RUN=$RUNS/br-gen-bin-00000
+  MUTATION_SOCKET=$MUTATION_RUN/replay.sock
+  DATASET=$RUNS/dataset RESULT=$RUNS/taosc-llm-result CACHE=$RUNS/taosc-llm-cache
+  mkdir -p -- "$LOG" "$CACHE"
+  OWNED_PIDS=() CONCRETE_PID= MUTATION_PID=
+  trap cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  echo "== preparing both generation environments =="
+  run_uv "$REPO" binradar-setup --generate-concrete -c "$SUBJECT" -w "$WORKDIR"
+  run_uv "$REPO" binradar-setup --generate-binradar -c "$SUBJECT" -w "$WORKDIR"
+
+  echo "== starting concrete generation and resident mutation generation =="
+  # The subshell immediately execs setsid; the owned PID is the new group leader.
   (
     cd "$SUBJECT"
-    exec uv run --project "$REPO" binradar -w "$WORKDIR_NAME" -o "$RUNS" \
-      "$@" --run-prefix "$prefix"
-  ) >"$log" 2>&1 &
-  STARTED_PID=$!
+    exec setsid uv run --project "$REPO" binradar -w "$WORKDIR_NAME" -o "$RUNS" \
+      --generate-concrete --timeout "$TIMEOUT" --run-prefix br-gen-con
+  ) >"$LOG/concrete.log" 2>&1 &
+  CONCRETE_PID=$!; OWNED_PIDS+=("$CONCRETE_PID")
+  (
+    cd "$SUBJECT"
+    exec setsid uv run --project "$REPO" binradar -w "$WORKDIR_NAME" -o "$RUNS" \
+      --generate-binradar --replay-server --timeout "$TIMEOUT" --run-prefix br-gen-bin
+  ) >"$LOG/mutation.log" 2>&1 &
+  MUTATION_PID=$!; OWNED_PIDS+=("$MUTATION_PID")
+
+  echo "== waiting for the resident server to report ready =="
+  # Start immediately: the explicit readiness policy includes directory creation,
+  # PROBE, generation and handshake. Native generation timeout is independent.
+  run_uv "$TAOSC_LLM" python -m taosc_llm.replay wait \
+    --socket "$MUTATION_SOCKET" --pid "$MUTATION_PID" --timeout "$READY_TIMEOUT" >"$LOG/status.json"
+  cat "$LOG/status.json"
+  echo "== waiting for concrete generation =="
+  while [ -n "$CONCRETE_PID" ]; do producer_health; sleep 0.1; done
+  producer_health
+  [ -s "$CONCRETE_RUN/minimizer.sbsv" ] || {
+    echo "concrete run $CONCRETE_RUN has no minimizer.sbsv; dataset setup would fail" >&2; return 1;
+  }
+
+  echo "== freezing the dataset (concrete run + live mutation run) =="
+  run_uv "$TAOSC_LLM" taosc-llm-setup -c "$SUBJECT/config.env" -w "$WORKDIR" \
+    --concrete-run "$CONCRETE_RUN" --binradar-run "$MUTATION_RUN" \
+    --rea "$REA" --output "$DATASET" >"$LOG/setup.json"
+  cat "$LOG/setup.json"
+  echo "== warming the shared evaluation cache =="
+  local warm_status synthesis_status
+  if run_uv "$TAOSC_LLM" taosc-llm-evaluate --dataset "$DATASET" \
+    --warm --workers 4 --cache-dir "$CACHE" >"$LOG/warm.json"; then warm_status=0; else warm_status=$?; fi
+  case "$warm_status" in
+    0|2|3) echo "warm exit $warm_status (neutral p0; see $LOG/warm.json)" ;;
+    *) echo "cache warm failed with exit $warm_status" >&2; return 1 ;;
+  esac
+  echo "== candidate synthesis =="
+  local mode_args=()
+  if [ "$NO_LLM" -eq 1 ]; then mode_args=(--predicate "$PREDICATE"); else
+    mode_args=(--provider-env "$PROVIDER_ENV" --pi-sdk-root "$TAOSC_LLM/thirdparty/pi" --max-rounds 4)
+  fi
+  if run_uv "$TAOSC_LLM" taosc-llm --dataset "$DATASET" "${mode_args[@]}" \
+    --execution-workers 4 --output "$RESULT" --replay-socket "$MUTATION_SOCKET" \
+    --cache-dir "$CACHE" >"$LOG/synthesis.json"; then synthesis_status=0; else synthesis_status=$?; fi
+  cat "$LOG/synthesis.json"
+  case "$synthesis_status" in
+    0|2|3) echo "synthesis exit $synthesis_status (rejection-only; never FINAL)" ;;
+    *) echo "synthesis failed with exit $synthesis_status" >&2; return 1 ;;
+  esac
+
+  producer_health
+  echo "== shutting the resident server down =="
+  # From here the resident's exit is expected, but shutdown itself stays bounded.
+  local resident_pid=$MUTATION_PID attempt
+  MUTATION_PID=
+  run_uv "$TAOSC_LLM" timeout --kill-after=1 5 python -m taosc_llm.replay shutdown --socket "$MUTATION_SOCKET"
+  for ((attempt=0; attempt<50; attempt++)); do
+    kill -0 "$resident_pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  if kill -0 "$resident_pid" 2>/dev/null; then echo "resident shutdown did not finish" >&2; return 1; fi
+  wait "$resident_pid"
+  retire_job "$resident_pid"
+  printf 'artifacts:\n  run root     %s\n  dataset      %s\n  result       %s\n  cache        %s\n  logs         %s\n' \
+    "$RUNS" "$DATASET" "$RESULT" "$CACHE" "$LOG"
 }
 
-echo "== preparing both generation environments =="
-run_uv "$REPO" binradar-setup --generate-concrete -c "$SUBJECT" -w "$WORKDIR"
-run_uv "$REPO" binradar-setup --generate-binradar -c "$SUBJECT" -w "$WORKDIR"
-
-echo "== starting concrete generation and resident mutation generation =="
-start_generation "$CONCRETE_PREFIX" "$LOG/concrete.log" \
-  --generate-concrete --timeout "$TIMEOUT"
-CONCRETE_PID=$STARTED_PID
-start_generation "$MUTATION_PREFIX" "$LOG/mutation.log" \
-  --generate-binradar --replay-server --timeout "$TIMEOUT"
-MUTATION_PID=$STARTED_PID
-
-for _ in $(seq 1 600); do
-  [ -d "$MUTATION_RUN" ] && break
-  kill -0 "$MUTATION_PID" 2>/dev/null || break
-  sleep 0.1
-done
-[ -d "$MUTATION_RUN" ] || {
-  echo "mutation generation did not create $MUTATION_RUN; tail $LOG/mutation.log" >&2
-  exit 1
-}
-
-echo "== waiting for the resident server to report ready =="
-# `status` is the only completion signal; a closed socket or a log line is not.
-# A dead launcher pid fails immediately instead of waiting out the timeout.
-# The generation deadline bounds new attempts, but the in-flight child and its
-# cleanup may finish just after it, so allow a bounded grace on top.
-WAIT_TIMEOUT=$((TIMEOUT + 300))
-run_uv "$TAOSC_LLM" python -m taosc_llm.replay wait \
-  --socket "$MUTATION_SOCKET" --pid "$MUTATION_PID" --timeout "$WAIT_TIMEOUT" \
-  | tee "$LOG/status.json"
-
-echo "== waiting for concrete generation =="
-if ! wait "$CONCRETE_PID"; then
-  CONCRETE_PID=
-  echo "concrete generation failed; last log lines:" >&2
-  tail -5 "$LOG/concrete.log" >&2 || true
-  exit 1
-fi
-CONCRETE_PID=
-[ -d "$CONCRETE_RUN" ] || { echo "concrete generation produced no run" >&2; exit 1; }
-[ -s "$CONCRETE_RUN/minimizer.sbsv" ] || {
-  echo "concrete run $CONCRETE_RUN has no minimizer.sbsv; dataset setup would fail" >&2
-  exit 1
-}
-
-echo "== freezing the dataset (concrete run + live mutation run) =="
-[ ! -e "$DATASET" ] || { echo "dataset path already exists: $DATASET" >&2; exit 1; }
-run_uv "$TAOSC_LLM" taosc-llm-setup -c "$SUBJECT/config.env" -w "$WORKDIR" \
-  --concrete-run "$CONCRETE_RUN" \
-  --binradar-run "$MUTATION_RUN" \
-  --rea "$REA" \
-  --output "$DATASET" | tee "$LOG/setup.json"
-
-# Warm once so later candidate evaluations reuse real concrete captures.  The
-# cache directory is explicit and shared with synthesis below.
-echo "== warming the shared evaluation cache =="
-# Warm evaluates neutral p0, so reproducing the original crash is a normal
-# result and exits 2; unavailable exits 3.  Only an actual failure exits 1.
-set +e
-run_uv "$TAOSC_LLM" taosc-llm-evaluate --dataset "$DATASET" \
-  --warm --workers 4 --cache-dir "$CACHE" >"$LOG/warm.json"
-warm_status=$?
-set -e
-case "$warm_status" in
-  0|2|3) echo "warm exit $warm_status (neutral p0; see $LOG/warm.json)" ;;
-  *) echo "cache warm failed with exit $warm_status" >&2; exit 1 ;;
-esac
-
-echo "== candidate synthesis =="
-# Synthesis exits 2 for reject_same_crash and 3 for unavailable: both are
-# scoped rejection-only results, not orchestration failures.  Capture and
-# report them instead of aborting before the resident server is shut down.
-set +e
-if [ "$NO_LLM" -eq 1 ]; then
-  run_uv "$TAOSC_LLM" taosc-llm --dataset "$DATASET" --predicate "$PREDICATE" \
-    --execution-workers 4 --output "$RESULT" \
-    --replay-socket "$MUTATION_SOCKET" --cache-dir "$CACHE" \
-    | tee "$LOG/synthesis.json"
-  synthesis_status=${PIPESTATUS[0]}
-else
-  run_uv "$TAOSC_LLM" taosc-llm --dataset "$DATASET" \
-    --provider-env "$PROVIDER_ENV" \
-    --pi-sdk-root "$TAOSC_LLM/thirdparty/pi" \
-    --execution-workers 4 --max-rounds 4 --output "$RESULT" \
-    --replay-socket "$MUTATION_SOCKET" --cache-dir "$CACHE" \
-    | tee "$LOG/synthesis.json"
-  synthesis_status=${PIPESTATUS[0]}
-fi
-set -e
-case "$synthesis_status" in
-  0|2|3) echo "synthesis exit $synthesis_status (rejection-only; never FINAL)" ;;
-  *) echo "synthesis failed with exit $synthesis_status" >&2; exit 1 ;;
-esac
-
-echo "== shutting the resident server down =="
-run_uv "$TAOSC_LLM" python -m taosc_llm.replay shutdown --socket "$MUTATION_SOCKET"
-wait "$MUTATION_PID"
-MUTATION_PID=
-
-echo "artifacts:"
-echo "  run root     $RUNS"
-echo "  dataset      $DATASET"
-echo "  result       $RESULT"
-echo "  cache        $CACHE"
-echo "  logs         $LOG"
+# Sourcing is only for focused helper regressions, not an orchestration API.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

@@ -105,6 +105,9 @@ def dataset(tmp_path, run_dir):
     rows_by_id = {row["id"]: dict(row) for row in base.cases()}
     first, second = (rows_by_id[f"function:{index}"] for index in range(2))
     first["id"], second["id"] = "function:2", "function:3"
+    for case in (first, second):
+        case["observation"] = {"outcome": "normal"}
+        case["capture"] = {**case["capture"], "outcome": {"outcome": "normal"}}
     return rewrite_cases(base, [first, second])
 
 
@@ -160,8 +163,7 @@ def test_socket_must_be_the_datasets_own_run(run_dir):
         replay.validate_dataset(dataset, other / replay.SOCKET_NAME)
 
 
-def test_retained_mutations_must_match_frozen_cases(run_dir):
-    dataset = make_dataset(run_dir.parent / "dataset", binradar_run=run_dir)
+def test_retained_mutations_must_match_frozen_cases(run_dir, dataset):
     server = serve(run_dir, [], mutations=1)
     try:
         with pytest.raises(replay.ReplayError, match="retains 1 mutations"):
@@ -182,7 +184,8 @@ def test_generating_state_is_not_replayable(run_dir):
         server.close()
 
 
-def test_wait_ready_uses_status_only(run_dir):
+@pytest.mark.parametrize("timeout", [0, 5])
+def test_wait_ready_uses_status_only(run_dir, timeout):
     statuses = [
         {"state": "starting", "generation_stop": None,
          "remaining_plans": None, "retained_mutations": 0},
@@ -191,7 +194,7 @@ def test_wait_ready_uses_status_only(run_dir):
     ]
     server = serve(run_dir, [[statuses[0]], [statuses[1]]], scripted_status=True)
     try:
-        ready = replay.wait_ready(run_dir / replay.SOCKET_NAME, timeout=5,
+        ready = replay.wait_ready(run_dir / replay.SOCKET_NAME, timeout=timeout,
                                   interval=0.01)
     finally:
         server.close()
@@ -199,14 +202,81 @@ def test_wait_ready_uses_status_only(run_dir):
     assert server.requests == [{"op": "status"}, {"op": "status"}]
 
 
-def test_wait_ready_reports_dead_launcher(tmp_path):
+@pytest.mark.parametrize("timeout", [0, 5])
+def test_wait_ready_reports_dead_launcher(tmp_path, timeout):
     import subprocess
     import sys
     dead = subprocess.Popen([sys.executable, "-c", "pass"])
     dead.wait()
     path = tmp_path / "replay.sock"
     with pytest.raises(replay.ReplayError, match="exited before ready"):
-        replay.wait_ready(path, timeout=5, pid=dead.pid, interval=0.01)
+        replay.wait_ready(path, timeout=timeout, pid=dead.pid, interval=0.01)
+
+
+def test_wait_ready_positive_timeout_bounds_status_request(tmp_path, monkeypatch):
+    clock = [0.0]
+    observed_timeouts = []
+    monkeypatch.setattr(replay.time, "monotonic", lambda: clock[0])
+    def sleep(delay):
+        clock[0] += delay
+    def generating(path, *, timeout):
+        observed_timeouts.append(timeout)
+        clock[0] += timeout
+        raise replay.ReplayError("peer stalled")
+    monkeypatch.setattr(replay.time, "sleep", sleep)
+    monkeypatch.setattr(replay, "status", generating)
+    with pytest.raises(TimeoutError, match="within 0.1s"):
+        replay.wait_ready(tmp_path / "missing", timeout=0.1)
+    assert observed_timeouts == [0.1]
+    assert clock[0] == 0.1
+
+
+def test_unlimited_wait_fails_on_stopping(run_dir):
+    server = serve(run_dir, [], status_value={
+        "state": "stopping", "generation_stop": "shutdown",
+        "remaining_plans": 0, "retained_mutations": 0})
+    try:
+        with pytest.raises(replay.ReplayError, match="stopping"):
+            replay.wait_ready(run_dir / replay.SOCKET_NAME, timeout=0)
+    finally:
+        server.close()
+    assert len(status_requests(server)) == 1
+
+
+def test_wait_cli_zero_waits_until_ready(run_dir, capsys):
+    server = serve(run_dir, [
+        [{"state": "generating", "generation_stop": None,
+          "remaining_plans": 1, "retained_mutations": 0}],
+        [{"state": "ready", "generation_stop": "exhausted",
+          "remaining_plans": 0, "retained_mutations": 2}],
+    ], scripted_status=True)
+    try:
+        assert replay._main(["wait", "--socket", str(server.path), "--timeout", "0"]) == 0
+    finally:
+        server.close()
+    assert json.loads(capsys.readouterr().out)["state"] == "ready"
+    assert len(status_requests(server)) == 2
+
+
+def test_short_alias_is_used_even_when_target_exceeds_unix_limit(dataset, tmp_path):
+    import tempfile
+    target = tmp_path / ("long-run-" + "x" * 110)
+    target.mkdir()
+    with tempfile.TemporaryDirectory(prefix="replay-alias-") as short:
+        alias = Path(short) / "run"
+        alias.symlink_to(target, target_is_directory=True)
+        base = make_dataset(tmp_path / "alias-dataset", binradar_run=target)
+        bound = rewrite_cases(base, dataset.cases("function"))
+        # Captures are unnecessary to the wire test; its evidence paths are not read.
+        server = FakeServer(alias / replay.SOCKET_NAME, [rows() + [done()]]).start()
+        try:
+            result = replay.evaluate_replay(bound, parse_candidate("ERM generic", "1"),
+                                            socket_path=alias / replay.SOCKET_NAME)
+        finally:
+            server.close()
+        assert len(os.fsencode(str(target / replay.SOCKET_NAME))) > 107
+        assert result["replay"]["socket"] == str(alias / replay.SOCKET_NAME)
+        assert len(evaluate_requests(server)) == 1
 
 
 @pytest.mark.parametrize("outcome,source,status,reason", [
@@ -240,7 +310,8 @@ def test_busy_is_retried_without_losing_the_batch(run_dir, dataset):
     server = serve(run_dir, [
         [{"error": "busy"}],
         rows() + [done()],
-    ])
+    ], status_value={"state": "evaluating", "generation_stop": "exhausted",
+                     "remaining_plans": 0, "retained_mutations": 2})
     try:
         result = replay.evaluate_replay(dataset, parse_candidate("ERM generic", "1"),
                                         admission_timeout=5)
@@ -393,6 +464,112 @@ def test_model_tool_shares_live_bridge_and_never_sees_the_endpoint(run_dir, data
                  json.dumps(context.projection)):
         assert str(run_dir) not in text
         assert str(run_dir.parent / "cache") not in text
+
+
+@pytest.mark.parametrize("through_tool", [False, True])
+def test_offline_evaluation_never_contacts_configured_bridge(
+        dataset, run_dir, tmp_path, monkeypatch, through_tool):
+    monkeypatch.setattr(replay, "status", lambda *a, **k: pytest.fail("offline socket access"))
+    monkeypatch.setattr(evaluation, "execute_capture",
+                        lambda *a, **k: pytest.fail("offline target execution"))
+    if through_tool:
+        from taosc_llm.context import prepare_context
+        context = prepare_context(dataset, run_dir=tmp_path / "run",
+                                  replay_socket=run_dir / replay.SOCKET_NAME)
+        result = context.call_tool("evaluate_predicate", {
+            "context_id": context.context_id, "predicate": "1"})
+        assert result["ok"] is True
+        assert result["cases"]["total"] == 2
+    else:
+        result = evaluation.evaluate_dataset(
+            dataset, "1", execute=False, cache_dir=tmp_path / "cache",
+            replay_socket=run_dir / replay.SOCKET_NAME)
+        assert "replay" not in result
+        assert len(result["cases"]) == 2
+
+
+@pytest.mark.parametrize("selected", [None, ["function:3"], ["function:2", "function:3"]])
+@pytest.mark.parametrize("target_crash", [False, True])
+@pytest.mark.parametrize("predicate", ["0", "1"])
+def test_nonretained_crashes_remain_selected_offline_evidence(
+        dataset, run_dir, tmp_path, selected, target_crash, predicate):
+    first, second = dataset.cases("function")
+    crash = {"outcome": "crash", "fault_valid": True}
+    if target_crash:
+        first = {**first, "observation": crash,
+                 "capture": {**first["capture"], "outcome": crash, "same_crash": True}}
+    second = {**second, "observation": crash,
+              "capture": {**second["capture"], "outcome": crash, "same_crash": False}}
+    dataset = rewrite_cases(dataset, [first, second])
+    server = serve(run_dir, [rows((2,)) + [done(1)]], mutations=1)
+    try:
+        result = evaluation.evaluate_dataset(
+            dataset, predicate, case_ids=selected, cache_dir=tmp_path / "cache",
+            replay_socket=run_dir / replay.SOCKET_NAME)
+    finally:
+        server.close()
+    expected = selected or ["function:2", "function:3"]
+    assert [case["case_id"] for case in result["cases"]] == expected
+    by_id = {case["case_id"]: case for case in result["cases"]}
+    if predicate == "0":
+        assert by_id["function:3"]["source"] == "offline"
+        assert by_id["function:3"]["status"] == "not_rejected"
+    else:
+        assert by_id["function:3"]["source"] == "unavailable"
+        assert by_id["function:3"]["status"] == "unavailable"
+        assert by_id["function:3"]["reason"] == "branch-divergence"
+    assert result["summary"]["total"] == len(expected)
+    assert result["replay"]["mutations"] == 1
+
+
+def test_normal_and_target_crash_replay_but_other_crash_stays_offline(dataset, run_dir, tmp_path):
+    normal, other = dataset.cases("function")
+    crash = {"outcome": "crash", "fault_valid": True}
+    other = {**other, "observation": crash,
+             "capture": {**other["capture"], "outcome": crash, "same_crash": False}}
+    target = {**normal, "id": "function:4", "observation": crash,
+              "capture": {**normal["capture"], "outcome": crash, "same_crash": True}}
+    dataset = rewrite_cases(dataset, [normal, other, target])
+    server = serve(run_dir, [rows((2,)) + rows((4,), outcome="target-crash") + [done()]], mutations=2)
+    try:
+        result = evaluation.evaluate_dataset(
+            dataset, "0", cache_dir=tmp_path / "cache",
+            replay_socket=run_dir / replay.SOCKET_NAME)
+    finally:
+        server.close()
+    assert [(case["case_id"], case["source"]) for case in result["cases"]] == [
+        ("function:2", "executed"), ("function:3", "offline"), ("function:4", "executed")]
+    assert result["summary"]["total"] == 3
+    assert result["replay"]["mutations"] == 2
+
+
+def test_zero_retained_keeps_offline_cases_and_empty_live_coverage(dataset, run_dir, tmp_path):
+    cases = [{**case, "capture": {**case["capture"],
+              "outcome": {"outcome": "crash"}, "same_crash": False}}
+             for case in dataset.cases("function")]
+    dataset = rewrite_cases(dataset, cases)
+    server = serve(run_dir, [], mutations=0)
+    try:
+        result = evaluation.evaluate_dataset(
+            dataset, "0", cache_dir=tmp_path / "cache",
+            replay_socket=run_dir / replay.SOCKET_NAME)
+    finally:
+        server.close()
+    assert evaluate_requests(server) == []
+    assert result["replay"]["coverage"] == "empty"
+    assert result["replay"]["mutations"] == 0
+    assert result["summary"]["total"] == 2
+    assert all(case["source"] == "offline" for case in result["cases"])
+
+
+@pytest.mark.parametrize("mutations", [(2, 2), (2, 4), (2,), (2, 3, 4)])
+def test_replay_requires_exact_retained_ids(dataset, run_dir, mutations):
+    server = serve(run_dir, [rows(mutations) + [done(len(mutations))]])
+    try:
+        with pytest.raises(replay.ReplayError, match="mutation set"):
+            replay.evaluate_replay(dataset, parse_candidate("ERM generic", "1"))
+    finally:
+        server.close()
 
 
 def test_host_cache_dir_is_shared_by_tool_and_cli(dataset, run_dir, tmp_path):

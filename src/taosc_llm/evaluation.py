@@ -311,6 +311,9 @@ def _evaluate(dataset, candidate, descriptor, *, case_ids, workers, execute, cac
     cases.  It is a host-side option only: neither the model nor a public patch
     entry can name a socket.  Concrete ``system`` cases keep their existing
     capture/cache/execution path and never use the live mutation snapshot.
+    ``execute=False`` suppresses both concrete execution and socket access.
+    Function observations without a retained native plan stay offline even
+    when the host enables replay.
     """
     if isinstance(dataset, (str, Path)):
         dataset = load_dataset(Path(dataset))
@@ -322,6 +325,9 @@ def _evaluate(dataset, candidate, descriptor, *, case_ids, workers, execute, cac
     cases = dataset.cases() if case_ids is None else [dataset.case(case_id) for case_id in case_ids]
     if len({c['id'] for c in cases}) != len(cases):
         raise ValueError('duplicate case ids')
+    # Offline is an API guarantee, even if a trusted context has an endpoint.
+    if not execute:
+        replay_socket = None
     if replay_socket is not None and candidate is None:
         raise ValueError('live replay requires a candidate predicate, not --warm')
     live_cases = [c for c in cases if c['domain'] == 'function']

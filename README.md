@@ -125,15 +125,20 @@ uv run --project utils/taosc-llm taosc-llm \
   --cache-dir workdir/out/taosc-llm-cache
 ```
 
-- The socket must be the dataset's own `--binradar-run` endpoint; another
-  generation's path is rejected, not treated as an alias.
-- The service must report `ready`, and its `retained_mutations` must equal the
-  dataset's frozen `function:*` case count. A dead launcher fails immediately.
+- The socket must identify the dataset's own `--binradar-run` endpoint. Canonical
+  paths are compared for identity, but connections preserve the supplied short
+  alias: resolving it could exceed the Unix socket path limit.
+- The service must report `ready` or `evaluating`. Its `retained_mutations` and
+  returned IDs must match the frozen **useful subset**: normal observations or
+  authenticated target crashes. Other committed crashes remain offline evidence;
+  they are not missing native plans. Offline divergence remains unavailable.
 - Concrete `system:*` cases keep their existing capture/cache/worker path and
   never use the mutation snapshot.
 - The model never sees the socket, and no tool schema accepts a path, endpoint or
   execution switch. `test_candidate` gains live function cases only because the
-  host configured the bridge; `evaluate_predicate` stays offline.
+  host configured the bridge; `evaluate_predicate` stays offline. The Python
+  API's `execute=False` also prohibits all socket access, even with a configured
+  endpoint; the CLI rejects `--offline` combined with `--replay-socket`.
 - Status mapping reuses the existing vocabulary: `target-crash` (the artifact's
   committed attempt-1 oracle) is `reject_same_crash`; `normal` and `other-crash`
   are `not_rejected`; cancellation, timeout, trap, unsupported external state and
@@ -150,6 +155,9 @@ uv run --project utils/taosc-llm python -m taosc_llm.replay wait     --socket <r
 uv run --project utils/taosc-llm python -m taosc_llm.replay evaluate --dataset <dataset> --predicate 'rax <= 0'
 uv run --project utils/taosc-llm python -m taosc_llm.replay shutdown --socket <run>/replay.sock
 ```
+
+`wait --timeout 0` waits indefinitely, but a dead launcher or stopping server
+still fails. A positive timeout bounds the entire wait, including status calls.
 
 The server's own acceptance boundaries (fresh-target/multiwrite replay, large
 capture sets, measured cost) are unchanged; see the
@@ -276,12 +284,20 @@ utils/taosc-llm/run.sh --provider-env /abs/provider.env --timeout 7200
 ```
 
 Options: `--subject DIR`, `--workdir NAME`, `--outdir DIR`, `--rea PATH`,
-`--predicate`, `--no-llm`. When the joined run root plus
-`/br-gen-bin-00000/replay.sock` would exceed the 107-byte Unix socket limit
-(this happens under a deep subject path), the script switches the run root to
-`/tmp/binradar-debug-<timestamp>` and says so; pass `--outdir` on a short path to
-control it explicitly. Each invocation uses a fresh run root, so both
-generations start at run id 0 and cannot collide with an in-flight run.
+`--timeout SECONDS`, `--ready-timeout SECONDS`, `--predicate`, `--no-llm`,
+`--provider-env FILE`. Relative subject/output paths are made absolute before
+changing cwd, without resolving short symlink aliases. Each invocation exclusively
+creates `<outdir>/runs-debug-<random>` with `mktemp -d`, so both producers start
+at run id 0 without sharing a root with another invocation. If its socket path
+would exceed **107 encoded bytes** (not characters), allocation instead uses
+`/tmp/binradar-debug-<random>` and prints a notice. A short `--outdir` controls
+the location explicitly. Do not run setup concurrently in the same workdir.
+
+`--timeout` controls native generation (default 7200; 0 means unlimited).
+`--ready-timeout` independently bounds readiness, including startup and PROBE
+(default 0: unlimited). It is not `--timeout + grace`: PROBE has its own budget.
+Both producers are monitored throughout readiness, dataset setup and evaluation;
+a failed concrete producer or premature resident exit stops the example promptly.
 
 Two checkout-only requirements: export `JAVA_HOME` and `GHIDRA_INSTALL_DIR`
 for REA/Ghidra static analysis (the Guix wrapper sets them), and do not rely on
@@ -291,9 +307,9 @@ Guix `taosc-llm-rea-*/bin/rea` that actually runs, then `PATH`.
 
 Exit codes 2 (`reject_same_crash`) and 3 (`unavailable`) from `--warm` and
 synthesis are scoped results, not orchestration failures; the script reports
-them, still shuts the resident server down, and exits 0. A non-`ready` server,
+them, still shuts the resident server down, and exits 0. A readiness deadline,
 a dead launcher, a failed producer or a protocol error exits nonzero and keeps
-the logs.
+the logs. SIGINT exits 130; SIGTERM exits 143, never success.
 
 Order and failure rules the example encodes:
 
@@ -311,8 +327,10 @@ Order and failure rules the example encodes:
    silently producing a concrete-only dataset.
 6. Warming and synthesis share one `--cache-dir`, so concrete captures are
    reused instead of re-executed.
-7. On any exit path, the trap sends `shutdown` to the resident server, waits for
-   the launcher, then terminates leftovers.
+7. Each pipeline stage, including preparation/warm/synthesis, belongs to an owned
+   process group. Exit cleanup attempts bounded resident shutdown, then bounded
+   TERM/KILL cleanup of those groups; it never waits indefinitely or kills an
+   unrelated run.
 
 ## Native isolation and harmless fixture
 

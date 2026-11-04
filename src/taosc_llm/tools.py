@@ -204,7 +204,7 @@ def call_tool(context: SynthesisContext, name, args):
             evaluation = evaluate_dataset(context.dataset, candidate.expression, workers=context.workers,
                                           execute=name == "test_candidate",
                                           cache_dir=context.cache_dir or context.run_dir / "cache",
-                                          replay_socket=context.replay_socket)
+                                          replay_socket=context.replay_socket if name == "test_candidate" else None)
             result_id = digest(canonical(evaluation))
             context._results[result_id] = evaluation
             result = {"valid_syntax": True, "checked_predicate": args["predicate"], **_result(context, result_id)}

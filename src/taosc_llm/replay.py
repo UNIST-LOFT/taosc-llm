@@ -161,14 +161,22 @@ def _process_alive(pid: int) -> bool:
 
 def wait_ready(socket_path, *, timeout: float, pid: int | None = None,
                interval: float = WAIT_INTERVAL) -> dict:
-    """Block until generation finished and replay is available."""
-    deadline = time.monotonic() + timeout
+    """Block until ready; timeout zero waits indefinitely, not past launcher death."""
+    if timeout < 0:
+        raise ValueError("readiness timeout must be nonnegative")
+    deadline = time.monotonic() + timeout if timeout else None
     last_error: Exception | None = None
     while True:
         if pid is not None and not _process_alive(pid):
             raise ReplayError(f"replay server process {pid} exited before ready")
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            detail = f": {last_error}" if last_error is not None else ""
+            raise TimeoutError(
+                f"replay server did not reach ready within {timeout:g}s{detail}")
         try:
-            value = status(socket_path)
+            value = status(socket_path, timeout=STATUS_TIMEOUT if remaining is None
+                           else min(STATUS_TIMEOUT, remaining))
         except ReplayError as exc:
             last_error = exc
         else:
@@ -177,11 +185,12 @@ def wait_ready(socket_path, *, timeout: float, pid: int | None = None,
             if value["state"] == "stopping":
                 raise ReplayError("replay server is stopping")
             last_error = None
-        if time.monotonic() >= deadline:
+        if deadline is not None and time.monotonic() >= deadline:
             detail = f": {last_error}" if last_error is not None else ""
             raise TimeoutError(
                 f"replay server did not reach ready within {timeout:g}s{detail}")
-        time.sleep(interval)
+        time.sleep(interval if deadline is None else
+                   min(interval, max(0.0, deadline - time.monotonic())))
 
 
 def dataset_socket(dataset) -> Path:
@@ -191,7 +200,22 @@ def dataset_socket(dataset) -> Path:
         raise ReplayError(
             "dataset has no binradar run; prepare it with "
             "taosc-llm-setup --binradar-run")
-    return Path(source).expanduser().resolve() / SOCKET_NAME
+    return Path(source).expanduser().absolute() / SOCKET_NAME
+
+
+def retained_cases(dataset) -> list[dict]:
+    """Select the native committed-useful subset without losing offline evidence.
+
+    Native snapshot_modify_memory fails before publishing a valid exit when a
+    plan cannot apply, and generation discards patch-zero site misses before
+    committing captures. Consequently the imported committed mutation pairs
+    already guarantee applied/site-observed. snapshot_replay_commit_plan further
+    keeps only normal exits or authenticated target crashes; other crashes are
+    valid frozen evidence, but have no retained plan.
+    """
+    return [case for case in dataset.cases("function")
+            if (case.get("capture") or {}).get("outcome", {}).get("outcome") == "normal"
+            or (case.get("capture") or {}).get("same_crash") is True]
 
 
 def validate_dataset(dataset, socket_path) -> tuple[Path, list[dict], dict]:
@@ -201,25 +225,21 @@ def validate_dataset(dataset, socket_path) -> tuple[Path, list[dict], dict]:
     different generation is a mismatch, not an interchangeable endpoint.
     """
     expected = dataset_socket(dataset)
-    actual = Path(socket_path).expanduser().resolve()
-    if actual != expected:
+    actual = Path(socket_path).expanduser().absolute()
+    if actual.resolve() != expected.resolve():
         raise ReplayError(
             f"replay socket {actual} is not the dataset's binradar run "
             f"({expected})")
-    cases = dataset.cases("function")
-    if not cases:
-        raise ReplayError(
-            "dataset has no function cases for live replay; prepare it with "
-            "--binradar-run")
+    cases = retained_cases(dataset)
     info = status(actual)
-    if info["state"] != "ready":
+    if info["state"] not in ("ready", "evaluating"):
         raise ReplayError(
             f"replay server is not ready (state={info['state']}); wait for "
             "generation to finish")
     if info["retained_mutations"] != len(cases):
         raise ReplayError(
             f"replay server retains {info['retained_mutations']} mutations but "
-            f"the dataset froze {len(cases)} function cases")
+            f"the dataset froze {len(cases)} useful function cases")
     return actual, cases, info
 
 
@@ -314,6 +334,14 @@ def evaluate_replay(dataset, candidate, *, socket_path=None,
     """Evaluate one candidate over every retained mutation in the live snapshot."""
     path, cases, _info = validate_dataset(
         dataset, dataset_socket(dataset) if socket_path is None else socket_path)
+    if not cases:
+        return {
+            "cases": [], "status": "unavailable",
+            "summary": {"total": 0, "reject_same_crash": 0,
+                        "not_rejected": 0, "unavailable": 0},
+            "replay": {"socket": str(path), "coverage": "empty",
+                       "mutations": 0, "unavailable": 0},
+        }
     objects = _exchange(path, candidate.source_predicate,
                         admission_timeout=admission_timeout,
                         response_timeout=response_timeout)
@@ -375,7 +403,8 @@ def _main(argv: list[str] | None = None) -> int:
     endpoint.add_argument("--socket", type=Path)
     endpoint.add_argument("--dataset", type=Path)
     parser.add_argument("--predicate")
-    parser.add_argument("--timeout", type=float, default=ADMISSION_TIMEOUT)
+    parser.add_argument("--timeout", type=float, default=ADMISSION_TIMEOUT,
+                        help="seconds to wait (wait: 0 means unlimited; default: %(default)g)")
     parser.add_argument("--pid", type=int,
                         help="launcher pid; a dead process fails wait early")
     args = parser.parse_args(argv)
