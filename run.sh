@@ -3,25 +3,15 @@
 # cache warm, then manual/provider synthesis. Scoped results are never FINAL.
 set -euo pipefail
 
-# Keep lexical aliases: resolving a short symlink can exceed sockaddr_un's limit.
+# Preserve the user's lexical paths, including symlinked directories.
 absolute_path() { realpath --canonicalize-missing --no-symlinks -- "$1"; }
-socket_path_fits() {
-  local LC_ALL=C path=$1
-  [ "${#path}" -le 107 ]
-}
 allocate_runs() {
-  local out=$1 producer_base=$1
+  local out=$1
   mkdir -p -- "$out"
   RUNS=$(mktemp -d -- "$out/runs-debug-XXXXXXXXXX")
   LOG=$RUNS/logs
-  if ! socket_path_fits "$out/br-gen-bin/replay.sock"; then
-    echo "note: output socket path exceeds 107 bytes; using a temporary /tmp alias" >&2
-    OUTPUT_ALIAS=$(mktemp -d -- /tmp/binradar-debug-XXXXXXXXXX)
-    ln -s -- "$out" "$OUTPUT_ALIAS/out"
-    producer_base=$OUTPUT_ALIAS/out
-  fi
-  CONCRETE_RUN=$producer_base/br-gen-con
-  MUTATION_RUN=$producer_base/br-gen-bin
+  CONCRETE_RUN=$out/br-gen-con
+  MUTATION_RUN=$out/br-gen-bin
   MUTATION_SOCKET=$MUTATION_RUN/replay.sock
 }
 
@@ -119,11 +109,6 @@ cleanup() {
   for pid in "${OWNED_PIDS[@]}"; do
     if ! kill -0 "$pid" 2>/dev/null; then wait "$pid" 2>/dev/null || true; fi
   done
-  # Only remove our symlink and its owned parent, never the physical outputs.
-  if [ -n "$OUTPUT_ALIAS" ]; then
-    rm -f -- "$OUTPUT_ALIAS/out"
-    rmdir -- "$OUTPUT_ALIAS"
-  fi
   if [ "$status" -ne 0 ] && [ -n "$LOG" ]; then echo "logs kept for diagnosis: $LOG" >&2; fi
   exit "$status"
 }
@@ -140,9 +125,9 @@ default_rea() {
 }
 
 main() {
-  REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-  TAOSC_LLM=$REPO/utils/taosc-llm
-  SUBJECT=$REPO/benchmarks/loftix/binutils/CVE-2017-14745
+  REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd) # binradar repo
+  TAOSC_LLM=$REPO/utils/taosc-llm # taosc-llm repo
+  SUBJECT=$REPO/benchmarks/loftix/binutils/CVE-2017-14745 # subject directory with config.env
   WORKDIR_NAME=workdir-0.1.24
   OUTDIR= TIMEOUT=7200 READY_TIMEOUT=0 PROVIDER_ENV=$TAOSC_LLM/.env PREDICATE= NO_LLM=0 REA=
   while [ $# -gt 0 ]; do
@@ -193,7 +178,7 @@ HELP
     echo "model mode needs --provider-env; use --no-llm for the manual predicate path" >&2; return 2
   fi
   OUTDIR=$(absolute_path "${OUTDIR:-$WORKDIR/out}")
-  OWNED_PIDS=() CONCRETE_PID= MUTATION_PID= MUTATION_SOCKET= OUTPUT_ALIAS= LOG=
+  OWNED_PIDS=() CONCRETE_PID= MUTATION_PID= MUTATION_SOCKET= LOG=
   trap cleanup EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM

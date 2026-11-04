@@ -126,8 +126,11 @@ uv run --project utils/taosc-llm taosc-llm \
 ```
 
 - The socket must identify the dataset's own `--binradar-run` endpoint. Canonical
-  paths are compared for identity, but connections preserve the supplied short
-  alias: resolving it could exceed the Unix socket path limit.
+  paths are compared for identity. BinRadar publishes `<run>/replay.sock` as a
+  symlink to its short private `/tmp` socket; the common client transport resolves
+  that link before every connection. A missing or dangling endpoint remains
+  unavailable, not ready. Pass the public path even when it exceeds 107 bytes;
+  do not pass it directly to a raw `socket.connect()` without resolving it.
 - The service must report `ready` or `evaluating`. Its `retained_mutations` and
   returned IDs must match the frozen **useful subset**: normal observations or
   authenticated target crashes. Other committed crashes remain offline evidence;
@@ -286,7 +289,7 @@ utils/taosc-llm/run.sh --provider-env /abs/provider.env --timeout 7200
 Options: `--subject DIR`, `--workdir NAME`, `--outdir DIR`, `--rea PATH`,
 `--timeout SECONDS`, `--ready-timeout SECONDS`, `--predicate`, `--no-llm`,
 `--provider-env FILE`. Relative subject/output paths are made absolute before
-changing cwd, without resolving short symlink aliases. The default layout is:
+changing cwd, without expanding user-provided symlinks. The default layout is:
 
 ```text
 workdir/out/
@@ -298,10 +301,11 @@ workdir/out/
 `--outdir DIR` overrides this base directory. Each producer receives its own
 exact `binradar --output` leaf; neither `--run-prefix` nor a numeric suffix is
 used. Diagnostic roots still use `mktemp -d` so old logs/datasets remain separate.
-If the physical socket path exceeds **107 encoded bytes**, an owned temporary
-`/tmp/binradar-debug-<random>/out` symlink points to the output base. Producer
-launches and socket connections use that short alias; physical results stay in
-the requested output directory. The alias is removed only after shutdown.
+BinRadar, not this script, creates the actual socket under
+`/tmp/binradar-replay-<random>/` and publishes `br-gen-bin/replay.sock` as a
+symlink. The script always passes the requested producer paths; there is no
+socket-length check or output-directory alias. Shutdown removes the owned
+public link and private socket directory, not the producer outputs.
 
 Stop the previous invocation before rerunning; fixed producer directories are
 not safe for overlapping runs. Setup in a shared workdir remains single-owner.
@@ -314,11 +318,13 @@ must not be attached to a different server merely because its path was reused.
 Both producers are monitored throughout readiness, dataset setup and evaluation;
 a failed concrete producer or premature resident exit stops the example promptly.
 
-Two checkout-only requirements: export `JAVA_HOME` and `GHIDRA_INSTALL_DIR`
-for REA/Ghidra static analysis (the Guix wrapper sets them), and do not rely on
-a bare `rea` on `PATH` — a mise shim can exist without a selected version and
-exit nonzero. The script prefers an explicit `--rea`/`TAOSC_LLM_REA`, then a
-Guix `taosc-llm-rea-*/bin/rea` that actually runs, then `PATH`.
+The Guix REA wrapper supplies `JAVA_HOME` and `GHIDRA_INSTALL_DIR`; callers
+using it do not need to export them. An unwrapped checkout must configure both
+for static analysis. The script's parent-shell note does not inspect wrapper
+exports. Do not rely on a bare `rea` on `PATH`: a mise shim can exist without a
+selected version and exit nonzero. The script prefers an explicit
+`--rea`/`TAOSC_LLM_REA`, then a Guix `taosc-llm-rea-*/bin/rea` that actually runs,
+then `PATH`.
 
 Exit codes 2 (`reject_same_crash`) and 3 (`unavailable`) from `--warm` and
 synthesis are scoped results, not orchestration failures; the script reports
@@ -345,7 +351,8 @@ Order and failure rules the example encodes:
 7. Each pipeline stage, including preparation/warm/synthesis, belongs to an owned
    process group. Exit cleanup attempts bounded resident shutdown, then bounded
    TERM/KILL cleanup of those groups; it never waits indefinitely or kills an
-   unrelated run. The temporary alias is removed afterward, not its target outputs.
+   unrelated run. BinRadar owns socket/link cleanup; the runner retains producer
+   outputs and diagnostic roots.
 
 ## Native isolation and harmless fixture
 

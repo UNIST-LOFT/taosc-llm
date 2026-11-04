@@ -80,11 +80,15 @@ def validate_status(value: dict) -> dict:
 def _read_objects(socket_path: Path, payload: dict, *,
                   timeout: float) -> list[dict]:
     """One newline-delimited request/response exchange on its own connection."""
+    connection = None
     try:
+        endpoint = socket_path.resolve(strict=True)
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         connection.settimeout(timeout)
-        connection.connect(str(socket_path))
-    except OSError as exc:
+        connection.connect(str(endpoint))
+    except (OSError, RuntimeError) as exc:
+        if connection is not None:
+            connection.close()
         raise ReplayError(
             f"replay socket unavailable: {socket_path}: {exc}") from exc
     try:

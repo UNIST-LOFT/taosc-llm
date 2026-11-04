@@ -258,25 +258,86 @@ def test_wait_cli_zero_waits_until_ready(run_dir, capsys):
     assert len(status_requests(server)) == 2
 
 
-def test_short_alias_is_used_even_when_target_exceeds_unix_limit(dataset, tmp_path):
+@pytest.mark.parametrize("leaf", ["long-run-" + "x" * 110, "é" * 60])
+def test_long_published_socket_supports_all_operations(dataset, tmp_path, leaf):
     import tempfile
-    target = tmp_path / ("long-run-" + "x" * 110)
+    target = tmp_path / leaf
     target.mkdir()
-    with tempfile.TemporaryDirectory(prefix="replay-alias-") as short:
-        alias = Path(short) / "run"
-        alias.symlink_to(target, target_is_directory=True)
-        base = make_dataset(tmp_path / "alias-dataset", binradar_run=target)
-        bound = rewrite_cases(base, dataset.cases("function"))
-        # Captures are unnecessary to the wire test; its evidence paths are not read.
-        server = FakeServer(alias / replay.SOCKET_NAME, [rows() + [done()]]).start()
+    public = target / replay.SOCKET_NAME
+    base = make_dataset(tmp_path / "published-dataset", binradar_run=target)
+    bound = rewrite_cases(base, dataset.cases("function"))
+    with tempfile.TemporaryDirectory(prefix="replay-peer-", dir="/tmp") as short:
+        server = FakeServer(Path(short) / replay.SOCKET_NAME,
+                            [rows() + [done()], [{"accepted": True}]]).start()
+        public.symlink_to(server.path)
         try:
-            result = replay.evaluate_replay(bound, parse_candidate("ERM generic", "1"),
-                                            socket_path=alias / replay.SOCKET_NAME)
+            assert replay.status(public)["state"] == "ready"
+            assert replay.wait_ready(public, timeout=5)["state"] == "ready"
+            result = replay.evaluate_replay(bound, parse_candidate("ERM generic", "1"))
+            assert replay.shutdown(public) == {"accepted": True}
         finally:
             server.close()
-        assert len(os.fsencode(str(target / replay.SOCKET_NAME))) > 107
-        assert result["replay"]["socket"] == str(alias / replay.SOCKET_NAME)
+        assert len(os.fsencode(str(public))) > 107
+        assert result["replay"]["socket"] == str(public)
+        assert len(status_requests(server)) == 3
         assert len(evaluate_requests(server)) == 1
+        assert server.requests[-1] == {"op": "shutdown"}
+
+
+@pytest.mark.parametrize("dangling", [False, True])
+def test_wait_retries_until_public_endpoint_is_available(tmp_path, monkeypatch, dangling):
+    import tempfile
+    public = tmp_path / ("long-run-" + "x" * 110) / replay.SOCKET_NAME
+    public.parent.mkdir()
+    sleeps = []
+    with tempfile.TemporaryDirectory(prefix="replay-peer-", dir="/tmp") as short:
+        endpoint = Path(short) / replay.SOCKET_NAME
+        if dangling:
+            public.symlink_to(endpoint)
+        server = FakeServer(endpoint, [])
+        def publish(delay):
+            sleeps.append(delay)
+            server.start()
+            if not dangling:
+                public.symlink_to(endpoint)
+        monkeypatch.setattr(replay.time, "sleep", publish)
+        try:
+            assert replay.wait_ready(public, timeout=5, interval=0.01)["state"] == "ready"
+        finally:
+            server.close()
+        assert sleeps == [0.01]
+        assert server.requests == [{"op": "status"}]
+
+
+@pytest.mark.parametrize("kind", ["missing", "dangling", "loop"])
+def test_unavailable_endpoint_does_not_allocate_a_socket(tmp_path, monkeypatch, kind):
+    public = tmp_path / replay.SOCKET_NAME
+    if kind == "dangling":
+        public.symlink_to(tmp_path / "missing")
+    elif kind == "loop":
+        public.symlink_to(public)
+    def unexpected_socket(*args, **kwargs):
+        pytest.fail("unresolved endpoints must not allocate a socket")
+    monkeypatch.setattr(replay.socket, "socket", unexpected_socket)
+    with pytest.raises(replay.ReplayError, match="replay socket unavailable"):
+        replay.status(public)
+
+
+def test_failed_connect_closes_its_socket(tmp_path, monkeypatch):
+    # An existing non-socket endpoint resolves but cannot accept a connection.
+    public = tmp_path / replay.SOCKET_NAME
+    public.touch()
+    sockets = []
+    socket_factory = socket.socket
+    def tracked_socket(*args, **kwargs):
+        connection = socket_factory(*args, **kwargs)
+        sockets.append(connection)
+        return connection
+    monkeypatch.setattr(replay.socket, "socket", tracked_socket)
+    with pytest.raises(replay.ReplayError, match="replay socket unavailable"):
+        replay.status(public)
+    assert len(sockets) == 1
+    assert sockets[0].fileno() == -1
 
 
 @pytest.mark.parametrize("outcome,source,status,reason", [
