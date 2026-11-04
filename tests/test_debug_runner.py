@@ -41,27 +41,87 @@ def test_socket_limit_counts_utf8_bytes():
     assert shell('socket_path_fits "$1"', "/" + "a" * 107).returncode != 0
 
 
-def test_roots_are_exclusive_and_long_utf8_falls_back(tmp_path):
-    result = shell('allocate_runs "$1"; a=$RUNS; allocate_runs "$1"; printf "%s\\n%s\\n" "$a" "$RUNS"', tmp_path)
+def test_diagnostic_roots_are_exclusive_and_producer_leaves_are_fixed(tmp_path):
+    result = shell('''
+OUTPUT_ALIAS=
+allocate_runs "$1"; first=$RUNS; first_alias=$OUTPUT_ALIAS
+allocate_runs "$1"
+printf '%s\\n' "$first" "$RUNS" "$CONCRETE_RUN" "$MUTATION_RUN"
+if [ -n "$first_alias" ]; then rm "$first_alias/out"; rmdir "$first_alias"; fi
+if [ -n "$OUTPUT_ALIAS" ]; then rm "$OUTPUT_ALIAS/out"; rmdir "$OUTPUT_ALIAS"; fi
+''', tmp_path)
     assert result.returncode == 0, result.stderr
-    first, second = map(Path, result.stdout.splitlines())
-    try:
-        assert first != second
-        assert first.is_dir() and second.is_dir()
-        assert list(first.iterdir()) == []
-    finally:
-        first.rmdir()
-        if second != first:
-            second.rmdir()
-    result = shell('allocate_runs "$1"; printf "%s\\n" "$RUNS"', tmp_path / ("é" * 40))
-    assert result.returncode == 0, result.stderr
-    fallback = Path(result.stdout.strip())
-    try:
-        assert fallback.parent == Path("/tmp")
-        assert fallback.is_dir()
-        assert len(str(fallback / "br-gen-bin-00000/replay.sock").encode()) <= 107
-    finally:
-        fallback.rmdir()
+    first, second, concrete, mutation = map(Path, result.stdout.splitlines())
+    assert first != second
+    assert first.parent == second.parent == tmp_path
+    assert first.is_dir() and second.is_dir()
+    assert list(first.iterdir()) == []
+    # Pytest's root can itself exceed the socket limit; aliases are covered below.
+    assert concrete.name == "br-gen-con"
+    assert mutation.name == "br-gen-bin"
+    assert concrete.parent == mutation.parent
+    if mutation.parent != tmp_path:
+        assert mutation.parent.name == "out"
+        assert mutation.parent.parent.parent == Path("/tmp")
+
+
+@pytest.mark.parametrize("ending,status", [("exit 0", 0), ("exit 7", 7),
+                                           ("kill -INT $$", 130), ("kill -TERM $$", 143)])
+def test_long_utf8_alias_binds_and_lives_until_owned_shutdown(tmp_path, ending, status):
+    target = tmp_path / ("é" * 60)
+    result = shell('''
+OWNED_PIDS=(); CONCRETE_PID=; MUTATION_PID=; MUTATION_SOCKET=; OUTPUT_ALIAS=; LOG=
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+allocate_runs "$1"
+printf '%s\\n' "$RUNS" "$OUTPUT_ALIAS" "$CONCRETE_RUN" "$MUTATION_SOCKET"
+mkdir -p "$CONCRETE_RUN" "$MUTATION_RUN"
+printf retained > "$CONCRETE_RUN/marker"
+python3 -c 'import socket, sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])' "$MUTATION_SOCKET"
+start_job python3 -c '
+import pathlib, signal, sys, time
+alias, target = map(pathlib.Path, sys.argv[1:])
+def stop(*_):
+    if (alias / "out").is_symlink():
+        (target / "stopped").write_text("alive")
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+(target / "ready").touch()
+while True:
+    time.sleep(0.1)
+' "$OUTPUT_ALIAS" "$1"
+while [ ! -f "$1/ready" ]; do sleep 0.02; done
+eval "$2"
+''', target, ending)
+    assert result.returncode == status, result.stderr
+    diagnostic, alias, concrete, socket_path = map(Path, result.stdout.splitlines())
+    assert diagnostic.parent == target
+    assert diagnostic.is_dir()
+    assert alias.parent == Path("/tmp")
+    assert not alias.exists()
+    assert len(str(socket_path).encode()) <= 107
+    assert concrete == alias / "out/br-gen-con"
+    assert (target / "br-gen-bin/replay.sock").is_socket()
+    assert (target / "br-gen-con/marker").read_text() == "retained"
+    assert (target / "stopped").read_text().strip() == "alive"
+
+
+def test_failed_alias_link_allocation_removes_owned_parent_only(tmp_path):
+    target = tmp_path / ("é" * 60)
+    target.mkdir()
+    (target / "retained").write_text("existing output")
+    result = shell('''
+OWNED_PIDS=(); CONCRETE_PID=; MUTATION_PID=; MUTATION_SOCKET=; OUTPUT_ALIAS=; LOG=
+trap cleanup EXIT
+ln() { printf '%s\\n' "$4"; return 9; }
+allocate_runs "$1"
+''', target)
+    assert result.returncode == 9, result.stderr
+    alias_link = Path(result.stdout.strip())
+    assert alias_link.parent.parent == Path("/tmp")
+    assert not alias_link.parent.exists()
+    assert (target / "retained").read_text() == "existing output"
 
 
 def test_short_symlink_root_is_not_resolved(tmp_path):
@@ -102,7 +162,7 @@ wait_job "$STARTED_PID"
         assert "generation" in result.stderr
 
 
-def preparation_runner(tmp_path, command):
+def preparation_runner(tmp_path, command, outdir="out"):
     subject = tmp_path / "subject"
     workdir = subject / "prepared"
     workdir.mkdir(parents=True)
@@ -114,18 +174,28 @@ def preparation_runner(tmp_path, command):
     uv.chmod(0o755)
     env = dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}", CHILD_FILE=str(tmp_path / "child"))
     process = subprocess.Popen(
-        [str(RUNNER), "--subject", "subject", "--workdir", "prepared", "--outdir", "out",
+        [str(RUNNER), "--subject", "subject", "--workdir", "prepared",
+         *(["--outdir", outdir] if outdir is not None else []),
          "--rea", "/bin/true", "--no-llm", "--predicate", "0"],
         cwd=tmp_path, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     return process
 
 
-def test_preparation_preserves_failure_status(tmp_path):
-    process = preparation_runner(tmp_path, "exit 7")
+@pytest.mark.parametrize("outdir", [None, "custom-output"])
+def test_preparation_preserves_failure_status_and_physical_output_base(tmp_path, outdir):
+    process = preparation_runner(tmp_path, "exit 7", outdir=outdir)
     stdout, stderr = process.communicate(timeout=10)
     assert process.returncode == 7, (stdout, stderr)
     assert "candidate synthesis" not in stdout
+    base = tmp_path / outdir if outdir else tmp_path / "subject/prepared/out"
+    lines = stdout.splitlines()
+    assert f"  concrete     {base / 'br-gen-con'}" in lines
+    assert f"  mutation     {base / 'br-gen-bin'}" in lines
+    roots = list(base.glob("runs-debug-*"))
+    assert len(roots) == 1
+    assert f"artifact root: {roots[0]}" in lines
+    assert (roots[0] / "logs").is_dir()
 
 
 @pytest.mark.parametrize("sig,expected", [(signal.SIGINT, 130), (signal.SIGTERM, 143)])

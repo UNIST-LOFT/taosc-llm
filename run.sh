@@ -10,15 +10,19 @@ socket_path_fits() {
   [ "${#path}" -le 107 ]
 }
 allocate_runs() {
-  local out=$1 template
-  template=$out/runs-debug-XXXXXXXXXX
-  if ! socket_path_fits "$template/br-gen-bin-00000/replay.sock"; then
-    echo "note: output socket path exceeds 107 bytes; using an exclusive /tmp run root" >&2
-    template=/tmp/binradar-debug-XXXXXXXXXX
-  else
-    mkdir -p -- "$out"
+  local out=$1 producer_base=$1
+  mkdir -p -- "$out"
+  RUNS=$(mktemp -d -- "$out/runs-debug-XXXXXXXXXX")
+  LOG=$RUNS/logs
+  if ! socket_path_fits "$out/br-gen-bin/replay.sock"; then
+    echo "note: output socket path exceeds 107 bytes; using a temporary /tmp alias" >&2
+    OUTPUT_ALIAS=$(mktemp -d -- /tmp/binradar-debug-XXXXXXXXXX)
+    ln -s -- "$out" "$OUTPUT_ALIAS/out"
+    producer_base=$OUTPUT_ALIAS/out
   fi
-  RUNS=$(mktemp -d -- "$template")
+  CONCRETE_RUN=$producer_base/br-gen-con
+  MUTATION_RUN=$producer_base/br-gen-bin
+  MUTATION_SOCKET=$MUTATION_RUN/replay.sock
 }
 
 # Own each job's process group so cleanup still reaches descendants after its
@@ -115,7 +119,12 @@ cleanup() {
   for pid in "${OWNED_PIDS[@]}"; do
     if ! kill -0 "$pid" 2>/dev/null; then wait "$pid" 2>/dev/null || true; fi
   done
-  if [ "$status" -ne 0 ]; then echo "logs kept for diagnosis: $LOG" >&2; fi
+  # Only remove our symlink and its owned parent, never the physical outputs.
+  if [ -n "$OUTPUT_ALIAS" ]; then
+    rm -f -- "$OUTPUT_ALIAS/out"
+    rmdir -- "$OUTPUT_ALIAS"
+  fi
+  if [ "$status" -ne 0 ] && [ -n "$LOG" ]; then echo "logs kept for diagnosis: $LOG" >&2; fi
   exit "$status"
 }
 
@@ -135,7 +144,7 @@ main() {
   TAOSC_LLM=$REPO/utils/taosc-llm
   SUBJECT=$REPO/benchmarks/loftix/binutils/CVE-2017-14745
   WORKDIR_NAME=workdir-0.1.24
-  OUTDIR= TIMEOUT=7200 READY_TIMEOUT=0 PROVIDER_ENV= PREDICATE= NO_LLM=0 REA=
+  OUTDIR= TIMEOUT=7200 READY_TIMEOUT=0 PROVIDER_ENV=$TAOSC_LLM/.env PREDICATE= NO_LLM=0 REA=
   while [ $# -gt 0 ]; do
     case "$1" in
       --subject|--workdir|--outdir|--timeout|--ready-timeout|--provider-env|--predicate|--rea)
@@ -184,17 +193,15 @@ HELP
     echo "model mode needs --provider-env; use --no-llm for the manual predicate path" >&2; return 2
   fi
   OUTDIR=$(absolute_path "${OUTDIR:-$WORKDIR/out}")
-  allocate_runs "$OUTDIR"
-  LOG=$RUNS/logs
-  CONCRETE_RUN=$RUNS/br-gen-con-00000
-  MUTATION_RUN=$RUNS/br-gen-bin-00000
-  MUTATION_SOCKET=$MUTATION_RUN/replay.sock
-  DATASET=$RUNS/dataset RESULT=$RUNS/taosc-llm-result CACHE=$RUNS/taosc-llm-cache
-  mkdir -p -- "$LOG" "$CACHE"
-  OWNED_PIDS=() CONCRETE_PID= MUTATION_PID=
+  OWNED_PIDS=() CONCRETE_PID= MUTATION_PID= MUTATION_SOCKET= OUTPUT_ALIAS= LOG=
   trap cleanup EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
+  allocate_runs "$OUTDIR"
+  DATASET=$RUNS/dataset RESULT=$RUNS/taosc-llm-result CACHE=$RUNS/taosc-llm-cache
+  mkdir -p -- "$LOG" "$CACHE"
+  printf 'producer outputs:\n  concrete     %s\n  mutation     %s\nartifact root: %s\n' \
+    "$OUTDIR/br-gen-con" "$OUTDIR/br-gen-bin" "$RUNS"
 
   echo "== preparing both generation environments =="
   run_uv "$REPO" binradar-setup --generate-concrete -c "$SUBJECT" -w "$WORKDIR"
@@ -204,14 +211,14 @@ HELP
   # The subshell immediately execs setsid; the owned PID is the new group leader.
   (
     cd "$SUBJECT"
-    exec setsid uv run --project "$REPO" binradar -w "$WORKDIR_NAME" -o "$RUNS" \
-      --generate-concrete --timeout "$TIMEOUT" --run-prefix br-gen-con
+    exec setsid uv run --project "$REPO" binradar -w "$WORKDIR_NAME" --output "$CONCRETE_RUN" \
+      --generate-concrete --timeout "$TIMEOUT"
   ) >"$LOG/concrete.log" 2>&1 &
   CONCRETE_PID=$!; OWNED_PIDS+=("$CONCRETE_PID")
   (
     cd "$SUBJECT"
-    exec setsid uv run --project "$REPO" binradar -w "$WORKDIR_NAME" -o "$RUNS" \
-      --generate-binradar --replay-server --timeout "$TIMEOUT" --run-prefix br-gen-bin
+    exec setsid uv run --project "$REPO" binradar -w "$WORKDIR_NAME" --output "$MUTATION_RUN" \
+      --generate-binradar --replay-server --timeout "$TIMEOUT"
   ) >"$LOG/mutation.log" 2>&1 &
   MUTATION_PID=$!; OWNED_PIDS+=("$MUTATION_PID")
 

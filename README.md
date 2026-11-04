@@ -116,12 +116,12 @@ trusted-host option evaluates them against the dataset's own resident
 ```sh
 uv run --project utils/taosc-llm taosc-llm-evaluate \
   --dataset /path/to/new-dataset --predicate 'rax <= 0' \
-  --replay-socket workdir/out/br-gen-bin-00000/replay.sock \
+  --replay-socket workdir/out/br-gen-bin/replay.sock \
   --cache-dir workdir/out/taosc-llm-cache --workers 4
 uv run --project utils/taosc-llm taosc-llm \
   --dataset /path/to/new-dataset --provider-env /abs/provider.env \
   --output /path/to/model-runs --execution-workers 4 \
-  --replay-socket workdir/out/br-gen-bin-00000/replay.sock \
+  --replay-socket workdir/out/br-gen-bin/replay.sock \
   --cache-dir workdir/out/taosc-llm-cache
 ```
 
@@ -286,12 +286,27 @@ utils/taosc-llm/run.sh --provider-env /abs/provider.env --timeout 7200
 Options: `--subject DIR`, `--workdir NAME`, `--outdir DIR`, `--rea PATH`,
 `--timeout SECONDS`, `--ready-timeout SECONDS`, `--predicate`, `--no-llm`,
 `--provider-env FILE`. Relative subject/output paths are made absolute before
-changing cwd, without resolving short symlink aliases. Each invocation exclusively
-creates `<outdir>/runs-debug-<random>` with `mktemp -d`, so both producers start
-at run id 0 without sharing a root with another invocation. If its socket path
-would exceed **107 encoded bytes** (not characters), allocation instead uses
-`/tmp/binradar-debug-<random>` and prints a notice. A short `--outdir` controls
-the location explicitly. Do not run setup concurrently in the same workdir.
+changing cwd, without resolving short symlink aliases. The default layout is:
+
+```text
+workdir/out/
+  br-gen-con/                  # concrete generation; replaced on rerun
+  br-gen-bin/                  # resident mutation generation; replaced on rerun
+  runs-debug-<random>/         # fresh logs, dataset, result and cache
+```
+
+`--outdir DIR` overrides this base directory. Each producer receives its own
+exact `binradar --output` leaf; neither `--run-prefix` nor a numeric suffix is
+used. Diagnostic roots still use `mktemp -d` so old logs/datasets remain separate.
+If the physical socket path exceeds **107 encoded bytes**, an owned temporary
+`/tmp/binradar-debug-<random>/out` symlink points to the output base. Producer
+launches and socket connections use that short alias; physical results stay in
+the requested output directory. The alias is removed only after shutdown.
+
+Stop the previous invocation before rerunning; fixed producer directories are
+not safe for overlapping runs. Setup in a shared workdir remains single-owner.
+Rebuild the dataset for each new generation, as this script does: an old dataset
+must not be attached to a different server merely because its path was reused.
 
 `--timeout` controls native generation (default 7200; 0 means unlimited).
 `--ready-timeout` independently bounds readiness, including startup and PROBE
@@ -316,8 +331,8 @@ Order and failure rules the example encodes:
 1. `binradar-setup --generate-concrete` and `--generate-binradar` run first;
    they prepare different `.env` files and do not run patches.
 2. Both `binradar` processes start together. They share the prepared workdir but
-   write separate `-o` run directories; `out/plt_info.txt` is published by
-   atomic rename so the two runs cannot interleave it.
+   receive distinct exact `--output` directories, each with its own PLT metadata,
+   progress history and phase results.
 3. `python -m taosc_llm.replay wait` is the only readiness signal. A closed
    socket, a log line or a missing socket is not completion, and a dead launcher
    pid fails immediately.
@@ -330,7 +345,7 @@ Order and failure rules the example encodes:
 7. Each pipeline stage, including preparation/warm/synthesis, belongs to an owned
    process group. Exit cleanup attempts bounded resident shutdown, then bounded
    TERM/KILL cleanup of those groups; it never waits indefinitely or kills an
-   unrelated run.
+   unrelated run. The temporary alias is removed afterward, not its target outputs.
 
 ## Native isolation and harmless fixture
 
