@@ -52,14 +52,8 @@ async def _kill(process) -> None:
 
 
 async def run_adapter(context: SynthesisContext, provider: ProviderConfig,
-                      command: list[str], run_id: str, journal: Path,
-                      settlement: dict[str, bool]) -> dict:
-    """Caller must retain its quota reservation until this coroutine finishes.
-
-    settlement is pessimistic once a worker exists. A valid final frame followed
-    by worker exit is the only normal release path. Cancellation may drain that
-    proof, otherwise leaves the reservation quarantined for explicit recovery.
-    """
+                      command: list[str], run_id: str, journal: Path) -> dict:
+    """Validate the terminal frame and worker exit; drain cancellation before killing."""
     process = None
     terminal = None
     seen = set()
@@ -67,7 +61,6 @@ async def run_adapter(context: SynthesisContext, provider: ProviderConfig,
     checked = set()
     request_id = uuid.uuid4().hex
     read_fd, write_fd = os.pipe()
-    settlement["remote_settled"] = True  # no worker/request exists yet
     key_bytes = json.dumps({"api_key": provider.api_key}).encode()
     if len(key_bytes) > 65536:
         os.close(read_fd)
@@ -138,7 +131,6 @@ async def run_adapter(context: SynthesisContext, provider: ProviderConfig,
                     await process.wait()
                     if process.returncode != (0 if frame["type"] == "turn_complete" else 1):
                         raise AdapterError("adapter exit disagrees with terminal frame")
-                    settlement["remote_settled"] = frame["remote_settled"]
                     result["host_inspected_context"] = inspected
                     result["host_checked_predicates"] = sorted(checked)
                     return result
@@ -150,9 +142,9 @@ async def run_adapter(context: SynthesisContext, provider: ProviderConfig,
                 if len(seen) > provider.max_tool_calls:
                     raise AdapterError("adapter tool limit exceeded")
                 record("adapter", frame)
-                # One host tool at a time. Cancellation does not abandon a native
-                # worker: drain it before releasing the provider reservation; the
-                # evaluator owns bounded process-group execution and worker limits.
+                # One host tool at a time. Cancellation drains native work before
+                # stopping the adapter; the evaluator owns bounded process-group
+                # execution and worker limits.
                 task = asyncio.create_task(asyncio.to_thread(context.call_tool, frame["tool"], frame["arguments"]))
                 try:
                     result = await asyncio.shield(task)
@@ -178,7 +170,6 @@ async def run_adapter(context: SynthesisContext, provider: ProviderConfig,
                         terminal = final(frame)
                         record("adapter", frame)
                         await process.wait()
-                        settlement["remote_settled"] = terminal["remote_settled"]
                         return
             except (OSError, ValueError, AdapterError):
                 return
@@ -195,7 +186,6 @@ async def run_adapter(context: SynthesisContext, provider: ProviderConfig,
                 # Never forward provider/SDK stderr into logs or terminal.
                 stderr=asyncio.subprocess.DEVNULL, pass_fds=(read_fd,),
                 start_new_session=True, limit=MAX_FRAME + 1)
-            settlement["remote_settled"] = False
             os.close(read_fd)
             read_fd = -1
             with os.fdopen(write_fd, "wb") as pipe:

@@ -45,22 +45,12 @@ def _run(label: str, operation) -> int:
         print(f"{label}: {error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        print(f"{label}: cancelled; unresolved provider requests remain quarantined", file=sys.stderr)
+        print(f"{label}: cancelled", file=sys.stderr)
         return 130
 
 
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if arguments[:1] == ["recover-quota"]:
-        parser = argparse.ArgumentParser(prog="taosc-llm recover-quota")
-        parser.add_argument("--confirm-provider-settled", action="store_true", required=True)
-        parser.parse_args(arguments[1:])
-        def recover():
-            from .admission import recover_reservations
-            return {"status": "prepared", "cleared_reservations":
-                    recover_reservations(confirm_provider_settled=True)}
-        return _run("taosc-llm", recover)
-
     parser = argparse.ArgumentParser(
         prog="taosc-llm",
         description="Synthesize or build an ERM predicate from a prepared dataset; not final repair verification.",
@@ -70,7 +60,7 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--predicate", help="manual family-specific predicate, evaluated before building")
     mode.add_argument("--provider-env", type=Path, help="explicit provider file; enables isolated Pi refinement")
     parser.add_argument("--output", type=Path, help="private synthesis run root")
-    parser.add_argument("--execution-workers", type=_positive, default=1, help="concrete workers, independent of provider quota")
+    parser.add_argument("--execution-workers", type=_positive, default=1, help="concrete evaluation workers")
     parser.add_argument("--max-rounds", type=_positive, help="maximum proposal/build/refinement rounds (provider mode; default: 4)")
     parser.add_argument("--pi-sdk-root", type=Path, help="pinned SDK project; Guix supplies its own default")
     parser.add_argument(
@@ -84,11 +74,9 @@ def main(argv: list[str] | None = None) -> int:
               "is private to each run directory"))
     parser.add_argument("--base-url")
     parser.add_argument("--model")
-    parser.add_argument("--max-in-flight", type=int, help="provider cap; Ollama permits 1..3")
-    parser.add_argument("--workers", type=_positive, help="model-session worker capacity, not execution workers")
     args = parser.parse_args(arguments)
     if args.predicate is not None and any(value is not None for value in (
-            args.pi_sdk_root, args.base_url, args.model, args.max_in_flight, args.workers, args.max_rounds)):
+            args.pi_sdk_root, args.base_url, args.model, args.max_rounds)):
         parser.error("provider options require --provider-env")
 
     def execute():
@@ -100,7 +88,6 @@ def main(argv: list[str] | None = None) -> int:
         from .synthesis import generate_with_pi
         return generate_with_pi(args.dataset, args.provider_env,
                                 sdk_root=args.pi_sdk_root, base_url=args.base_url, model=args.model,
-                                max_in_flight=args.max_in_flight, workers=args.workers,
                                 execution_workers=args.execution_workers, max_rounds=4 if args.max_rounds is None else args.max_rounds,
                                 output=args.output, replay_socket=args.replay_socket,
                                 cache_dir=args.cache_dir)

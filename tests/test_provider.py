@@ -30,24 +30,25 @@ def test_explicit_loading_ignores_ambient_and_redacts(tmp_path, monkeypatch):
     assert config.model == "deepseek-v4.1-flash:1017"
     assert SECRET not in repr(config)
     assert SECRET not in json.dumps(config.public_dict())
-    assert "api_key" not in config.public_dict()
     with pytest.raises(FrozenInstanceError):
         setattr(config, "model", "changed")
 
 
 def test_nonsecret_override_precedence(tmp_path):
-    config = load_provider(provider_file(tmp_path, "TAOSC_LLM_WORKERS=2\nTAOSC_LLM_MAX_IN_FLIGHT=2\n"),
-                           workers=5, max_in_flight=3,
-                           base_url="https://ollama.com/v1", model="deepseek-v4.1-flash:1017")
-    assert config.workers == 5
-    assert config.max_in_flight == 3
+    path = provider_file(tmp_path, "TAOSC_LLM_PROFILE=openai-compatible\n")
+    config = load_provider(path, base_url="https://provider.example/api/v1",
+                           model="explicit-opaque-model:revision")
+    assert config.base_url == "https://provider.example/api/v1"
+    assert config.model == "explicit-opaque-model:revision"
+    original = load_provider(path)
+    assert original.base_url == "https://ollama.com/v1"
+    assert original.model == "deepseek-v4.1-flash:1017"
 
 
 @pytest.mark.parametrize("extra", [
     "OPENAI_API_KEY=another-secret\n", "UNRECOGNIZED=secret-value\n",
-    "export OPENAI_API_KEY=secret-value\n", "TAOSC_LLM_WORKERS=0\n",
-    "TAOSC_LLM_MAX_IN_FLIGHT=0\n", "TAOSC_LLM_MAX_IN_FLIGHT=4\n",
-    "TAOSC_LLM_MAX_IN_FLIGHT=-1\n", "TAOSC_LLM_WORKERS=inf\n",
+    "export OPENAI_API_KEY=secret-value\n", "TAOSC_LLM_WORKERS=2\n",
+    "TAOSC_LLM_MAX_IN_FLIGHT=3\n",
     "TAOSC_LLM_TIMEOUT_SECONDS=1.5\n",
 ])
 def test_invalid_fields_do_not_echo_values(tmp_path, extra):
@@ -72,11 +73,21 @@ def test_placeholders_and_shell_substitutions_rejected(tmp_path, value):
     {"base_url": "https://openai.com/v1"},
     {"base_url": "https://ollama.com/v1/"},
     {"model": "deepseek-v4.1-flash:cloud"},
-    {"workers": True}, {"max_in_flight": -1},
+    {"base_url": True}, {"model": ""},
 ])
 def test_unsupported_routing_and_invalid_overrides(tmp_path, overrides):
     with pytest.raises(ProviderConfigError):
         load_provider(provider_file(tmp_path), **overrides)
+
+
+@pytest.mark.parametrize("name,value", [
+    ("context_window", 0), ("max_tokens", 0), ("timeout_seconds", 0),
+    ("max_turns", 0), ("max_tool_calls", 0),
+    ("timeout_seconds", True), ("max_turns", 1.5),
+])
+def test_direct_api_rejects_invalid_operation_bounds(name, value):
+    with pytest.raises(ProviderConfigError):
+        ProviderConfig(api_key=SECRET, **{name: value})
 
 
 @pytest.mark.parametrize("output_tokens", [64000, 64001])
@@ -113,15 +124,13 @@ def test_native_environment_is_nonsecret_allowlist(monkeypatch):
         "AWS_SECRET_ACCESS_KEY", "NODE_OPTIONS", "LD_PRELOAD", "HOME", "PYTHONPATH", "SDK_ROOT"})
 
 
-def test_explicit_generic_profile_admits_custom_model_and_cap_zero(tmp_path):
-    path = provider_file(tmp_path, "TAOSC_LLM_PROFILE=openai-compatible\n"
-                                   "TAOSC_LLM_MAX_IN_FLIGHT=0\nTAOSC_LLM_WORKERS=4\n")
-    loaded = load_provider(path, base_url="https://provider.example/api/v1",
-                           model="explicit-opaque-model:revision")
+def test_explicit_generic_profile_admits_custom_model(tmp_path):
+    path = provider_file(tmp_path, "TAOSC_LLM_PROFILE=openai-compatible\n")
+    path.write_text(path.read_text().replace("https://ollama.com/v1", "https://provider.example/api/v1")
+                    .replace("deepseek-v4.1-flash:1017", "explicit-opaque-model:revision"))
+    loaded = load_provider(path)
     assert loaded.base_url == "https://provider.example/api/v1"
     assert loaded.model == "explicit-opaque-model:revision"
-    assert loaded.max_in_flight == 0
-    assert loaded.workers == 4
 
 
 @pytest.mark.parametrize("extra", ["TAOSC_LLM_PROFILE=unknown-profile\n",
@@ -155,7 +164,7 @@ def test_generic_profile_rejects_unsafe_urls(tmp_path, endpoint):
 
 
 @pytest.mark.parametrize("overrides", [
-    {"max_in_flight": 0}, {"max_in_flight": 4}, {"model": "substitute-model"},
+    {"model": "substitute-model"},
     {"base_url": "https://OLLAMA.COM/v1"},
     {"base_url": "https://ollama.com./v1"},
     {"base_url": "https://ollama.com:443/v1"},
@@ -168,8 +177,8 @@ def test_generic_profile_cannot_bypass_known_ollama_account_policy(tmp_path, ove
 
 
 @pytest.mark.parametrize("overrides", [
-    {"max_in_flight": 0}, {"max_in_flight": 4}, {"model": "substitute-model"},
-    {"base_url": "https://subdomain.ollama.com/v1", "max_in_flight": 0},
+    {"model": "substitute-model"},
+    {"base_url": "https://subdomain.ollama.com/v1"},
 ])
 def test_direct_api_cannot_bypass_known_account_policy(overrides):
     with pytest.raises(ProviderConfigError):

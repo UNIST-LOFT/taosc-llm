@@ -9,7 +9,6 @@ import uuid
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-from .admission import QuotaOwner
 from .bridge import adapter_command, run_adapter
 from .context import SynthesisContext, canonical, prepare_context
 from .provider import ProviderConfig, load_provider, native_environment
@@ -103,33 +102,25 @@ async def _build(context: SynthesisContext, proposal: dict, candidate: Path) -> 
     return result
 
 
-async def _model_round(context, provider, owner, command, run_id, trials, attempts):
-    async with owner.reserve() as reservation:
-        settlement = {"remote_settled": True}
-        try:
-            for attempt in range(3):
-                terminal = await run_adapter(context, provider, command, run_id,
-                    trials / f"turn-{attempt + 1}.jsonl", settlement)
-                attempts.append({k: v for k, v in terminal.items() if k != "final_text"})
-                if terminal["type"] == "turn_complete":
-                    return terminal
-                delay = terminal.get("retry_after_seconds")
-                if (terminal.get("http_status") != 429 or not settlement["remote_settled"] or attempt == 2
-                        or not isinstance(delay, (int, float)) or isinstance(delay, bool)
-                        or not 0 <= delay <= provider.timeout_seconds):
-                    raise RuntimeError("Pi operation failed: " + terminal["error_code"])
-                await asyncio.sleep(delay)
-        finally:
-            if settlement["remote_settled"]:
-                reservation.settle()
+async def _model_round(context, provider, command, run_id, trials, attempts):
+    for attempt in range(3):
+        terminal = await run_adapter(context, provider, command, run_id,
+            trials / f"turn-{attempt + 1}.jsonl")
+        attempts.append({k: v for k, v in terminal.items() if k != "final_text"})
+        if terminal["type"] == "turn_complete":
+            return terminal
+        delay = terminal.get("retry_after_seconds")
+        if (terminal.get("http_status") != 429 or not terminal["remote_settled"] or attempt == 2
+                or not isinstance(delay, (int, float)) or isinstance(delay, bool)
+                or not 0 <= delay <= provider.timeout_seconds):
+            raise RuntimeError("Pi operation failed: " + terminal["error_code"])
+        await asyncio.sleep(delay)
     raise RuntimeError("Pi retry policy exhausted")
 
 
 async def synthesize_context(context: SynthesisContext, provider: ProviderConfig,
-                             owner: QuotaOwner, *, sdk_root: Path | None = None,
+                             *, sdk_root: Path | None = None,
                              max_rounds: int = 4) -> dict:
-    if owner.config != provider:
-        raise ValueError("provider must match quota owner")
     if type(max_rounds) is not int or not 1 <= max_rounds <= 16:
         raise ValueError("max_rounds must be between 1 and 16")
     command = adapter_command(sdk_root)
@@ -152,7 +143,7 @@ async def synthesize_context(context: SynthesisContext, provider: ProviderConfig
                                       feedback=feedback, replay_socket=context.replay_socket,
                                       cache_dir=context.cache_dir)
             current._results.update(prior_results)
-            terminal = await _model_round(current, provider, owner, command, run_id, trials, result["attempts"])
+            terminal = await _model_round(current, provider, command, run_id, trials, result["attempts"])
             prior_results.update(current._results)
             (trials / "final.txt").write_text(terminal["final_text"])
             round_result: dict = {"round": index + 1, "final_text": terminal["final_text"]}
@@ -248,13 +239,11 @@ def generate_manual(dataset: Path, predicate: str, *, execution_workers=1, outpu
 
 
 def generate_with_pi(dataset: Path, provider_file: Path, *, sdk_root=None, base_url=None,
-                     model=None, max_in_flight=None, workers=None, execution_workers=1,
+                     model=None, execution_workers=1,
                      max_rounds=4, output: Path | None = None,
                      replay_socket: Path | None = None,
                      cache_dir: Path | None = None) -> dict:
-    provider = load_provider(provider_file, base_url=base_url, model=model,
-                             max_in_flight=max_in_flight, workers=workers)
+    provider = load_provider(provider_file, base_url=base_url, model=model)
     context = prepare_context(dataset, run_dir=output, workers=execution_workers,
                               replay_socket=replay_socket, cache_dir=cache_dir)
-    with QuotaOwner(provider) as owner:
-        return asyncio.run(synthesize_context(context, provider, owner, sdk_root=sdk_root, max_rounds=max_rounds))
+    return asyncio.run(synthesize_context(context, provider, sdk_root=sdk_root, max_rounds=max_rounds))

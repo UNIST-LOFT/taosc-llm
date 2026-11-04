@@ -17,8 +17,6 @@ class ProviderConfig:
     api_key: str = field(repr=False)
     base_url: str = "https://ollama.com/v1"
     model: str = "deepseek-v4.1-flash:1017"
-    max_in_flight: int = 3
-    workers: int = 3
     context_window: int = 300000
     max_tokens: int = 65536
     timeout_seconds: int = 600
@@ -29,10 +27,9 @@ class ProviderConfig:
         for name in ("api_key", "base_url", "model"):
             _validate_text(name, getattr(self, name))
         _validate_url(self.base_url)
-        for name in ("max_in_flight", "workers", "context_window", "max_tokens",
-                     "timeout_seconds", "max_turns", "max_tool_calls"):
+        for name in ("context_window", "max_tokens", "timeout_seconds", "max_turns", "max_tool_calls"):
             value = getattr(self, name)
-            if type(value) is not int or value < (0 if name == "max_in_flight" else 1):
+            if type(value) is not int or value < 1:
                 raise ProviderConfigError(f"invalid {name}")
         if self.max_tokens > self.context_window:
             raise ProviderConfigError("invalid max_tokens")
@@ -44,8 +41,6 @@ class ProviderConfig:
                 raise ProviderConfigError("unsupported base_url")
             if self.model != "deepseek-v4.1-flash:1017":
                 raise ProviderConfigError("unsupported model")
-            if not 1 <= self.max_in_flight <= 3:
-                raise ProviderConfigError("invalid max_in_flight")
 
     def public_dict(self) -> dict:
         """Client bounds are not assertions about provider capabilities."""
@@ -59,8 +54,7 @@ _FIELDS = {
     "OPENAI_MODEL": "model",
     "TAOSC_LLM_PROFILE": "profile",
     **{f"TAOSC_LLM_{name.upper()}": name for name in (
-        "max_in_flight", "workers", "context_window", "max_tokens",
-        "timeout_seconds", "max_turns", "max_tool_calls")},
+        "context_window", "max_tokens", "timeout_seconds", "max_turns", "max_tool_calls")},
 }
 _PLACEHOLDERS = {"changeme", "change-me", "replace-me", "replace_me", "your-api-key",
                  "your_api_key", "your-key", "your_key", "placeholder", "todo", "xxx",
@@ -89,12 +83,11 @@ def _validate_url(value: str) -> None:
         raise ProviderConfigError("invalid base_url") from None
 
 
-def load_provider(path: Path, *, base_url=None, model=None,
-                  max_in_flight=None, workers=None) -> ProviderConfig:
+def load_provider(path: Path, *, base_url=None, model=None) -> ProviderConfig:
     """Load only the selected file; CLI nonsecret overrides take precedence.
 
     TAOSC_LLM_PROFILE defaults to ollama-dev. Explicit openai-compatible admits
-    another HTTPS endpoint/model and cap zero; it never relaxes Ollama policy.
+    another HTTPS endpoint/model; it never relaxes Ollama routing policy.
     Profile is loader policy only and is not forwarded to the adapter.
 
     Syntax: blank lines, full-line comments, and KEY=value assignments. A pair
@@ -130,12 +123,10 @@ def load_provider(path: Path, *, base_url=None, model=None,
     for name in ("api_key", "base_url", "model"):
         if name not in values:
             raise ProviderConfigError(f"missing {name}")
-    for name, value in (("base_url", base_url), ("model", model),
-                        ("max_in_flight", max_in_flight), ("workers", workers)):
+    for name, value in (("base_url", base_url), ("model", model)):
         if value is not None:
             values[name] = value
-    for name in ("max_in_flight", "workers", "context_window", "max_tokens",
-                 "timeout_seconds", "max_turns", "max_tool_calls"):
+    for name in ("context_window", "max_tokens", "timeout_seconds", "max_turns", "max_tool_calls"):
         if name in values and isinstance(values[name], str):
             if not re.fullmatch(r"[0-9]+", values[name]):
                 raise ProviderConfigError(f"invalid {name}")
@@ -148,7 +139,7 @@ def load_provider(path: Path, *, base_url=None, model=None,
         raise ProviderConfigError("unsupported profile")
     config = ProviderConfig(**values)
     # Default profile never silently routes to a different provider. Known
-    # Ollama endpoint/model/cap invariants also hold for direct API construction.
+    # Ollama endpoint/model invariants also hold for direct API construction.
     if profile == "ollama-dev" and config.base_url != "https://ollama.com/v1":
         raise ProviderConfigError("unsupported base_url")
     return config

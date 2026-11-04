@@ -143,15 +143,14 @@ function validateStart(frame) {
   insist(frame.protocol_version === VERSION && frame.type === 'start_turn' && [frame.run_id, frame.request_id, frame.context_id].every(text));
   insist(typeof frame.system_prompt === 'string' && typeof frame.user_prompt === 'string' && isAbsolute(frame.private_dir));
   const p = frame.provider;
-  exactKeys(p, ['base_url', 'model', 'max_in_flight', 'workers', 'context_window', 'max_tokens', 'timeout_seconds', 'max_turns', 'max_tool_calls']);
+  exactKeys(p, ['base_url', 'model', 'context_window', 'max_tokens', 'timeout_seconds', 'max_turns', 'max_tool_calls']);
   insist(text(p.base_url) && !/[\x00-\x20\x7f]/.test(p.base_url) && text(p.model), 'configuration_error');
   let base;
   try { base = new URL(p.base_url); } catch { throw new SafeError('configuration_error'); }
   insist(base.protocol === 'https:' && base.hostname && !base.username && !base.password && !base.search && !base.hash, 'configuration_error');
-  insist(Number.isSafeInteger(p.max_in_flight) && p.max_in_flight >= 0 && positive(p.workers), 'configuration_error');
   const hostname = base.hostname.replace(/\.$/, '');
   if (hostname === 'ollama.com' || hostname.endsWith('.ollama.com')) {
-    insist(p.base_url === 'https://ollama.com/v1' && p.model === 'deepseek-v4.1-flash:1017' && p.max_in_flight >= 1 && p.max_in_flight <= 3, 'configuration_error');
+    insist(p.base_url === 'https://ollama.com/v1' && p.model === 'deepseek-v4.1-flash:1017', 'configuration_error');
   }
   chatEndpoint = new URL(base.href.replace(/\/$/, '') + '/chat/completions').href;
   insist([p.context_window, p.max_tokens, p.max_turns, p.max_tool_calls].every(positive) && Number.isFinite(p.timeout_seconds) && p.timeout_seconds > 0 && p.timeout_seconds * 1000 <= 2147483647, 'configuration_error');

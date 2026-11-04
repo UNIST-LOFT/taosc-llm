@@ -167,7 +167,8 @@ capture sets, measured cost) are unchanged; see the
 [replay plan](../../agent-docs/memo/BINRADAR_REPLAY_SERVER_PLAN.md).
 
 Concrete workers are bounded to 1–32 (`--workers` here, `--execution-workers` in
-synthesis). They are separate from provider session workers and the provider cap.
+synthesis). They do not limit LLM concurrency; external orchestration owns any
+account-wide provider limits.
 A supplied PIE `.brcached` cannot currently execute a nonneutral descriptor:
 literal-destination relocation is unproven, so that path explicitly reports
 `unavailable`. This is distinct from the fixed/selectable builder's PIE support.
@@ -207,9 +208,14 @@ feed bounded refinement rounds (`--max-rounds` 1–16, default 4, provider-only)
 manual mode rejects provider options instead of ignoring them. Abstention stops
 without a candidate. No final BinRadar verification is run.
 
-Provider routing, credential-file syntax, isolated SDK setup, the unchanged
-Ollama cap of three, session `--workers`, nonsecret overrides and durable quota
-recovery are specified in [PROVIDER_AND_PI.md](../../agent-docs/taosc-llm/PROVIDER_AND_PI.md).
+Provider routing, credential-file syntax, isolated SDK setup, per-operation
+bounds and externally managed scheduling are specified in
+[PROVIDER_AND_PI.md](../../agent-docs/taosc-llm/PROVIDER_AND_PI.md).
+There is no global provider lock, call counter or recovery command. Separate CLI
+invocations may run concurrently; each invocation still processes one context
+sequentially. Remove obsolete `TAOSC_LLM_MAX_IN_FLIGHT`/`TAOSC_LLM_WORKERS` fields
+from provider files. Provider `--max-in-flight`/`--workers` are also removed;
+evaluator `--workers` and synthesis `--execution-workers` remain supported.
 Use an explicit provider file; no home credentials, ambient provider defaults or
 fallback models are discovered. Guix supplies its SDK root automatically.
 
@@ -223,7 +229,7 @@ Stdout contains one JSON result; diagnostics go to stderr. Common CLI exits:
 | 2 | `reject_same_crash` |
 | 3 | `unavailable` |
 | 1 | Other terminal failure, including exhausted refinement or infrastructure/parser/build error |
-| 130 | Interrupted; unresolved provider operations remain quarantined |
+| 130 | Interrupted; local cleanup does not prove remote provider completion |
 
 `--warm` currently returns the ordinary evaluation status, not a guaranteed
 `warmed` status. Rejection takes precedence over unavailable cases; absent any

@@ -208,5 +208,5 @@ def main(argv: list[str] | None = None) -> int:
         print(f"taosc-llm-fixture: {error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        print("taosc-llm-fixture: cancelled; unresolved model requests stay quarantined", file=sys.stderr)
+        print("taosc-llm-fixture: cancelled; remote provider completion is not confirmed", file=sys.stderr)
         return 130

@@ -1,7 +1,6 @@
 """Refinement failures and exact host checks; no provider, target or fake verdict."""
 import asyncio
 import json
-from types import SimpleNamespace
 
 import pytest
 
@@ -16,6 +15,39 @@ def terminal(context, final, checked):
             "host_checked_predicates": checked}
 
 
+@pytest.mark.parametrize("settled,status,delay,expected_attempts", [
+    (True, 429, 2, 3),
+    (False, 429, 2, 1),
+    (True, 401, 2, 1),
+    (True, 429, None, 1),
+    (True, 429, True, 1),
+    (True, 429, -1, 1),
+    (True, 429, 31, 1),
+])
+def test_retry_uses_terminal_settlement_and_existing_bounds(
+        tmp_path, monkeypatch, settled, status, delay, expected_attempts):
+    provider = ProviderConfig(api_key="offline-only", base_url="https://example.invalid/v1",
+                              model="offline", timeout_seconds=30)
+    journals = []
+    delays = []
+    async def fail(context, provider, command, run_id, journal):
+        journals.append(journal.name)
+        return {"type": "turn_failed", "remote_settled": settled, "http_status": status,
+                "retry_after_seconds": delay, "error_code": "provider_rate_limited",
+                "request_count": 1}
+    async def sleep(seconds):
+        delays.append(seconds)
+    monkeypatch.setattr(synthesis, "run_adapter", fail)
+    monkeypatch.setattr(synthesis.asyncio, "sleep", sleep)
+    attempts = []
+    with pytest.raises(RuntimeError, match="Pi operation failed"):
+        asyncio.run(synthesis._model_round(None, provider, ["not-executed"], "offline", tmp_path, attempts))
+    assert journals == [f"turn-{index + 1}.jsonl" for index in range(expected_attempts)]
+    assert len(attempts) == expected_attempts
+    assert delays == [delay] * (expected_attempts - 1)
+    assert all(attempt["remote_settled"] is settled for attempt in attempts)
+
+
 def test_exact_candidate_must_have_been_evaluated(tmp_path, monkeypatch):
     context = prepare_context(make_dataset(tmp_path / "dataset"), run_dir=tmp_path / "runs")
     provider = ProviderConfig(api_key="offline-only", base_url="https://example.invalid/v1", model="offline")
@@ -23,7 +55,7 @@ def test_exact_candidate_must_have_been_evaluated(tmp_path, monkeypatch):
     async def model(current, *args):
         return terminal(current, proposal(current, predicate="rax < 0"), ["rax <= 0"])
     monkeypatch.setattr(synthesis, "_model_round", model)
-    result = asyncio.run(synthesis.synthesize_context(context, provider, SimpleNamespace(config=provider), max_rounds=1))
+    result = asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=1))
     assert result["status"] == "refinement_exhausted"
     assert result["rounds"][0]["status"] == "parse_rejected"
     assert "exact predicate" in result["rounds"][0]["reason"]
@@ -48,7 +80,7 @@ def test_parser_and_real_build_failure_are_feedback_then_abstention(tmp_path, mo
     monkeypatch.setattr(synthesis, "_model_round", model)
     # The real builder rejects the fixture's deliberately non-ELF identity bytes
     # before any native tool/target runs; this is actual build feedback, not a verdict.
-    result = asyncio.run(synthesis.synthesize_context(context, provider, SimpleNamespace(config=provider), max_rounds=3))
+    result = asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=3))
     assert [r["status"] for r in result["rounds"]] == ["parse_rejected", "build_rejected", "abstained"]
     assert result["status"] == "abstained" and result["verified"] is False
     assert result["binradar_verification"] == "not_run"
