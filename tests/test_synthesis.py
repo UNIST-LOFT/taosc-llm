@@ -72,9 +72,9 @@ def test_parser_and_real_build_failure_are_feedback_then_abstention(tmp_path, mo
     async def model(current, *args):
         prompts.append(current.initial_prompt())
         if len(prompts) == 1:
-            return terminal(current, proposal(current, predicate="rax && 1"), [])
+            return terminal(current, proposal(current, predicate="rax &&"), [])
         if len(prompts) == 2:
-            assert 'rax && 1' in prompts[-1] and 'parse_rejected' in prompts[-1]
+            assert 'rax &&' in prompts[-1] and 'parse_rejected' in prompts[-1]
             return terminal(current, proposal(current), ["rax < 0"])
         assert 'build_rejected' in prompts[-1] and 'rax < 0' in prompts[-1]
         return terminal(current, proposal(current, decision="abstain", predicate=None), [])

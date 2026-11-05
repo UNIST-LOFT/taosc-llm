@@ -19,6 +19,9 @@ def make_dataset(root, *, count=2, patch_format="ERM generic", binradar_run=None
     payloads = {"config.env": b"BINARY=fixture\nTEST_CMD=./fixture @@\n", "fixture.orig": b"harmless fixture identity",
                 "fixture.brcached": b"harmless cached identity", "patch-format": patch_format.encode(),
                 "patch-location": b"1000", "patch-destination": b"1001"}
+    cwe805 = patch_format == "ERM CWE-805"
+    if cwe805:
+        payloads["stack-size"] = b"0\n"
     artifacts = {}
     for name, data in payloads.items():
         path = workdir / name
@@ -27,8 +30,10 @@ def make_dataset(root, *, count=2, patch_format="ERM generic", binradar_run=None
     analysis = root / "instructions.txt"
     analysis.write_text("é" * 10000)
     capture = root / "state.brch"
-    capture.write_bytes(predicates.CACHED_SNAPSHOT_HEADER.pack(predicates.CACHED_SNAPSHOT_MAGIC, 1, 0, 0, 0, 0)
-                        + predicates.CACHED_SNAPSHOT_REGS.pack((1 << 64) - 3, *([0] * 15)))
+    capture.write_bytes(predicates.CACHED_SNAPSHOT_HEADER.pack(
+        predicates.CACHED_SNAPSHOT_MAGIC, 1, 0, 0, 0, 2 if cwe805 else 0)
+        + (b"\0" * predicates.CACHED_SNAPSHOT_CLAMPS.size if cwe805 else b"")
+        + predicates.CACHED_SNAPSHOT_REGS.pack((1 << 64) - 3, *([0] * 15)))
     cases = []
     for index in range(count):
         cases.append({"id": f"function:{index}", "domain": "function", "input_path": None, "input_sha256": None,
@@ -192,7 +197,7 @@ def test_large_dataset_pages_not_global_cap(tmp_path):
     assert second["items"][0]["id"] == "function:32"
 
 
-@pytest.mark.parametrize("expression", ["", "rax && 1", "rax; return 1", "rip == 0", "0xff"])
+@pytest.mark.parametrize("expression", ["", "rax &&", "rax; return 1", "rip == 0", "0xff"])
 def test_family_parser_rejects_invalid_candidates(context, expression):
     assert not query(context, "evaluate_predicate", predicate=expression)["ok"]
     with pytest.raises(ValueError):
@@ -205,6 +210,20 @@ def test_family_parser_rejects_invalid_candidates(context, expression):
 def test_exact_proposal_fields(context, changes):
     with pytest.raises(ValueError):
         context.validate_proposal(proposal(context, **changes))
+
+
+@pytest.mark.parametrize("patch_format,expression", [
+    ("ERM generic", "rax != 0 && 10 / rax < 0"),
+    ("ERM CWE-805", "(s->rax >= i->begin && s->rax < i->end) || (1 * s->rbx < i->end - i->begin)"),
+])
+def test_logical_candidate_tool_and_proposal_roundtrip(tmp_path, patch_format, expression):
+    context = prepare_context(make_dataset(tmp_path / "dataset", patch_format=patch_format))
+    assert query(context, "get_patch_context")["ok"]
+    result = query(context, "evaluate_predicate", predicate=expression)
+    assert result["ok"]
+    parsed = context.validate_proposal(proposal(
+        context, predicate=expression, evidence_ids=[result["result_id"]]))
+    assert parsed["predicate"] == expression
 
 
 def test_exact_json_and_result_evidence(context):

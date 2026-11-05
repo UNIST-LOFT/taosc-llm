@@ -98,7 +98,11 @@ def test_invalid_inputs_preserve_previous_artifacts(tmp_path, monkeypatch, inval
 
 
 @pytest.mark.parametrize("stack_size", ["7", "-1", "1048577", "unknown"])
-def test_cwe805_stack_bounds_preserve_previous_artifacts(tmp_path, stack_size):
+@pytest.mark.parametrize("predicate", [
+    "1 * ((uint32_t *)s->rsp)[1] < i->end - i->begin",
+    "(s->rax >= i->begin && s->rax < i->end) || (1 * ((uint32_t *)s->rsp)[1] < i->end - i->begin)",
+])
+def test_cwe805_stack_bounds_preserve_previous_artifacts(tmp_path, stack_size, predicate):
     config, workdir = prepared_workdir(tmp_path)
     (workdir / "patch-format").write_text("ERM CWE-805\n")
     (workdir / "stack-size").write_text(stack_size + "\n")
@@ -113,9 +117,7 @@ def test_cwe805_stack_bounds_preserve_previous_artifacts(tmp_path, stack_size):
         pytest.fail("invalid stack access must be rejected before native work")
 
     with pytest.raises(ValueError):
-        generate_patch(config, workdir,
-                       "1 * ((uint32_t *)s->rsp)[1] < i->end - i->begin",
-                       native_runner=forbidden_runner)
+        generate_patch(config, workdir, predicate, native_runner=forbidden_runner)
     assert snapshot(workdir) == before
 
 

@@ -9,9 +9,11 @@ from importlib.resources import files
 from pathlib import Path
 from tempfile import mkdtemp
 
+from binradar.binradar_taosc_predicates import MAX_SOURCE_BYTES
+
 from .dataset import PreparedDataset
 
-MAX_EXPRESSION = 4096
+MAX_EXPRESSION = MAX_SOURCE_BYTES
 
 
 def canonical(value: object) -> bytes:

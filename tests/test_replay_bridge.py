@@ -382,6 +382,34 @@ def test_outcome_mapping_matches_the_existing_evaluation_vocabulary(
         {"id": 1, "predicate": "(rax <= 0) == 0"}]
 
 
+@pytest.mark.parametrize("patch_format,expression", [
+    ("ERM generic", "rax != 0 && 10 / rax > 1"),
+    ("ERM CWE-805", "(s->rax >= i->begin && s->rax < i->end) && (1 * s->rbx < i->end - i->begin)"),
+])
+def test_logical_replay_preserves_shared_safe_source(run_dir, tmp_path, patch_format, expression):
+    base = make_dataset(tmp_path / "logical-dataset", patch_format=patch_format,
+                        binradar_run=run_dir)
+    cases = []
+    for index, original in enumerate(base.cases("function"), 2):
+        case = dict(original)
+        case["id"] = f"function:{index}"
+        case["observation"] = {"outcome": "normal"}
+        case["capture"] = {**case["capture"], "outcome": {"outcome": "normal"}}
+        cases.append(case)
+    dataset = rewrite_cases(base, cases)
+    candidate = parse_candidate(patch_format, expression)
+    server = serve(run_dir, [rows() + [done()]])
+    try:
+        result = replay.evaluate_replay(dataset, candidate)
+    finally:
+        server.close()
+    assert all(case["verified"] is False for case in result["cases"])
+    assert evaluate_requests(server)[0]["patches"] == [
+        {"id": 1, "predicate": candidate.source_predicate}]
+    assert candidate.source_predicate == (f"({expression}) == 0"
+                                           if patch_format == "ERM generic" else expression)
+
+
 def test_busy_is_retried_without_losing_the_batch(run_dir, dataset):
     server = serve(run_dir, [
         [{"error": "busy"}],

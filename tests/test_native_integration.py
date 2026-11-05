@@ -80,7 +80,12 @@ def returncode(binary: Path, argument_count: int, patch_id: str | None) -> int:
 
 
 @pytest.mark.parametrize("link_mode", ["-no-pie", "-pie"])
-def test_real_fixed_and_selected_patch_semantics(tmp_path, link_mode):
+@pytest.mark.parametrize("predicate", [
+    "rax <= 0",
+    "rax == 0 || (rax < 0 && 10 / rax < 0)",
+    "rax <= 0 && (1 || 1 / 0)",
+])
+def test_real_fixed_and_selected_patch_semantics(tmp_path, link_mode, predicate):
     gcc = require_native_tools()
     workdir = tmp_path / "workdir"
     workdir.mkdir()
@@ -100,7 +105,7 @@ def test_real_fixed_and_selected_patch_semantics(tmp_path, link_mode):
     (workdir / "patch-format").write_text("ERM generic\n")
     config = tmp_path / "config.env"
     config.write_text("BINARY=fixture\n")
-    result = generate_patch(config, workdir, "rax <= 0")
+    result = generate_patch(config, workdir, predicate)
 
     assert result["status"] == "built"
     assert result["verified"] is False
@@ -172,6 +177,8 @@ error_handler:
     ("((uint64_t *)s->rsp)[1] >= i->begin && ((uint64_t *)s->rsp)[1] < i->end", 0, 32),
     ("1 * s->rdx < i->end - i->begin", 0, 32),
     ("1 * ((uint32_t *)s->rsp)[0] < i->end - i->begin", 0, 31),
+    ("(s->rax >= i->begin && s->rax < i->end) && (1 * s->rdx < i->end - i->begin)", 0, 32),
+    ("(s->rax >= i->begin && s->rax < i->end) || (1 * ((uint32_t *)s->rsp)[0] < i->end - i->begin)", 0, 32),
 ])
 def test_real_cwe805_clamps_and_typed_cells(tmp_path, link_mode, predicate, safe_count, repair_count):
     gcc = require_native_tools()

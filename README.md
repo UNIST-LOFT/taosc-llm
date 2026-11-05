@@ -192,8 +192,19 @@ Both paths build and evaluate the family-specific candidate. Generic predicates
 are signed-i64 register expressions: **nonzero means jump to the selected repair
 destination**. The builder lowers the safe condition `(expression) == 0` through
 BinRadar's parser, never interpolating model text as C. CWE-805 instead accepts
-the existing closed pointer/size safe-clamp grammar; it is not generic C or an
-arbitrary memory-expression interface. Inspect the dataset's family grammar.
+the closed pointer/size safe-clamp grammar; it is not generic C or an arbitrary
+memory-expression interface. Both families support parentheses and logical
+`&&`/`||`, with `&&` binding tighter and left-to-right short circuit. Generic
+logical results are exactly 0/1; bitwise `&`/`|` remain eager. For example,
+`rax != 0 && 10 / rax > 1` skips division at zero. Visited arithmetic traps stay
+branch 2, never repair success.
+
+CWE atoms compose against one **same allocation clamp** before existential
+reduction, in raw clamp order 255→0. All leaves, including skipped ones, must fit
+the captured stack. Source is bounded to 4096 UTF-8 bytes; the final lowered
+descriptor to 4095 bytes and depth 256. Inspect the dataset's family grammar.
+Rebuild all components and regenerate workdirs/datasets together; no additional
+language version, capability metadata or compatibility check is used.
 
 Pi SDK 1.4.0 receives exactly seven restricted host tools:
 `get_patch_context`, `get_function_analysis`, `list_cases`, `get_case`,

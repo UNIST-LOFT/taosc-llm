@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import re
 import shutil
 import subprocess
@@ -140,12 +139,10 @@ def generate_patch(config: Path, workdir: Path, predicate: str, *,
         (stage / "predicates").write_text(safe_predicate + "\n", encoding="utf-8")
         # This table is deliberately just one validated candidate plus id0.
         # No source expression is interpolated into C.
-        (stage / "brpatches.inc").write_text(
-            f"case 1: return {json.dumps(branch)};\ndefault: return \"p0\";\n",
-            encoding="utf-8")
+        records = [predicates.PredicateRecord(1, 1, safe_predicate, candidate.parsed)]
+        predicates._emit_brpatches_inc(stage / "brpatches.inc", records)
         predicates.write_runtime_predicates(
-            stage / "brpatches.json", candidate.family,
-            [predicates.PredicateRecord(1, 1, safe_predicate, candidate.parsed)])
+            stage / "brpatches.json", candidate.family, records)
         (stage / "predicate.h").write_text(
             # STATE.rip is the matching instruction's runtime address. A static
             # ELF destination alone is not a valid process address for PIE.

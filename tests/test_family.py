@@ -57,6 +57,57 @@ def test_cwe805_rejects_noncanonical_or_unrepresentable_predicates(expression):
         parse_candidate("ERM CWE-805", expression)
 
 
+@pytest.mark.parametrize("expression,branch", [
+    ("2 && 4", 1), ("2 || 4", 1), ("2 & 4", 0),
+    ("0 && (1 / 0)", 0), ("1 || (1 / 0)", 1),
+    ("1 || 0 && 0", 1), ("(1 || 0) && 0", 0),
+    ("(0 && (1 / 0)) + 7", 1),
+    ("((1 || (1 / 0)) == 1) && rax", 1),
+])
+def test_generic_logical_safe_lowering(expression, branch):
+    candidate = parse_candidate("ERM generic", expression)
+    assert predicates.eval_patch_str(candidate.descriptor, [2] + [0] * 15) == branch
+    assert candidate.source_predicate == f"({expression}) == 0"
+
+
+@pytest.mark.parametrize("expression", [
+    "1 && (1 / 0)", "0 || (1 / 0)",
+    "(1 / 0) || 1", "(1 / 0) && 0",
+])
+def test_generic_visited_logical_traps(expression):
+    candidate = parse_candidate("ERM generic", expression)
+    with pytest.raises(predicates.PredicateTrap):
+        predicates.eval_patch_str(candidate.descriptor, [0] * 16)
+
+
+@pytest.mark.parametrize("operator,branch", [("&&", 1), ("||", 0)])
+def test_cwe805_logical_tree_uses_one_clamp(operator, branch):
+    expression = ("(s->rax >= i->begin && s->rax < i->end) " + operator
+                  + " (s->rbx >= i->begin && s->rbx < i->end)")
+    candidate = parse_candidate("ERM CWE-805", expression)
+    assert isinstance(candidate.parsed, predicates.CWE805LogicalPredicate)
+    assert predicates.parse_predicate_descriptor(candidate.descriptor) == candidate.parsed
+    assert predicates.CWE805_branch_taken(candidate.parsed, [110, 310] + [0] * 14,
+                                         b"", [(100, 200), (300, 400)]) == branch
+
+
+def test_cwe805_short_circuit_and_whole_tree_stack_extent():
+    pointer = "(s->rax >= i->begin && s->rax < i->end)"
+    overflow = "(8 * s->rbx < i->end - i->begin)"
+    registers = [110, (1 << 64) - 1] + [0] * 14
+    skipped = parse_candidate("ERM CWE-805", f"{pointer} || {overflow}")
+    visited = parse_candidate("ERM CWE-805", f"{overflow} || {pointer}")
+    assert predicates.CWE805_branch_taken(skipped.parsed, registers, b"", [(100, 200)]) == 0
+    assert predicates.CWE805_branch_taken(visited.parsed, registers, b"", [(100, 200)]) == 2
+    stack = parse_candidate("ERM CWE-805", f"{pointer} || (1 * ((uint32_t *)s->rsp)[3] < i->end - i->begin)")
+    assert stack.required_stack_bytes == 16
+
+
+def test_candidate_source_bound_applies_before_whitespace_normalization():
+    with pytest.raises(ValueError, match="UTF-8"):
+        parse_candidate("ERM generic", " " * predicates.MAX_SOURCE_BYTES + "0")
+
+
 @pytest.mark.parametrize("patch_format", ["", "Single CWE-805", "ERM CWE-823"])
 def test_formats_are_explicit(patch_format):
     with pytest.raises(ValueError):
