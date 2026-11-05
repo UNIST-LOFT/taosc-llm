@@ -1,5 +1,6 @@
 """Behavioral evaluation contracts; no provider or research target execution."""
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import hashlib
 from pathlib import Path
 import threading
@@ -43,7 +44,14 @@ class Dataset:
         return {'BINARY': self.binary, 'TEST_CMD': '@@', 'BRCACHE_STACK_SIZE': '0'}
 
     def verify_artifacts(self):
-        pass
+        for name, record in self.manifest['artifacts'].items():
+            if sha256(self.artifact(name)) != record['sha256']:
+                raise ValueError('fixture artifact mismatch')
+
+    @contextmanager
+    def validation(self):
+        self.verify_artifacts()
+        yield self
 
     def cases(self, domain='all'):
         return [row for row in self.rows if domain == 'all' or row['domain'] == domain]
@@ -133,6 +141,36 @@ def test_owned_cache_reused_offline_and_environment_invalidates(dataset, tmp_pat
     third = evaluation.evaluate_dataset(dataset, 'rax != 0', cache_dir=root, execute=False)
     assert third['status'] == 'unavailable'
     assert len(calls) == 1
+
+
+def test_cached_capture_tampering_is_not_hidden_by_earlier_result(dataset, tmp_path, monkeypatch):
+    monkeypatch.setattr(evaluation, 'execute_capture',
+                        lambda ds, case, descriptor, directory: capture(ds, descriptor=descriptor))
+    cache = tmp_path / 'cache'
+    first = evaluation.evaluate_dataset(dataset, '0', cache_dir=cache)
+    assert first['status'] == 'reject_same_crash'
+    Path(first['cases'][0]['capture']['path']).write_bytes(b'tampered after evaluation')
+    monkeypatch.setattr(evaluation, 'execute_capture', lambda *args: pytest.fail('offline target execution'))
+    second = evaluation.evaluate_dataset(dataset, '0', execute=False, cache_dir=cache)
+    assert second['status'] == 'unavailable'
+    assert second['cases'][0]['reason'] == 'capture-hash-mismatch'
+    assert second['cases'][0]['branches'] is None
+
+
+@pytest.mark.parametrize('operation', ['evaluate', 'warm', 'snapshots'])
+def test_independent_evaluation_operations_revalidate_prepared_artifacts(tmp_path, operation):
+    from test_context_tools import make_dataset
+    dataset = make_dataset(tmp_path / 'prepared', concrete_run=None)
+    evaluation.evaluate_dataset(dataset, '0', execute=False, cache_dir=tmp_path / 'cache')
+    committed = dataset.case('function:0')['capture']
+    dataset.artifact(dataset.binary + '.orig').write_bytes(b'tampered after evaluation')
+    with pytest.raises(ValueError, match='hash mismatch'):
+        if operation == 'evaluate':
+            evaluation.evaluate_dataset(dataset, '0', execute=False, cache_dir=tmp_path / 'cache')
+        elif operation == 'warm':
+            evaluation.warm_dataset(dataset, cache_dir=tmp_path / 'cache')
+        else:
+            evaluation._snapshots(dataset, committed)
 
 
 def test_function_same_crash_offline_only_and_no_divergence_inference(dataset, tmp_path, monkeypatch):
@@ -230,6 +268,56 @@ def test_late_journal_commit_requires_tracer_identity_and_preserves_producer(dat
     assert final['status'] == ('reject_same_crash' if qemu else 'unavailable')
     assert final['cases'][0]['source'] == ('cache' if qemu else 'unavailable')
     assert journal.read_bytes() == before
+
+
+def test_republished_producer_header_is_reauthenticated_between_cases(dataset, tmp_path, monkeypatch):
+    import json
+    committed = capture(dataset)
+    run = tmp_path / 'producer'
+    channel = run / 'feedback-capture' / 'baseline'
+    states = run / 'feedback-capture' / 'states'
+    channel.mkdir(parents=True)
+    states.mkdir()
+    dataset.manifest['sources']['concrete_run'] = str(run)
+    dataset.rows[0]['source'] = {'case_id': 0, 'filename': 'input'}
+    dataset.rows.append({**dataset.rows[0], 'id': 'system:1',
+                         'source': {'case_id': 1, 'filename': 'input'}})
+    header = {'version': 1, 'channel': 'baseline', 'candidates': 'none',
+              'brpatches.json': sha256(dataset.artifact('brpatches.json')), 'binradar.env': None,
+              'context': {'original_sha256': sha256(dataset.artifact('harmless.orig')),
+                          'qemu_sha256': 'fixture'}}
+    header_path = channel / 'header.json'
+    header_path.write_text(json.dumps(header))
+    (states / (committed['sha256'] + '.brch')).write_bytes(Path(committed['path']).read_bytes())
+    input_row = {'kind': 'input', 'case': 1, 'file': 'input',
+                 'sha256': dataset.rows[1]['input_sha256']}
+    trace = {'kind': 'trace', 'representative': 0, 'artifact': committed['artifact_sha256'],
+             'state_reason': 'none', 'state_sha256': committed['sha256'], 'capture_id': 0,
+             'hits': 1, 'branches': '00', **committed['outcome']}
+    (channel / '1.jsonl').write_text(json.dumps(input_row) + '\n' + json.dumps(trace) + '\n')
+
+    def execute_after_republication(ds, case, descriptor, directory):
+        if case['id'] == 'system:0':
+            # Case 0 has no journal capture. While it executes, the producer
+            # republishes the same channel under a different tracer identity.
+            replaced = {**header, 'context': {**header['context'], 'qemu_sha256': 'other-tracer'}}
+            header_path.write_text(json.dumps(replaced))
+            return committed
+        raise evaluation.ExecutionUnavailable('replacement-producer-unavailable')
+
+    monkeypatch.setattr(evaluation, 'execute_capture', execute_after_republication)
+    root = tmp_path / 'cache'
+    result = evaluation.evaluate_dataset(dataset, '0', workers=1, cache_dir=root)
+    assert result['cases'][0]['status'] == 'reject_same_crash'
+    assert result['cases'][1]['status'] == 'unavailable'
+    assert result['cases'][1]['source'] == 'unavailable'
+    # The journal bytes are reusable only after a currently matching header
+    # authenticates them, not because a previous operation trusted this path.
+    header_path.write_text(json.dumps(header))
+    restored = evaluation.evaluate_dataset(dataset, '0', case_ids=['system:1'],
+                                           execute=False, cache_dir=root)
+    assert restored['cases'][0]['status'] == 'reject_same_crash'
+    assert restored['cases'][0]['source'] == 'cache'
 
 
 @pytest.mark.parametrize('value', [[], None, 1, 'cache', {'identity': {}, 'capture': []}])

@@ -1,6 +1,9 @@
 """Real file-backed prepared datasets; no provider or native execution."""
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import json
 from pathlib import Path
+import threading
 
 import pytest
 from binradar import binradar_taosc_predicates as predicates
@@ -75,6 +78,58 @@ def test_dataset_identity_and_private_projection(context):
     with pytest.raises(ValueError):
         context.verify_artifacts()
     assert not query(context, "get_patch_context")["ok"]
+
+
+@pytest.mark.parametrize('name,args', [
+    ('get_patch_context', {}),
+    ('get_function_analysis', {'function_id': 'function:patch', 'view': 'instructions'}),
+    ('list_cases', {'domain': 'all'}),
+    ('get_case', {'case_id': 'function:0'}),
+    ('evaluate_predicate', {'predicate': '0'}),
+    ('test_candidate', {'predicate': '0'}),
+    ('get_candidate_result', {'result_id': 'earlier'}),
+])
+def test_each_tool_revalidates_after_an_earlier_success(context, name, args):
+    assert query(context, 'get_patch_context')['ok']
+    context._results['earlier'] = {'cases': []}
+    context.dataset.artifact('fixture.orig').write_bytes(b'changed between tools')
+    result = query(context, name, **args)
+    assert result['ok'] is False
+    assert result['error']['code'] == 'backend_error'
+
+
+def test_parallel_tool_evaluation_does_not_share_validation_scope(context, monkeypatch):
+    original = context.dataset
+    validation = type(original).validation
+    entered, release = threading.Event(), threading.Event()
+
+    @contextmanager
+    def pause_validated_operation(dataset):
+        with validation(dataset) as validated:
+            entered.set()
+            if not release.wait(10):
+                raise RuntimeError('test operation was not released')
+            yield validated
+
+    monkeypatch.setattr(type(original), 'validation', pause_validated_operation)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        running = pool.submit(query, context, 'evaluate_predicate', predicate='0')
+        try:
+            assert entered.wait(10)
+            assert context.dataset is original
+            original.artifact('fixture.orig').write_bytes(b'changed during independent operation')
+            # The new operation must authenticate independently, not borrow the
+            # in-flight operation's already authenticated view.
+            second = query(context, 'get_patch_context')
+            assert second['ok'] is False
+            assert second['error']['code'] == 'backend_error'
+            assert context.dataset is original
+        finally:
+            release.set()
+        first = running.result(timeout=10)
+    assert first['ok'] is True
+    assert first['cases']['items'][0]['branches'] == [0]
+    assert context.dataset is original
 
 
 def test_scoped_authority(context):

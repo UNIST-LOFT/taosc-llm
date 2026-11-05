@@ -104,12 +104,12 @@ def _public(value):
     return result
 
 
-def _candidate(context: SynthesisContext, expression):
+def _candidate(dataset, expression):
     from .family import parse_candidate
     if not isinstance(expression, str) or not expression.strip() or len(expression.encode()) > MAX_EXPRESSION:
         raise ToolError("invalid_predicate", "predicate exceeds expression bound")
     try:
-        return parse_candidate(context.dataset.patch_format, expression)
+        return parse_candidate(dataset.patch_format, expression)
     except (ValueError, RecursionError) as error:
         raise ToolError("invalid_predicate", "canonical family parser rejected predicate") from error
 
@@ -133,113 +133,117 @@ def call_tool(context: SynthesisContext, name, args):
         if args.get("context_id") != context.context_id:
             raise ToolError("stale_context", "context ID mismatch")
         _validate(args, definitions[name]["parameters"])
-        context.verify_artifacts()
-        if name == "get_patch_context":
-            result = {"patch_context": context.projection}
-        elif name == "list_cases":
-            result = _page(context, "cases:" + args["domain"], [_public(c) for c in context.dataset.cases(args["domain"])], args.get("cursor"))
-        elif name == "get_case":
-            try:
-                case = context.dataset.case(args["case_id"])
-                result = {"case": _public(case)}
-                capture = case.get("capture")
-                result_id = args.get("result_id")
-                if result_id is not None:
-                    if result_id not in context._results:
-                        raise ToolError("out_of_scope", "unknown candidate result")
-                    evaluated = next((item for item in context._results[result_id].get("cases", [])
-                                      if item["case_id"] == case["id"]), None)
-                    if evaluated is None:
-                        raise ToolError("out_of_scope", "case not present in candidate result")
-                    capture = evaluated.get("capture")
-                    result["evaluation"] = _public(evaluated)
-                    result["result_id"] = result_id
-                if capture is None:
-                    if args.get("state_id") is not None:
-                        raise ToolError("out_of_scope", "state does not belong to an available capture")
-                    if args.get("cursor") is not None:
-                        _offset(context, "states:" + case["id"] + ":" + (result_id or "prepared"), args["cursor"])
-                        raise ToolError("invalid_cursor", "cursor outside unavailable capture")
-                    result.update(availability="unavailable", reason="no complete committed capture")
-                else:
-                    import binradar.binradar_taosc_predicates as predicates
-                    from .evaluation import _snapshots
-                    states = _snapshots(context.dataset, capture)
-                    state_id = args.get("state_id")
-                    scope = case["id"] + ":" + (result_id or "prepared")
-                    def project(index, state):
-                        return {"state_id": scope + ":hit:" + str(index), "hit_index": index,
-                                "branch": state.branch,
-                                "registers": {name: str(predicates.wrap64(state.registers[position]))
-                                              for name, position in predicates.REGISTER_TO_VAR.items()},
-                                "clamps": [[str(begin), str(end)] for begin, end in state.clamps],
-                                "stack_bytes": len(state.stack), "stack_sha256": digest(state.stack)}
-                    if state_id is None:
-                        result["states"] = _page(context, "states:" + scope,
-                            [project(index, state) for index, state in enumerate(states)], args.get("cursor"))
-                        result["zero_hits"] = not states
-                    else:
-                        prefix = scope + ":hit:"
-                        if not state_id.startswith(prefix) or not state_id[len(prefix):].isdecimal():
-                            raise ToolError("out_of_scope", "state does not belong to case")
-                        index = int(state_id[len(prefix):])
-                        if index >= len(states) or state_id != prefix + str(index):
-                            raise ToolError("out_of_scope", "state does not belong to case")
-                        state = states[index]
-                        offset = _offset(context, "stack:" + state_id, args.get("cursor"))
-                        if offset >= len(state.stack) and offset:
-                            raise ToolError("invalid_cursor", "cursor outside captured stack")
-                        end = min(offset + 4096, len(state.stack))
-                        result["state"] = project(index, state)
-                        result["stack"] = {"hex": state.stack[offset:end].hex(), "byte_offset": offset,
-                            "total_bytes": len(state.stack), "truncated": end < len(state.stack),
-                            "next_cursor": _cursor(context, "stack:" + state_id, end) if end < len(state.stack) else None}
-            except ToolError:
-                raise
-            except ValueError:
-                raise ToolError("out_of_scope", "unknown case ID or invalid capture") from None
-        elif name in ("evaluate_predicate", "test_candidate"):
-            from .evaluation import evaluate_dataset
-            candidate = _candidate(context, args["predicate"])
-            evaluation = evaluate_dataset(context.dataset, candidate.expression, workers=context.workers,
-                                          execute=name == "test_candidate",
-                                          cache_dir=context.cache_dir or context.run_dir / "cache",
-                                          replay_socket=context.replay_socket if name == "test_candidate" else None)
-            result_id = digest(canonical(evaluation))
-            context._results[result_id] = evaluation
-            result = {"valid_syntax": True, "checked_predicate": args["predicate"], **_result(context, result_id)}
-        elif name == "get_candidate_result":
-            result = _result(context, args["result_id"], args.get("cursor"))
-        else:
-            entries = context.dataset.manifest.get("analysis", [])
-            entry = next((e for e in entries if e["function_id"] == args["function_id"] and e["view"] == args["view"]), None)
-            if entry is None:
-                raise ToolError("out_of_scope", "unknown analysis ID or view")
-            if entry.get("availability") != "available":
-                result = {k: entry.get(k) for k in ("function_id", "view", "availability", "reason", "backend", "backend_version")}
-            else:
-                path = (context.dataset.root / entry["path"]).resolve(strict=True)
-                if not path.is_relative_to(context.dataset.root.resolve()):
-                    raise ValueError("analysis path escapes dataset")
-                offset = _offset(context, "analysis:" + args["function_id"] + ":" + args["view"], args.get("cursor"))
-                with path.open("rb") as stream:
-                    stream.seek(offset)
-                    raw = stream.read(FUNCTION_PAGE_BYTES + 4)
-                if not raw and offset:
-                    raise ToolError("invalid_cursor", "cursor outside analysis")
-                end = min(len(raw), FUNCTION_PAGE_BYTES)
-                while end < len(raw) and raw[end] & 0xc0 == 0x80:
-                    end -= 1
-                size = path.stat().st_size
-                result = {k: entry.get(k) for k in ("function_id", "view", "sha256", "availability", "complete", "backend", "backend_version")}
-                result.update(text=raw[:end].decode(), byte_offset=offset, total_bytes=size, truncated=offset + end < size,
-                              next_cursor=_cursor(context, "analysis:" + args["function_id"] + ":" + args["view"], offset + end) if offset + end < size else None)
+        with context.dataset.validation() as dataset:
+            result = _call_validated(context, dataset, name, args)
         return {**base, "ok": True, **result}
     except ToolError as error:
         return {**base, "ok": False, "error": {"code": error.code, "message": str(error)}}
     except (ValueError, TypeError, KeyError, OSError, RecursionError):
         return {**base, "ok": False, "error": {"code": "backend_error", "message": "prepared dataset query failed"}}
 
+
+def _call_validated(context, dataset, name, args):
+    if name == "get_patch_context":
+        result = {"patch_context": context.projection}
+    elif name == "list_cases":
+        result = _page(context, "cases:" + args["domain"], [_public(c) for c in dataset.cases(args["domain"])], args.get("cursor"))
+    elif name == "get_case":
+        try:
+            case = dataset.case(args["case_id"])
+            result = {"case": _public(case)}
+            capture = case.get("capture")
+            result_id = args.get("result_id")
+            if result_id is not None:
+                if result_id not in context._results:
+                    raise ToolError("out_of_scope", "unknown candidate result")
+                evaluated = next((item for item in context._results[result_id].get("cases", [])
+                                  if item["case_id"] == case["id"]), None)
+                if evaluated is None:
+                    raise ToolError("out_of_scope", "case not present in candidate result")
+                capture = evaluated.get("capture")
+                result["evaluation"] = _public(evaluated)
+                result["result_id"] = result_id
+            if capture is None:
+                if args.get("state_id") is not None:
+                    raise ToolError("out_of_scope", "state does not belong to an available capture")
+                if args.get("cursor") is not None:
+                    _offset(context, "states:" + case["id"] + ":" + (result_id or "prepared"), args["cursor"])
+                    raise ToolError("invalid_cursor", "cursor outside unavailable capture")
+                result.update(availability="unavailable", reason="no complete committed capture")
+            else:
+                import binradar.binradar_taosc_predicates as predicates
+                from .evaluation import _snapshots
+                states = _snapshots(dataset, capture)
+                state_id = args.get("state_id")
+                scope = case["id"] + ":" + (result_id or "prepared")
+                def project(index, state):
+                    return {"state_id": scope + ":hit:" + str(index), "hit_index": index,
+                            "branch": state.branch,
+                            "registers": {name: str(predicates.wrap64(state.registers[position]))
+                                          for name, position in predicates.REGISTER_TO_VAR.items()},
+                            "clamps": [[str(begin), str(end)] for begin, end in state.clamps],
+                            "stack_bytes": len(state.stack), "stack_sha256": digest(state.stack)}
+                if state_id is None:
+                    result["states"] = _page(context, "states:" + scope,
+                        [project(index, state) for index, state in enumerate(states)], args.get("cursor"))
+                    result["zero_hits"] = not states
+                else:
+                    prefix = scope + ":hit:"
+                    if not state_id.startswith(prefix) or not state_id[len(prefix):].isdecimal():
+                        raise ToolError("out_of_scope", "state does not belong to case")
+                    index = int(state_id[len(prefix):])
+                    if index >= len(states) or state_id != prefix + str(index):
+                        raise ToolError("out_of_scope", "state does not belong to case")
+                    state = states[index]
+                    offset = _offset(context, "stack:" + state_id, args.get("cursor"))
+                    if offset >= len(state.stack) and offset:
+                        raise ToolError("invalid_cursor", "cursor outside captured stack")
+                    end = min(offset + 4096, len(state.stack))
+                    result["state"] = project(index, state)
+                    result["stack"] = {"hex": state.stack[offset:end].hex(), "byte_offset": offset,
+                        "total_bytes": len(state.stack), "truncated": end < len(state.stack),
+                        "next_cursor": _cursor(context, "stack:" + state_id, end) if end < len(state.stack) else None}
+        except ToolError:
+            raise
+        except ValueError:
+            raise ToolError("out_of_scope", "unknown case ID or invalid capture") from None
+    elif name in ("evaluate_predicate", "test_candidate"):
+        from .evaluation import evaluate_dataset
+        candidate = _candidate(dataset, args["predicate"])
+        evaluation = evaluate_dataset(dataset, candidate.expression, workers=context.workers,
+                                      execute=name == "test_candidate",
+                                      cache_dir=context.cache_dir or context.run_dir / "cache",
+                                      replay_socket=context.replay_socket if name == "test_candidate" else None)
+        result_id = digest(canonical(evaluation))
+        context._results[result_id] = evaluation
+        result = {"valid_syntax": True, "checked_predicate": args["predicate"], **_result(context, result_id)}
+    elif name == "get_candidate_result":
+        result = _result(context, args["result_id"], args.get("cursor"))
+    else:
+        entries = dataset.manifest.get("analysis", [])
+        entry = next((e for e in entries if e["function_id"] == args["function_id"] and e["view"] == args["view"]), None)
+        if entry is None:
+            raise ToolError("out_of_scope", "unknown analysis ID or view")
+        if entry.get("availability") != "available":
+            result = {k: entry.get(k) for k in ("function_id", "view", "availability", "reason", "backend", "backend_version")}
+        else:
+            path = (dataset.root / entry["path"]).resolve(strict=True)
+            if not path.is_relative_to(dataset.root.resolve()):
+                raise ValueError("analysis path escapes dataset")
+            offset = _offset(context, "analysis:" + args["function_id"] + ":" + args["view"], args.get("cursor"))
+            with path.open("rb") as stream:
+                stream.seek(offset)
+                raw = stream.read(FUNCTION_PAGE_BYTES + 4)
+            if not raw and offset:
+                raise ToolError("invalid_cursor", "cursor outside analysis")
+            end = min(len(raw), FUNCTION_PAGE_BYTES)
+            while end < len(raw) and raw[end] & 0xc0 == 0x80:
+                end -= 1
+            size = path.stat().st_size
+            result = {k: entry.get(k) for k in ("function_id", "view", "sha256", "availability", "complete", "backend", "backend_version")}
+            result.update(text=raw[:end].decode(), byte_offset=offset, total_bytes=size, truncated=offset + end < size,
+                          next_cursor=_cursor(context, "analysis:" + args["function_id"] + ":" + args["view"], offset + end) if offset + end < size else None)
+    return result
 
 def validate_proposal(context: SynthesisContext, value):
     if not isinstance(value, str) or len(value.encode()) > 16384:
@@ -248,7 +252,7 @@ def validate_proposal(context: SynthesisContext, value):
     if type(proposal["schema_version"]) is not int or proposal["schema_version"] != 1 or proposal["context_id"] != context.context_id:
         raise ValueError("invalid proposal identity")
     if proposal["decision"] == "candidate":
-        _candidate(context, proposal["predicate"])
+        _candidate(context.dataset, proposal["predicate"])
     elif proposal["decision"] != "abstain" or proposal["predicate"] is not None:
         raise ValueError("invalid proposal decision")
     evidence = proposal["evidence_ids"]

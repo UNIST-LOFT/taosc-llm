@@ -1,7 +1,10 @@
 """Identity-bound, file-backed prepared datasets (no P1 evidence compatibility)."""
 from __future__ import annotations
 
+from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass
+from threading import RLock
 import hashlib
 import json
 from pathlib import Path
@@ -78,7 +81,26 @@ class PreparedDataset:
             raise ValueError(f"dataset hash mismatch: {record['path']}")
         return path
 
+    @contextmanager
+    def validation(self):
+        """Authenticate one operation; never retain trust on the source dataset.
+
+        The yielded view may be shared with read-only workers which finish before
+        this context exits. Nested scopes on that view reuse its validation.
+        """
+        validated = _ValidatedDataset(self)
+        try:
+            validated._validate_all()
+            validated.execution_environment()
+            yield validated
+        finally:
+            validated._expire()
+
     def verify_artifacts(self) -> None:
+        with self.validation():
+            pass
+
+    def _validate_all(self) -> None:
         identity = dict(self.manifest)
         identity.pop("dataset_id", None)
         if hashlib.sha256(canonical(identity)).hexdigest() != self.dataset_id:
@@ -181,6 +203,119 @@ class PreparedDataset:
         return result
 
 
+class _ValidatedDataset(PreparedDataset):
+    """Short-lived trust state, owned by exactly one validation context."""
+
+    def __init__(self, source: PreparedDataset):
+        root = source.root.resolve(strict=True)
+        if root != source.root.absolute() or not root.is_dir():
+            raise ValueError("dataset root is no longer immutable")
+        object.__setattr__(self, "root", root)
+        object.__setattr__(self, "manifest", deepcopy(source.manifest))
+        object.__setattr__(self, "_active", True)
+        object.__setattr__(self, "_lock", RLock())
+        object.__setattr__(self, "_paths", {})
+        object.__setattr__(self, "_verified", {})
+        object.__setattr__(self, "_rows", None)
+        object.__setattr__(self, "_case_index", {})
+        object.__setattr__(self, "_captures", {})
+        object.__setattr__(self, "_environment", None)
+
+    def __getattribute__(self, name):
+        if not name.startswith("_"):
+            object.__getattribute__(self, "_ensure_active")()
+        return object.__getattribute__(self, name)
+
+    def _ensure_active(self):
+        if not self._active:
+            raise ValueError("dataset validation scope has expired")
+
+    def _expire(self):
+        with self._lock:
+            object.__setattr__(self, "_active", False)
+            self._paths.clear()
+            self._verified.clear()
+            self._case_index.clear()
+            self._captures.clear()
+            object.__setattr__(self, "_rows", None)
+            object.__setattr__(self, "_environment", None)
+            object.__setattr__(self, "manifest", {})
+
+    @contextmanager
+    def validation(self):
+        self._ensure_active()
+        yield self
+
+    def _path(self, relative):
+        self._ensure_active()
+        if not isinstance(relative, str) or Path(relative).is_absolute() or ".." in Path(relative).parts:
+            raise ValueError("dataset path must be root-relative")
+        if relative not in self._paths:
+            path = self.root / relative
+            resolved = path.resolve()
+            if not resolved.is_relative_to(self.root) or path.is_symlink():
+                raise ValueError("dataset path escapes immutable root")
+            self._paths[relative] = path
+        return self._paths[relative]
+
+    def artifact(self, name: str) -> Path:
+        with self._lock:
+            try:
+                record = self.manifest["artifacts"][name]
+            except KeyError as exc:
+                raise ValueError(f"dataset artifact unavailable: {name}") from exc
+            return self._path(record["path"])
+
+    def _verify(self, record: dict) -> Path:
+        with self._lock:
+            self._ensure_active()
+            key = (record["path"], record["sha256"])
+            if key not in self._verified:
+                path = self._path(record["path"])
+                if not path.is_file() or sha256(path) != record["sha256"]:
+                    raise ValueError(f"dataset hash mismatch: {record['path']}")
+                self._verified[key] = path
+            return self._verified[key]
+
+    def cases(self, domain: str = "all") -> list[dict]:
+        with self._lock:
+            if domain not in ("all", "system", "function"):
+                raise ValueError("invalid case domain")
+            if self._rows is None:
+                rows = super().cases()
+                object.__setattr__(self, "_rows", rows)
+                self._case_index.update((row["id"], row) for row in rows)
+            return deepcopy([row for row in self._rows if domain == "all" or row["domain"] == domain])
+
+    def case(self, case_id: str) -> dict:
+        with self._lock:
+            if not isinstance(case_id, str) or not re.fullmatch(r"(?:system|function):[0-9]+", case_id):
+                raise ValueError("invalid scoped case id")
+            if self._rows is None:
+                self.cases()
+            try:
+                return deepcopy(self._case_index[case_id])
+            except KeyError as exc:
+                raise ValueError(f"unknown dataset case: {case_id}") from exc
+
+    def snapshots(self, capture: dict) -> list[predicates.CachedSnapshot]:
+        with self._lock:
+            # Bind every field, not just the byte digest: descriptors, branch
+            # vectors, sidecars and selectors are independent trust assertions.
+            key = canonical(capture)
+            if key not in self._captures:
+                self._captures[key] = tuple(super().snapshots(capture))
+            # CachedSnapshot is frozen and contains only tuples/bytes/scalars.
+            # Copy the small outer list, never large stacks or register data.
+            return list(self._captures[key])
+
+    def execution_environment(self) -> dict[str, str]:
+        with self._lock:
+            if self._environment is None:
+                object.__setattr__(self, "_environment", super().execution_environment())
+            return dict(self._environment)
+
+
 def load_dataset(path: Path) -> PreparedDataset:
     path = Path(path).resolve(strict=True)
     manifest_path = path / "manifest.json" if path.is_dir() else path
@@ -195,5 +330,4 @@ def load_dataset(path: Path) -> PreparedDataset:
         raise ValueError("invalid ELF patch addresses")
     dataset = PreparedDataset(manifest_path.parent, manifest)
     dataset.verify_artifacts()
-    dataset.execution_environment()
     return dataset

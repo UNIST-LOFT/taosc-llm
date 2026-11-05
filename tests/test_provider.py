@@ -44,9 +44,11 @@ def test_invalid_reasoning_effort_is_rejected_without_echo(tmp_path, value):
 
 
 def test_nonsecret_override_precedence(tmp_path):
-    path = provider_file(tmp_path, "TAOSC_LLM_PROFILE=openai-compatible\n")
+    path = provider_file(tmp_path, "TAOSC_LLM_PROFILE=openai-compatible\n"
+                         "TAOSC_LLM_TIMEOUT_SECONDS=75\nTAOSC_LLM_MAX_TURNS=7\n")
     config = load_provider(path, base_url="https://provider.example/api/v1",
                            model="explicit-opaque-model:revision")
+    assert (config.timeout_seconds, config.max_turns) == (75, 7)
     assert config.base_url == "https://provider.example/api/v1"
     assert config.model == "explicit-opaque-model:revision"
     original = load_provider(path)

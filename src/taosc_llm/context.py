@@ -114,30 +114,30 @@ def prepare_context(dataset, *, run_dir: Path | None = None, workers: int = 1,
         replay_socket = Path(replay_socket).expanduser()
     if cache_dir is not None:
         cache_dir = Path(cache_dir).expanduser()
-    dataset.verify_artifacts()
-    resources = files("taosc_llm")
-    projection = {
-        "schema_version": 2, "dataset_id": dataset.dataset_id,
-        "patch_format": dataset.patch_format, "patch": {
-            "location": f"0x{dataset.manifest['patch']['location']:016x}",
-            "destination": f"0x{dataset.manifest['patch']['destination']:016x}",
-            "address_domain": "elf-va"},
-        "grammar_contract": grammar_contract(dataset.patch_format),
-        "analysis": [{k: v for k, v in item.items() if k not in ("path",)}
-                     for item in dataset.manifest.get("analysis", [])],
-        "case_counts": {domain: len(dataset.cases(domain)) for domain in ("system", "function")},
-        "source_hashes": {name: item["sha256"] for name, item in dataset.manifest["artifacts"].items()},
-        "implementation_hashes": {name: digest(resources.joinpath(name).read_bytes())
-                                  for name in ("context.py", "tools.py", "prompts/system.txt", "family.py")},
-        "limits": {"page_records": 32, "analysis_page_bytes": 8192, "expression_bytes": MAX_EXPRESSION},
-        "policy": ("Concrete cases selected by host. Function mutation cases use the "
-                   "trusted host replay bridge when configured, otherwise offline. "
-                   "Not rejected is not proof of repair; final verification is not run."
-                   if replay_socket is None else
-                   "Concrete cases selected by host. Function mutation cases use the "
-                   "trusted host live replay bridge; the model never names its endpoint. "
-                   "Not rejected is not proof of repair; final verification is not run."),
-    }
+    with dataset.validation() as validated:
+        resources = files("taosc_llm")
+        projection = {
+            "schema_version": 2, "dataset_id": validated.dataset_id,
+            "patch_format": validated.patch_format, "patch": {
+                "location": f"0x{validated.manifest['patch']['location']:016x}",
+                "destination": f"0x{validated.manifest['patch']['destination']:016x}",
+                "address_domain": "elf-va"},
+            "grammar_contract": grammar_contract(validated.patch_format),
+            "analysis": [{k: v for k, v in item.items() if k not in ("path",)}
+                         for item in validated.manifest.get("analysis", [])],
+            "case_counts": {domain: len(validated.cases(domain)) for domain in ("system", "function")},
+            "source_hashes": {name: item["sha256"] for name, item in validated.manifest["artifacts"].items()},
+            "implementation_hashes": {name: digest(resources.joinpath(name).read_bytes())
+                                      for name in ("context.py", "tools.py", "prompts/system.txt", "family.py")},
+            "limits": {"page_records": 32, "analysis_page_bytes": 8192, "expression_bytes": MAX_EXPRESSION},
+            "policy": ("Concrete cases selected by host. Function mutation cases use the "
+                       "trusted host replay bridge when configured, otherwise offline. "
+                       "Not rejected is not proof of repair; final verification is not run."
+                       if replay_socket is None else
+                       "Concrete cases selected by host. Function mutation cases use the "
+                       "trusted host live replay bridge; the model never names its endpoint. "
+                       "Not rejected is not proof of repair; final verification is not run."),
+        }
     identity = digest(canonical(projection))
     projection["context_id"] = identity
     if run_dir is None:

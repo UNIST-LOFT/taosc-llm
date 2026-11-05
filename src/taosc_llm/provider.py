@@ -19,8 +19,8 @@ class ProviderConfig:
     model: str = "deepseek-v4.1-flash:1017"
     context_window: int = 300000
     max_tokens: int = 65536
-    timeout_seconds: int = 600
-    max_turns: int = 16
+    timeout_seconds: int = 1800
+    max_turns: int = 32
     max_tool_calls: int = 64
     reasoning_effort: str | None = None
 

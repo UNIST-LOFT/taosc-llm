@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import dataclass
+from types import MappingProxyType
 import fcntl
 import hashlib
 import json
@@ -69,25 +71,44 @@ def _lock(path: Path):
             fcntl.flock(stream, fcntl.LOCK_UN)
 
 
+@dataclass(frozen=True)
+class _CaptureMetadata:
+    artifact_sha256: str
+    pie: bool
+    cwe: bool
+    stack_bytes: int
+
+
+def _capture_metadata(dataset):
+    with dataset.artifact(dataset.binary + '.brcached').open('rb') as stream:
+        header = stream.read(20)
+    return _CaptureMetadata(
+        dataset.manifest['artifacts'][dataset.binary + '.brcached']['sha256'],
+        len(header) >= 18 and header[:4] == b'\x7fELF'
+        and int.from_bytes(header[16:18], 'little' if header[5] == 1 else 'big') == 3,
+        dataset.patch_format == 'ERM CWE-805',
+        int(dataset.execution_environment().get('BRCACHE_STACK_SIZE', '0'), 0))
+
+
 def _snapshots(dataset, capture):
+    """Authenticate a capture even when called outside an evaluation/tool scope."""
+    with dataset.validation() as validated:
+        return _validated_snapshots(validated, capture, _capture_metadata(validated))
+
+
+def _validated_snapshots(dataset, capture, metadata):
     if capture.get('complete') is not True:
         raise ValueError(capture.get('reason', 'incomplete-capture'))
     descriptor = capture.get('descriptor')
     if not isinstance(descriptor, str) or not descriptor:
         raise ValueError('capture-descriptor-unavailable')
     parsed = parse_predicate_descriptor(descriptor)
-    cwe = dataset.patch_format == 'ERM CWE-805'
-    if descriptor != 'p0' and isinstance(parsed, str) == cwe:
+    if descriptor != 'p0' and isinstance(parsed, str) == metadata.cwe:
         raise ValueError('capture-descriptor-family-mismatch')
-    expected = sha256(dataset.artifact(dataset.binary + '.brcached'))
-    if capture.get('artifact_sha256') != expected:
+    if capture.get('artifact_sha256') != metadata.artifact_sha256:
         raise ValueError('capture-artifact-mismatch')
-    if 1 in capture.get('branches', []):
-        with dataset.artifact(dataset.binary + '.brcached').open('rb') as stream:
-            header = stream.read(20)
-        if (len(header) >= 18 and header[:4] == b'\x7fELF'
-                and int.from_bytes(header[16:18], 'little' if header[5] == 1 else 'big') == 3):
-            raise ValueError('pie-descriptor-relocation-capability-unavailable')
+    if 1 in capture.get('branches', []) and metadata.pie:
+        raise ValueError('pie-descriptor-relocation-capability-unavailable')
     path = Path(capture['path'])
     if not path.is_absolute():
         snapshots = dataset.snapshots(capture)
@@ -106,9 +127,8 @@ def _snapshots(dataset, capture):
     expected_id = capture.get('patch_id', capture.get('capture_id', 0))
     if any(state.patch_id != expected_id for state in snapshots):
         raise ValueError('capture-id-mismatch')
-    cwe = dataset.patch_format == 'ERM CWE-805'
-    stack = int(dataset.execution_environment().get('BRCACHE_STACK_SIZE', '0'), 0)
-    if any(s.is_CWE805 != cwe or (cwe and len(s.stack) != stack) for s in snapshots):
+    if any(s.is_CWE805 != metadata.cwe
+           or (metadata.cwe and len(s.stack) != metadata.stack_bytes) for s in snapshots):
         raise ValueError('capture-family-or-stack-mismatch')
     return snapshots
 
@@ -123,48 +143,71 @@ def _vector(descriptor, snapshots):
     return evaluate_cached_predicate(parsed, snapshots)
 
 
-def _external_captures(dataset, case, identity):
-    """Read only complete producer commits; producers never share our locks."""
-    if case['domain'] != 'system' or not identity.get('qemu'):
-        return
+@dataclass(frozen=True)
+class _ProducerMetadata:
+    run: str
+    descriptors: object
+    manifest_sha256: str
+    environment_sha256: str | None
+    original_sha256: str
+    qemu_sha256: str
+
+
+def _producer_metadata(dataset, identity):
+    """Freeze expected identities, never trust mutable producer records ahead of use."""
     run = dataset.manifest.get('sources', {}).get('concrete_run')
-    number = case.get('source', {}).get('case_id')
-    if run is None or type(number) is not int:
+    if run is None or not identity.get('qemu'):
+        return None
+    _, predicates = load_runtime_predicates(dataset.artifact('brpatches.json'))
+    artifacts = dataset.manifest['artifacts']
+    env_entry = artifacts.get('binradar.env')
+    return _ProducerMetadata(run, MappingProxyType({
+        number: predicate_descriptor(predicate) for number, predicate in predicates.items()
+    }), artifacts['brpatches.json']['sha256'],
+        env_entry['sha256'] if env_entry else None,
+        artifacts[dataset.binary + '.orig']['sha256'], identity['qemu'])
+
+
+def _external_captures(dataset, case, producer, metadata):
+    """Read only complete producer commits; producers never share our locks."""
+    if case['domain'] != 'system' or producer is None:
         return
-    manifest_path = dataset.artifact('brpatches.json')
-    family, predicates = load_runtime_predicates(manifest_path)
+    number = case.get('source', {}).get('case_id')
+    if type(number) is not int:
+        return
     for channel in ('baseline', 'verifier'):
         try:
-            header = read_header(run, channel)
-            if not header or header.get('brpatches.json') != sha256(manifest_path):
+            # Producers may republish this channel between cases. Authenticate
+            # its current header before consuming any of its mutable commits.
+            header = read_header(producer.run, channel)
+            if not header or header.get('brpatches.json') != producer.manifest_sha256:
                 continue
-            env_entry = dataset.manifest['artifacts'].get('binradar.env')
-            if header.get('binradar.env') != (env_entry['sha256'] if env_entry else None):
+            if header.get('binradar.env') != producer.environment_sha256:
                 continue
             context = header['context']
-            if (context.get('original_sha256') != sha256(dataset.artifact(dataset.binary + '.orig'))
-                    or context.get('qemu_sha256') != identity['qemu']):
+            if (context.get('original_sha256') != producer.original_sha256
+                    or context.get('qemu_sha256') != producer.qemu_sha256):
                 continue
             matched = False
-            for row in read_case(run, channel, number):
+            for row in read_case(producer.run, channel, number):
                 if row['kind'] == 'input':
                     matched = row.get('sha256') == case.get('input_sha256') and row.get('file') == case.get('source', {}).get('filename')
                     continue
                 if not matched or row['kind'] != 'trace' or row.get('state_reason') != 'none':
                     continue
-                if row.get('artifact') != sha256(dataset.artifact(dataset.binary + '.brcached')):
+                if row.get('artifact') != metadata.artifact_sha256:
                     continue
                 representative = row.get('representative')
                 if representative == 0:
                     descriptor = 'p0'
-                elif representative in predicates:
-                    descriptor = predicate_descriptor(predicates[representative])
+                elif representative in producer.descriptors:
+                    descriptor = producer.descriptors[representative]
                 else:
                     continue
                 branches = unpack_branches(row['hits'], row['branches'])
                 if branches is None:
                     continue
-                path = Path(run) / 'feedback-capture' / 'states' / (row['state_sha256'] + '.brch')
+                path = Path(producer.run) / 'feedback-capture' / 'states' / (row['state_sha256'] + '.brch')
                 yield {'path': str(path), 'sha256': row['state_sha256'],
                        'artifact_sha256': row['artifact'], 'descriptor': descriptor,
                        'branches': branches, 'outcome': row, 'complete': True,
@@ -172,7 +215,6 @@ def _external_captures(dataset, case, identity):
         except (OSError, ValueError, KeyError, TypeError):
             # A missing/partial producer is not an empty execution.
             continue
-
 
 def _same_crash(dataset, case, capture):
     if case['domain'] == 'function':
@@ -206,12 +248,12 @@ def _cache_record(path, key):
         return None
 
 
-def _case_result(dataset, case, candidate, descriptor, execute, root, base_identity):
+def _case_result(dataset, case, candidate, descriptor, execute, root, base_identity,
+                 metadata, producer):
     base = {'case_id': case['id'], 'domain': case['domain'], 'source': 'unavailable',
             'status': 'unavailable', 'reason': 'capture-unavailable', 'branches': None,
             'offline_branches': None, 'first_divergence': None}
-    if (candidate is not None and candidate.required_stack_bytes >
-            int(base_identity['environment'].get('BRCACHE_STACK_SIZE', '0'), 0)):
+    if candidate is not None and candidate.required_stack_bytes > metadata.stack_bytes:
         return {**base, 'reason': 'candidate-stack-unavailable'}
     identity = {**base_identity, 'input': case.get('input_sha256'), 'case': case['id'],
                 'descriptor': descriptor, 'observation': case.get('observation'),
@@ -225,7 +267,7 @@ def _case_result(dataset, case, candidate, descriptor, execute, root, base_ident
             captures.append((own, 'cache'))
         if case.get('capture'):
             captures.append((case['capture'], 'offline' if case['domain'] == 'function' else 'cache'))
-        captures.extend((c, 'cache') for c in _external_captures(dataset, case, base_identity['runtime']))
+        captures.extend((c, 'cache') for c in _external_captures(dataset, case, producer, metadata))
         # Reuse neutral own captures across candidates without trusting a prior
         # result summary; validate their complete state and mirror every time.
         neutral_identity = {**identity, 'descriptor': 'p0'}
@@ -234,7 +276,7 @@ def _case_result(dataset, case, candidate, descriptor, execute, root, base_ident
             captures.append((neutral, 'cache'))
         for capture, source in captures:
             try:
-                snapshots = _snapshots(dataset, capture)
+                snapshots = _validated_snapshots(dataset, capture, metadata)
                 if candidate is not None and any(len(s.stack) < candidate.required_stack_bytes for s in snapshots):
                     raise ValueError('candidate-stack-unavailable')
                 actual = capture['branches']
@@ -265,7 +307,7 @@ def _case_result(dataset, case, candidate, descriptor, execute, root, base_ident
             _atomic(record_path, {'identity': identity, 'capture': capture})
             base.update(source='executed', branches=capture.get('branches'),
                         outcome=capture.get('outcome'), capture=capture)
-            snapshots = _snapshots(dataset, capture)
+            snapshots = _validated_snapshots(dataset, capture, metadata)
             if _vector(descriptor, snapshots) != capture['branches']:
                 raise ExecutionUnavailable('candidate-evaluator-mismatch')
             if 2 in capture['branches']:
@@ -305,7 +347,7 @@ def _replay_evaluate(dataset, candidate, *, case_ids, socket_path):
 
 def _evaluate(dataset, candidate, descriptor, *, case_ids, workers, execute, cache_dir,
               replay_socket=None):
-    """Evaluate one candidate.
+    """Evaluate one candidate inside the caller's active validation scope.
 
     ``replay_socket`` selects the trusted live host bridge for **function**
     cases.  It is a host-side option only: neither the model nor a public patch
@@ -315,13 +357,11 @@ def _evaluate(dataset, candidate, descriptor, *, case_ids, workers, execute, cac
     Function observations without a retained native plan stay offline even
     when the host enables replay.
     """
-    if isinstance(dataset, (str, Path)):
-        dataset = load_dataset(Path(dataset))
     if dataset.patch_format not in ('ERM generic', 'ERM CWE-805'):
         raise ValueError('only ERM generic and ERM CWE-805 evaluation is supported')
     if type(workers) is not int or not 1 <= workers <= 32:
         raise ValueError('workers must be in 1..32')
-    dataset.verify_artifacts()
+    # Public entry points hold a validation scope until all worker threads settle.
     cases = dataset.cases() if case_ids is None else [dataset.case(case_id) for case_id in case_ids]
     if len({c['id'] for c in cases}) != len(cases):
         raise ValueError('duplicate case ids')
@@ -347,8 +387,14 @@ def _evaluate(dataset, candidate, descriptor, *, case_ids, workers, execute, cac
                      'environment': dataset.execution_environment(), 'family': dataset.patch_format,
                      'patch': dataset.manifest['patch'], 'oracles': dataset.manifest.get('oracles'),
                      'runtime': execution_identity(), 'evaluator': sha256(Path(__file__))}
+    metadata = _capture_metadata(dataset)
+    producer = (_producer_metadata(dataset, base_identity['runtime'])
+                if any(case['domain'] == 'system'
+                       and type(case.get('source', {}).get('case_id')) is int
+                       for case in cases) else None)
     def evaluate(case):
-        return _case_result(dataset, case, candidate, descriptor, execute, root, base_identity)
+        return _case_result(dataset, case, candidate, descriptor, execute, root,
+                            base_identity, metadata, producer)
     live = {}
     replay_result = None
     if use_replay:
@@ -389,15 +435,18 @@ def evaluate_dataset(dataset, predicate: str, *, case_ids: list[str] | None = No
     """
     if isinstance(dataset, (str, Path)):
         dataset = load_dataset(Path(dataset))
-    candidate = parse_candidate(dataset.patch_format, predicate)
-    return _evaluate(dataset, candidate, candidate.descriptor, case_ids=case_ids,
-                     workers=workers, execute=execute, cache_dir=cache_dir,
-                     replay_socket=replay_socket)
+    with dataset.validation() as validated:
+        candidate = parse_candidate(validated.patch_format, predicate)
+        return _evaluate(validated, candidate, candidate.descriptor, case_ids=case_ids,
+                         workers=workers, execute=execute, cache_dir=cache_dir,
+                         replay_socket=replay_socket)
 
 
 def warm_dataset(dataset, *, workers: int = 1, cache_dir: Path | None = None) -> dict:
     """Collect neutral p0 concrete observations, including empty manifests."""
     if isinstance(dataset, (str, Path)):
         dataset = load_dataset(Path(dataset))
-    return _evaluate(dataset, None, 'p0', case_ids=[c['id'] for c in dataset.cases('system')],
-                     workers=workers, execute=True, cache_dir=cache_dir)
+    with dataset.validation() as validated:
+        return _evaluate(validated, None, 'p0',
+                         case_ids=[c['id'] for c in validated.cases('system')],
+                         workers=workers, execute=True, cache_dir=cache_dir)
