@@ -110,7 +110,8 @@ async def _model_round(context, provider, command, run_id, trials, attempts):
         if terminal["type"] == "turn_complete":
             return terminal
         delay = terminal.get("retry_after_seconds")
-        if (terminal.get("http_status") != 429 or not terminal["remote_settled"] or attempt == 2
+        if (terminal.get("error_code") != "provider_rate_limited"
+                or terminal.get("http_status") != 429 or not terminal["remote_settled"] or attempt == 2
                 or not isinstance(delay, (int, float)) or isinstance(delay, bool)
                 or not 0 <= delay <= provider.timeout_seconds):
             raise RuntimeError("Pi operation failed: " + terminal["error_code"])

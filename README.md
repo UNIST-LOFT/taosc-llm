@@ -278,6 +278,58 @@ proposed = generate_with_pi(dataset.root, Path("provider.env"),
                            execution_workers=4, max_rounds=4)
 ```
 
+### Inspecting model sessions
+
+New Pi synthesis attempts automatically retain these private files under
+`<run-directory>/trials/<round>/`; no additional option is needed:
+
+| File | Contents |
+|---|---|
+| `turn-<attempt>.jsonl` | Host protocol: initial prompts, tool requests/results, terminal status/final text |
+| `turn-<attempt>.pi.jsonl` | Native Pi session: system/user messages, intermediate assistant text/thinking when returned, tool calls/results, final response, SDK usage and unmodified SDK errors |
+| `turn-<attempt>.errors/events.jsonl` | Lazily created unredacted HTTP response metadata, body-end status and full Node exception diagnostics |
+| `turn-<attempt>.errors/request-<index>.body` | Exact HTTP non-2xx payload bytes seen by fetch, including blocked redirects; index is the attempt's 1-based guarded request count |
+| `final.txt` | Final assistant text of the successfully settled attempt in that round |
+
+Use the pinned Pi 1.4.0 CLI to export a native capture without changing it. From
+the repository root, with Node >=22.19 (or `TAOSC_LLM_NODE` set):
+
+```sh
+SESSION=/absolute/path/to/run/trials/1/turn-1.pi.jsonl
+"${TAOSC_LLM_NODE:-node}" \
+  utils/taosc-llm/thirdparty/pi/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js \
+  --export "$SESSION" "$SESSION.html"
+```
+
+Open the HTML in a browser; `Toggle thinking` and `Toggle tools` control details.
+Pi 1.4.0's HTML transcript does not render the system prompt sections, although
+its tree lists `[system]`; those sections and `toolsAdded` remain in the native
+JSONL's system message. A normal Pi session viewer does not restore taosc's
+custom host tools or resume synthesis.
+
+Native and diagnostic files are created exclusively with mode 0600; error
+directories use exclusive mode 0700, refusing existing directories and symlinks.
+Completed native records remain on failure/cancellation; unfinished streaming text
+is not guaranteed. **SDK errors and raw response files are unredacted and may
+contain the configured API key or other secrets.** This is the explicit
+user-approved retention policy: no error clipping, masking or credential-based
+record dropping. Keep captures, diagnostics and exported HTML private; do not
+publish them or feed them back to model tools/native workers.
+
+HTTP body EOF records `complete:true`; interruption/cancellation retains received
+bytes with `complete:false`. SIGKILL may omit the end row, and deadlines still
+bound execution: capture cannot promise bytes never received. Node fetch's
+normal decompression/header normalization apply; this is not raw TCP capture.
+Redirects remain blocked, success wire bodies need not be logged, and private raw
+files do not travel through bounded, sanitized stdout protocol frames. Diagnostic
+creation/write failure terminates with `diagnostic_persistence_error`.
+
+SDK zero cost fields are not real billing. Existing host journals are not converted
+into native sessions; no old-results migration or deletion is performed. See the
+[native persistence contract](../../agent-docs/taosc-llm/PROVIDER_AND_PI.md#native-pi-session-artifacts)
+and the single authoritative
+[raw error schema and privacy contract](../../agent-docs/taosc-llm/PROVIDER_AND_PI.md#raw-error-artifacts-authoritative-persistence-contract).
+
 ## Debug orchestration example
 
 `run.sh` is a runnable example, not the production Taosc driver. It starts both
@@ -365,7 +417,10 @@ Order and failure rules the example encodes:
 Native builds and execution require Linux x86-64 Landlock + seccomp, private
 writable scratch, bounded resources and no networking. Isolation failure is
 fatal: no unsandboxed fallback. Credentials use a separate inherited pipe to
-Node and are absent from prompts, protocol journals, argv and native environments.
+Node, not prompts, protocol journals, argv or native-worker environments. The
+bridge's known-key protocol checks remain enabled. Private native Pi captures and
+raw error artifacts may nevertheless retain provider/SDK-echoed keys unredacted;
+that diagnostic retention does not grant model/tool or native-worker access.
 QASAN admits only its own `/proc/PID/maps` and `/proc/sys/vm/mmap_min_addr`;
 `environ`, `mem`, other proc entries and private files remain denied. System trees
 remain readable; Landlock ABI 1 does not hide all path metadata. This is not a VM.

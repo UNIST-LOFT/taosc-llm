@@ -14,6 +14,18 @@ PRELOAD = r'''
 const mode = __MODE__;
 let count = 0;
 const encode = x => new TextEncoder().encode(x);
+if (mode === 'write-failure') {
+  const {default:fs} = await import('node:fs');
+  const {syncBuiltinESMExports} = await import('node:module');
+  const originalWrite = fs.writeSync;
+  fs.writeSync = function(fd, ...args) {
+    if (fs.readlinkSync('/proc/self/fd/' + fd).endsWith('.errors/request-1.body')) {
+      throw Object.assign(new Error('offline diagnostic disk full'), {code:'ENOSPC'});
+    }
+    return originalWrite.call(this, fd, ...args);
+  };
+  syncBuiltinESMExports();
+}
 globalThis.fetch = async (input, init) => {
   const url = input instanceof Request ? input.url : String(input);
   if (url !== 'https://example.invalid/v1/chat/completions') throw Error('unexpected endpoint');
@@ -21,8 +33,43 @@ globalThis.fetch = async (input, init) => {
   if (body.model !== 'offline-exact-model' || body.tool_choice !== undefined) throw Error('wrong model/protocol');
   count++;
   if (mode === 'rate') return new Response(JSON.stringify({error:{message:'offline-secret-for-transport'}}), {status:429,headers:{'retry-after':'2'}});
-  if (mode === 'auth') return new Response(JSON.stringify({error:{message:'offline-secret-for-transport'}}), {status:401});
-  if (mode === 'redirect') return new Response('',{status:302,headers:{location:'https://example.invalid/elsewhere'}});
+  if (mode === 'auth' || mode === 'write-failure' || (mode === 'failure-prefix' && count === 2)) return new Response(JSON.stringify({error:{message:'private-provider-body offline-secret-for-transport',detail:'private-response-detail'}}), {status:401});
+  if (mode === 'checkpoint') {
+    // Let the public message_end callback's deferred checkpoint run before
+    // inspecting the sidecar while the next provider request is still active.
+    await new Promise(resolve => setImmediate(resolve));
+    const fs = await import('node:fs');
+    const session = __SESSION_PATH__;
+    fs.writeFileSync(session + (count === 1 ? '.initial' : '.live'), fs.readFileSync(session));
+    if (count === 2) return new Response(new ReadableStream({start(c) {
+      init.signal.addEventListener('abort', () => c.error(Error('aborted')), {once:true});
+      setImmediate(() => process.kill(process.pid, 'SIGTERM'));
+    }}),{headers:{'content-type':'text/event-stream'}});
+  }
+  if (mode === 'context-limit') return new Response(JSON.stringify({error:{code:'context_length_exceeded',message:'maximum context length exceeded: private context detail offline-secret-for-transport'}}), {status:400});
+  if (mode === 'binary') return new Response(new Uint8Array([0,255,128,13,10,65,0]), {status:502,headers:{'content-type':'application/octet-stream'}});
+  if (mode === 'large') return new Response('private-large-body offline-secret-for-transport\n' + 'x'.repeat(4 * 1024 * 1024 + 137), {status:503});
+  if (mode === 'network') throw new TypeError('private network detail offline-secret-for-transport', {cause:new Error('private socket cause')});
+  if (mode === 'partial-cancel') {
+    let pulls = 0;
+    return new Response(new ReadableStream({pull(c) {
+      if (pulls++ === 0) c.enqueue(encode('cancelled-body offline-secret-for-transport\n'));
+      else return new Promise(resolve => {
+        init.signal.addEventListener('abort', () => {
+          c.error(new Error('offline transfer cancelled')); resolve();
+        }, {once:true});
+        setImmediate(() => process.kill(process.pid, 'SIGTERM'));
+      });
+    }}), {status:502});
+  }
+  if (mode === 'partial') {
+    let pulls = 0;
+    return new Response(new ReadableStream({pull(c) {
+      if (pulls++ === 0) c.enqueue(encode('partial-body offline-secret-for-transport\n'));
+      else c.error(new Error('private interrupted transfer', {cause:new Error('private stream cause')}));
+    }}), {status:502});
+  }
+  if (mode === 'redirect') return new Response('private redirect body offline-secret-for-transport',{status:302,headers:{location:'https://example.invalid/elsewhere'}});
   if (mode === 'cancel') {
     return new Response(new ReadableStream({start(c) {
       init.signal.addEventListener('abort', () => c.error(Error('aborted')), {once:true});
@@ -31,13 +78,15 @@ globalThis.fetch = async (input, init) => {
   }
   const context = JSON.stringify(body.messages).match(/context_id=([a-f0-9]{64})/)[1];
   const chunk = (delta, finish=null) => 'data: ' + JSON.stringify({id:'offline',object:'chat.completion.chunk',created:1,
-    model:body.model,choices:[{index:0,delta,finish_reason:finish}]}) + '\n\n';
+    model:body.model,choices:[{index:0,delta,finish_reason:finish}],
+    ...(finish ? {usage:{prompt_tokens:11,completion_tokens:7,total_tokens:18}} : {})}) + '\n\n';
   let data;
   if (mode === 'truncated') data = chunk({role:'assistant',content:'incomplete'},'stop');
   else if (count <= 2 && mode !== 'abstain') {
     const name = count === 1 ? 'get_patch_context' : 'evaluate_predicate';
     const args = count === 1 ? {context_id:context} : {context_id:context,predicate:'rax <= 0'};
-    data = chunk({role:'assistant',tool_calls:[{index:0,id:'call-'+count,type:'function',function:{name,arguments:JSON.stringify(args)}}]});
+    data = chunk({role:'assistant',content:'Intermediate explanation '+count,reasoning_content:'Intermediate reasoning '+count,
+      tool_calls:[{index:0,id:'call-'+count,type:'function',function:{name,arguments:JSON.stringify(args)}}]});
     data += chunk({},'tool_calls') + 'data: [DONE]\n\n';
   } else if (count === 3 && mode === 'results') {
     const tool = body.messages.filter(m => m.role === 'tool').at(-1);
@@ -64,18 +113,71 @@ def adapter_context(tmp_path):
     return prepare_context(make_dataset(tmp_path / "dataset"), run_dir=tmp_path / "run"), Path(root)
 
 
-def operation(adapter_context, tmp_path, mode):
+def operation(adapter_context, tmp_path, mode, *, journal=None,
+              api_key="offline-secret-for-transport"):
     context, root = adapter_context
+    journal = journal if journal is not None else tmp_path / "turn.jsonl"
     preload = tmp_path / "provider.mjs"
-    preload.write_text(PRELOAD.replace("__MODE__", json.dumps(mode)))
+    preload.write_text(PRELOAD.replace("__MODE__", json.dumps(mode))
+                       .replace("__SESSION_PATH__", json.dumps(str(journal.with_suffix(".pi.jsonl")))))
     command = adapter_command(root)
     command[1:1] = ["--import", str(preload)]
-    provider = ProviderConfig(api_key="offline-secret-for-transport", base_url="https://example.invalid/v1",
+    provider = ProviderConfig(api_key=api_key, base_url="https://example.invalid/v1",
                               model="offline-exact-model", timeout_seconds=30)
-    journal = tmp_path / "turn.jsonl"
     result = asyncio.run(run_adapter(context, provider, command, "offline", journal))
     assert provider.api_key not in journal.read_text()
     return result, context
+
+
+def native_records(path):
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def assert_error_body(directory, expected, *, status, request_index=1, complete=True):
+    assert directory.stat().st_mode & 0o777 == 0o700
+    events_path = directory / "events.jsonl"
+    body_path = directory / f"request-{request_index}.body"
+    assert events_path.stat().st_mode & 0o777 == 0o600
+    assert body_path.stat().st_mode & 0o777 == 0o600
+    assert body_path.read_bytes() == expected
+    events = native_records(events_path)
+    responses = [event for event in events if event["type"] == "http_response"]
+    assert len(responses) == 1
+    assert responses[0]["request_index"] == request_index
+    assert responses[0]["status"] == status
+    assert isinstance(responses[0]["status_text"], str)
+    assert responses[0]["body_file"] == body_path.name
+    endings = [event for event in events if event["type"] == "http_body_end"]
+    assert endings == [{"type": "http_body_end", "request_index": request_index,
+                        "complete": complete, "body_bytes": len(expected)}]
+    return events
+
+
+def load_native_session(root, path, *, export=False):
+    """Use the pinned SDK's public reader and real standalone HTML exporter."""
+    import subprocess
+
+    package = root / "node_modules" / "@earendil-works" / "pi-coding-agent"
+    metadata = json.loads((package / "package.json").read_text())
+    entry = package / metadata["exports"]["."]["import"]
+    exporter = package / "dist" / "core" / "export-html" / "index.js"
+    code = r'''
+globalThis.fetch = () => { throw Error('native consumer must remain offline'); };
+const {SessionManager} = await import(process.argv[1]);
+const session = SessionManager.open(process.argv[3]);
+if (process.argv[4] === 'export') {
+  const {exportFromFile} = await import(process.argv[2]);
+  await exportFromFile(process.argv[3], {outputPath:process.argv[3]+'.html'});
+}
+console.log(JSON.stringify({header:session.getHeader(),entries:session.getEntries(),
+  messages:session.buildSessionContext().messages}));
+'''
+    completed = subprocess.run(
+        [adapter_command(root)[0], "--input-type=module", "-e", code,
+         entry.resolve().as_uri(), exporter.resolve().as_uri(), str(path),
+         "export" if export else "load"],
+        capture_output=True, text=True, check=True, timeout=30)
+    return json.loads(completed.stdout)
 
 
 def test_pi_custom_tools_and_settled_final_proposal(adapter_context, tmp_path):
@@ -98,13 +200,54 @@ def test_pi_continues_after_actual_offline_result_reference(adapter_context, tmp
     assert context._results
     assert all(item["verified"] is False for item in context._results.values())
 
+    sidecar = tmp_path / "turn.pi.jsonl"
+    assert sidecar.stat().st_mode & 0o777 == 0o600
+    records = native_records(sidecar)
+    loaded = load_native_session(adapter_context[1], sidecar, export=True)
+    assert loaded["header"] == records[0]
+    assert loaded["header"]["type"] == "session"
+    assert loaded["header"]["version"] == 3
+    assert loaded["entries"] == records[1:]
+    entries = loaded["entries"]
+    assert len({entry["id"] for entry in entries}) == len(entries)
+    assert [entry["parentId"] for entry in entries] == [None] + [entry["id"] for entry in entries[:-1]]
+    messages = [entry["message"] for entry in entries if entry["type"] == "message"]
+    assert [message["role"] for message in messages] == [
+        "system", "user", "assistant", "toolResult", "assistant", "toolResult",
+        "assistant", "toolResult", "assistant"]
+    assert json.dumps(context.system_prompt(), ensure_ascii=False)[1:-1] in json.dumps(messages[0], ensure_ascii=False)
+    assert {tool["name"] for tool in messages[0]["toolsAdded"]} == {
+        tool["name"] for tool in context.tool_definitions()}
+    assert messages[1]["content"] == [{"type": "text", "text": context.initial_prompt()}]
+    for index, message in enumerate((messages[2], messages[4]), start=1):
+        assert {"type": "text", "text": f"Intermediate explanation {index}"} in message["content"]
+        assert any(block["type"] == "thinking" and block["thinking"] == f"Intermediate reasoning {index}"
+                   for block in message["content"])
+    calls = [block for message in messages if message["role"] == "assistant"
+             for block in message["content"] if block["type"] == "toolCall"]
+    replies = [message for message in messages if message["role"] == "toolResult"]
+    assert [call["name"] for call in calls] == ["get_patch_context", "evaluate_predicate", "get_candidate_result"]
+    assert [reply["toolCallId"] for reply in replies] == [call["id"] for call in calls]
+    assert all(call["arguments"]["context_id"] == context.context_id for call in calls)
+    host_results = [record["frame"]["result"] for record in native_records(tmp_path / "turn.jsonl")
+                    if record["direction"] == "host" and record["frame"]["type"] == "tool_result"]
+    assert [json.loads(reply["content"][0]["text"]) for reply in replies] == host_results
+    assert all(result_id in json.dumps(replies) for result_id in context._results)
+    assert messages[-1]["content"] == [{"type": "text", "text": result["final_text"]}]
+    for message in messages:
+        if message["role"] == "assistant":
+            assert message["usage"]["input"] == 11
+            assert message["usage"]["output"] == 7
+    # The SDK reader/exporter must not rewrite the original capture.
+    assert native_records(sidecar) == records
+
 
 @pytest.mark.parametrize("mode,status,code", [
     ("rate",429,"provider_rate_limited"),
     ("auth",401,"provider_authentication_failed"),
     ("redirect",302,"provider_redirect_rejected"),
 ])
-def test_pi_http_failures_are_terminal_and_redacted(adapter_context, tmp_path, mode, status, code):
+def test_pi_http_failures_keep_private_bodies_and_safe_terminal(adapter_context, tmp_path, mode, status, code):
     result, _ = operation(adapter_context, tmp_path, mode)
     assert result["type"] == "turn_failed"
     assert result["http_status"] == status
@@ -113,6 +256,199 @@ def test_pi_http_failures_are_terminal_and_redacted(adapter_context, tmp_path, m
     assert result["remote_settled"] is True
     if mode == "rate":
         assert result["retry_after_seconds"] == 2
+    sidecar = tmp_path / "turn.pi.jsonl"
+    expected = {
+        "rate": b'{"error":{"message":"offline-secret-for-transport"}}',
+        "auth": b'{"error":{"message":"private-provider-body offline-secret-for-transport","detail":"private-response-detail"}}',
+        "redirect": b'private redirect body offline-secret-for-transport',
+    }[mode]
+    events = assert_error_body(tmp_path / "turn.errors", expected, status=status)
+    response = next(event for event in events if event["type"] == "http_response")
+    assert response["url"] == "https://example.invalid/v1/chat/completions"
+    if mode == "rate":
+        assert ["retry-after", "2"] in response["headers"]
+    if mode == "redirect":
+        assert ["location", "https://example.invalid/elsewhere"] in response["headers"]
+    loaded = load_native_session(adapter_context[1], sidecar)
+    assert any(message["role"] == "user" for message in loaded["messages"])
+    if mode in ("auth", "rate"):
+        errors = [entry["message"]["errorMessage"] for entry in loaded["entries"]
+                  if entry["type"] == "message" and entry["message"].get("errorMessage")]
+        assert len(errors) == 1
+        assert "offline-secret-for-transport" in errors[0]
+        assert errors[0] != "provider_error"
+        if mode == "auth":
+            assert "private-provider-body" in errors[0]
+            assert "private-response-detail" in (tmp_path / "turn.errors" / "request-1.body").read_text()
+
+
+@pytest.mark.parametrize("mode", ["checkpoint", "failure-prefix"])
+def test_native_completed_prefix_survives_cancel_or_provider_failure(adapter_context, tmp_path, mode):
+    result, _ = operation(adapter_context, tmp_path, mode)
+    assert result["type"] == "turn_failed"
+    assert result["request_count"] == 2
+    sidecar = tmp_path / "turn.pi.jsonl"
+    if mode == "checkpoint":
+        initial = sidecar.with_suffix(".jsonl.initial")
+        live = sidecar.with_suffix(".jsonl.live")
+        initial_messages = [entry["message"] for entry in native_records(initial)
+                            if entry["type"] == "message"]
+        assert [message["role"] for message in initial_messages] == ["system", "user"]
+        live_messages = [entry["message"] for entry in native_records(live)
+                         if entry["type"] == "message"]
+        assert [message["role"] for message in live_messages] == ["system", "user", "assistant", "toolResult"]
+        assert sidecar.read_bytes().startswith(live.read_bytes())
+        assert live.read_bytes().startswith(initial.read_bytes())
+        assert result["remote_settled"] is False
+    else:
+        assert result["error_code"] == "provider_authentication_failed"
+        assert result["remote_settled"] is True
+    loaded = load_native_session(adapter_context[1], sidecar, export=True)
+    messages = [entry["message"] for entry in loaded["entries"] if entry["type"] == "message"]
+    completed = next(message for message in messages if message["role"] == "assistant")
+    assert {"type": "text", "text": "Intermediate explanation 1"} in completed["content"]
+    reply = next(message for message in messages if message["role"] == "toolResult")
+    call = next(block for block in completed["content"] if block["type"] == "toolCall")
+    assert reply["toolCallId"] == call["id"]
+    assert sidecar.stat().st_mode & 0o777 == 0o600
+    if mode == "failure-prefix":
+        errors = [message["errorMessage"] for message in messages if message.get("errorMessage")]
+        assert len(errors) == 1
+        assert "private-provider-body offline-secret-for-transport" in errors[0]
+        assert_error_body(tmp_path / "turn.errors",
+                          b'{"error":{"message":"private-provider-body offline-secret-for-transport","detail":"private-response-detail"}}',
+                          status=401, request_index=2)
+
+
+@pytest.mark.parametrize("mode,status,expected", [
+    ("context-limit", 400, b'{"error":{"code":"context_length_exceeded","message":"maximum context length exceeded: private context detail offline-secret-for-transport"}}'),
+    ("binary", 502, bytes([0, 255, 128, 13, 10, 65, 0])),
+    ("large", 503, b'private-large-body offline-secret-for-transport\n' + b'x' * (4 * 1024 * 1024 + 137)),
+])
+def test_private_http_payloads_are_byte_complete(adapter_context, tmp_path, mode, status, expected):
+    result, _ = operation(adapter_context, tmp_path, mode)
+    assert result["type"] == "turn_failed"
+    assert result["http_status"] == status
+    assert result["request_count"] == 1
+    assert result["remote_settled"] is True
+    assert_error_body(tmp_path / "turn.errors", expected, status=status)
+    if mode == "context-limit":
+        loaded = load_native_session(adapter_context[1], tmp_path / "turn.pi.jsonl")
+        errors = [entry["message"]["errorMessage"] for entry in loaded["entries"]
+                  if entry["type"] == "message" and entry["message"].get("errorMessage")]
+        assert len(errors) == 1
+        assert "maximum context length exceeded" in errors[0]
+        assert "offline-secret-for-transport" in errors[0]
+
+
+@pytest.mark.parametrize("mode", ["partial", "network"])
+def test_private_transport_errors_retain_stack_and_cause(adapter_context, tmp_path, mode):
+    result, _ = operation(adapter_context, tmp_path, mode)
+    assert result["type"] == "turn_failed"
+    assert result["request_count"] == 1
+    assert result["remote_settled"] is False
+    directory = tmp_path / "turn.errors"
+    if mode == "partial":
+        events = assert_error_body(directory, b'partial-body offline-secret-for-transport\n',
+                                   status=502, complete=False)
+        details = ("private interrupted transfer", "private stream cause")
+    else:
+        assert directory.stat().st_mode & 0o777 == 0o700
+        assert (directory / "events.jsonl").stat().st_mode & 0o777 == 0o600
+        events = native_records(directory / "events.jsonl")
+        assert not list(directory.glob("request-*.body"))
+        details = ("private network detail offline-secret-for-transport", "private socket cause")
+    errors = [event for event in events if event["type"] == "transport_error"]
+    assert len(errors) == 1
+    assert errors[0]["request_index"] == 1
+    assert all(detail in errors[0]["error"] for detail in details)
+    assert "at " in errors[0]["error"]
+
+
+def test_partial_http_body_survives_cancellation(adapter_context, tmp_path):
+    result, _ = operation(adapter_context, tmp_path, "partial-cancel")
+    assert result["type"] == "turn_failed"
+    assert result["request_count"] == 1
+    assert result["remote_settled"] is False
+    assert_error_body(tmp_path / "turn.errors", b'cancelled-body offline-secret-for-transport\n',
+                      status=502, complete=False)
+
+
+def test_failed_diagnostic_write_is_terminal_and_observable(adapter_context, tmp_path):
+    result, _ = operation(adapter_context, tmp_path, "write-failure")
+    assert result["type"] == "turn_failed"
+    assert result["error_code"] == "diagnostic_persistence_error"
+    assert result["request_count"] == 1
+    directory = tmp_path / "turn.errors"
+    assert directory.stat().st_mode & 0o777 == 0o700
+    assert (directory / "request-1.body").read_bytes() == b""
+    events = native_records(directory / "events.jsonl")
+    assert any(event["type"] == "http_response" for event in events)
+    assert not any(event["type"] == "http_body_end" and event["complete"] for event in events)
+
+
+@pytest.mark.parametrize("symlink", [False, True])
+def test_error_directory_is_exclusive_and_never_clobbered(adapter_context, tmp_path, symlink):
+    directory = tmp_path / "turn.errors"
+    target = tmp_path / "prior-errors" if symlink else directory
+    target.mkdir()
+    original = b'private prior diagnostic: must not be changed\n'
+    (target / "events.jsonl").write_bytes(original)
+    (target / "request-1.body").write_bytes(original)
+    if symlink:
+        directory.symlink_to(target, target_is_directory=True)
+    result, _ = operation(adapter_context, tmp_path, "auth")
+    assert result["type"] == "turn_failed"
+    assert result["error_code"] == "diagnostic_persistence_error"
+    assert result["request_count"] == 1
+    assert directory.is_symlink() is symlink
+    assert {path.name: path.read_bytes() for path in target.iterdir()} == {
+        "events.jsonl": original, "request-1.body": original}
+
+
+@pytest.mark.parametrize("symlink", [False, True])
+def test_native_destination_is_exclusive_and_never_clobbered(adapter_context, tmp_path, symlink):
+    sidecar = tmp_path / "turn.pi.jsonl"
+    original = b"private prior run: must not be changed\n"
+    if symlink:
+        target = tmp_path / "prior-session.jsonl"
+        target.write_bytes(original)
+        sidecar.symlink_to(target)
+    else:
+        sidecar.write_bytes(original)
+    result, _ = operation(adapter_context, tmp_path, "abstain")
+    assert result["type"] == "turn_failed"
+    assert result["error_code"] == "session_persistence_error"
+    assert result["request_count"] == 0
+    assert sidecar.read_bytes() == original
+    assert sidecar.is_symlink() is symlink
+
+
+def test_native_attempts_have_distinct_sessions_and_preserve_prior_capture(adapter_context, tmp_path):
+    first = tmp_path / "turn-1.jsonl"
+    second = tmp_path / "turn-2.jsonl"
+    failed, _ = operation(adapter_context, tmp_path, "auth", journal=first)
+    original_journal = first.read_bytes()
+    original_native = first.with_suffix(".pi.jsonl").read_bytes()
+    original_errors = {path.name: path.read_bytes() for path in first.with_suffix(".errors").iterdir()}
+    third = tmp_path / "turn-3.jsonl"
+    failed_again, _ = operation(adapter_context, tmp_path, "auth", journal=third)
+    assert failed_again["type"] == "turn_failed"
+    assert first.with_suffix(".errors") != third.with_suffix(".errors")
+    assert {path.name: path.read_bytes() for path in first.with_suffix(".errors").iterdir()} == original_errors
+    assert {path.name: path.read_bytes() for path in third.with_suffix(".errors").iterdir()} == original_errors
+    completed, _ = operation(adapter_context, tmp_path, "abstain", journal=second)
+    assert not second.with_suffix(".errors").exists()
+    assert failed["type"] == "turn_failed"
+    assert completed["type"] == "turn_complete"
+    assert first.read_bytes() == original_journal
+    assert first.with_suffix(".pi.jsonl").read_bytes() == original_native
+    sessions = [load_native_session(adapter_context[1], journal.with_suffix(".pi.jsonl"))
+                for journal in (first, second)]
+    assert sessions[0]["header"]["id"] != sessions[1]["header"]["id"]
+    assert all(session["header"]["type"] == "session" for session in sessions)
+    assert all(journal.with_suffix(".pi.jsonl").stat().st_mode & 0o777 == 0o600
+               for journal in (first, second))
 
 
 @pytest.mark.parametrize("held_lock", [False, True])

@@ -15,17 +15,18 @@ def terminal(context, final, checked):
             "host_checked_predicates": checked}
 
 
-@pytest.mark.parametrize("settled,status,delay,expected_attempts", [
-    (True, 429, 2, 3),
-    (False, 429, 2, 1),
-    (True, 401, 2, 1),
-    (True, 429, None, 1),
-    (True, 429, True, 1),
-    (True, 429, -1, 1),
-    (True, 429, 31, 1),
+@pytest.mark.parametrize("settled,status,delay,code,expected_attempts", [
+    (True, 429, 2, "provider_rate_limited", 3),
+    (False, 429, 2, "provider_rate_limited", 1),
+    (True, 401, 2, "provider_rate_limited", 1),
+    (True, 429, None, "provider_rate_limited", 1),
+    (True, 429, True, "provider_rate_limited", 1),
+    (True, 429, -1, "provider_rate_limited", 1),
+    (True, 429, 31, "provider_rate_limited", 1),
+    (True, 429, 2, "diagnostic_persistence_error", 1),
 ])
 def test_retry_uses_terminal_settlement_and_existing_bounds(
-        tmp_path, monkeypatch, settled, status, delay, expected_attempts):
+        tmp_path, monkeypatch, settled, status, delay, code, expected_attempts):
     provider = ProviderConfig(api_key="offline-only", base_url="https://example.invalid/v1",
                               model="offline", timeout_seconds=30)
     journals = []
@@ -33,7 +34,7 @@ def test_retry_uses_terminal_settlement_and_existing_bounds(
     async def fail(context, provider, command, run_id, journal):
         journals.append(journal.name)
         return {"type": "turn_failed", "remote_settled": settled, "http_status": status,
-                "retry_after_seconds": delay, "error_code": "provider_rate_limited",
+                "retry_after_seconds": delay, "error_code": code,
                 "request_count": 1}
     async def sleep(seconds):
         delays.append(seconds)

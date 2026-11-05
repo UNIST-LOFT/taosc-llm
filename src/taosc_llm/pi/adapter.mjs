@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // One private, single-turn Pi worker. Stdout is exclusively the host JSONL protocol.
-import { createReadStream } from 'node:fs';
+import { closeSync, createReadStream, mkdirSync, openSync, writeSync } from 'node:fs';
 import { readFile, realpath, stat } from 'node:fs/promises';
 import { join, isAbsolute } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { inspect } from 'node:util';
 
 const VERSION = 1;
 const MAX_FRAME = 4 * 1024 * 1024;
@@ -16,6 +17,69 @@ for (const method of ['log', 'info', 'warn', 'error', 'debug', 'trace']) console
 
 class SafeError extends Error {
   constructor(code) { super(code); this.code = code; }
+}
+// Private captures intentionally retain the original SDK records, including errors.
+class NativeSessionWriter {
+  constructor(manager) {
+    this.manager = manager;
+    this.fd = undefined;
+    this.entriesWritten = 0;
+    this.headerWritten = false;
+    this.queued = false;
+    this.closed = false;
+    this.error = undefined;
+  }
+  guard(action) {
+    if (this.error) throw this.error;
+    try { return action(); }
+    catch {
+      this.error = new SafeError('session_persistence_error');
+      throw this.error;
+    }
+  }
+  open(path) {
+    this.guard(() => { this.fd = openSync(path, 'wx', 0o600); });
+    this.checkpoint();
+  }
+  append(record) {
+    const line = JSON.stringify(record);
+    insist(typeof line === 'string', 'session_persistence_error');
+    writeBytes(this.fd, Buffer.from(line + '\n'));
+  }
+  checkpoint() {
+    if (this.closed) return;
+    this.guard(() => {
+      if (!this.headerWritten) {
+        const header = this.manager.getHeader();
+        insist(header?.type === 'session', 'session_persistence_error');
+        this.append(header);
+        this.headerWritten = true;
+      }
+      const entries = this.manager.getEntries();
+      insist(entries.length >= this.entriesWritten, 'session_persistence_error');
+      while (this.entriesWritten < entries.length) {
+        this.append(entries[this.entriesWritten]);
+        this.entriesWritten++;
+      }
+    });
+  }
+  schedule() {
+    if (this.queued || this.closed || this.error) return;
+    this.queued = true;
+    // Public message_end listeners run before the SDK appends that message.
+    queueMicrotask(() => {
+      this.queued = false;
+      if (this.closed) return;
+      try { this.checkpoint(); } catch (error) { stop(error.code); }
+    });
+  }
+  close() {
+    this.closed = true;
+    if (this.fd === undefined) return;
+    const fd = this.fd;
+    this.fd = undefined;
+    try { closeSync(fd); } catch { throw new SafeError('session_persistence_error'); }
+  }
 }
 function insist(value, code = 'protocol_error') { if (!value) throw new SafeError(code); }
 function object(value) { return value !== null && typeof value === 'object' && !Array.isArray(value); }
@@ -50,6 +114,75 @@ let httpStatus = null;
 let retryAfter = null;
 let chatEndpoint;
 const aborter = new AbortController();
+let diagnosticFd;
+let diagnosticFailure;
+const responseCaptures = new Set();
+
+function writeBytes(fd, bytes) {
+  let offset = 0;
+  while (offset < bytes.length) {
+    const written = writeSync(fd, bytes, offset, bytes.length - offset);
+    if (written <= 0) throw new Error('Diagnostic write made no progress');
+    offset += written;
+  }
+}
+function diagnosticIO(action) {
+  if (diagnosticFailure) throw diagnosticFailure;
+  try { return action(); }
+  catch {
+    diagnosticFailure = new SafeError('diagnostic_persistence_error');
+    stop(diagnosticFailure.code);
+    failure = diagnosticFailure.code;
+    throw diagnosticFailure;
+  }
+}
+function diagnosticEvent(event) {
+  diagnosticIO(() => {
+    if (diagnosticFd === undefined) {
+      mkdirSync(start.error_dir, { mode: 0o700 });
+      diagnosticFd = openSync(join(start.error_dir, 'events.jsonl'), 'wx', 0o600);
+    }
+    writeBytes(diagnosticFd, Buffer.from(JSON.stringify(event) + '\n'));
+  });
+}
+function diagnosticError(type, error, requestIndex) {
+  diagnosticEvent({ type, ...(requestIndex === undefined ? {} : { request_index: requestIndex }),
+    error: inspect(error, { depth: null, maxArrayLength: null, maxStringLength: null, customInspect: false, colors: false }) });
+}
+function beginResponseCapture(response, requestIndex, url) {
+  const name = `request-${requestIndex}.body`;
+  diagnosticEvent({ type: 'http_response', request_index: requestIndex, url,
+    status: response.status, status_text: response.statusText,
+    headers: [...response.headers], body_file: name });
+  const capture = { requestIndex, bytes: 0,
+    fd: diagnosticIO(() => openSync(join(start.error_dir, name), 'wx', 0o600)) };
+  responseCaptures.add(capture);
+  return capture;
+}
+function captureResponseBytes(capture, bytes) {
+  if (!capture) return;
+  diagnosticIO(() => { writeBytes(capture.fd, bytes); capture.bytes += bytes.byteLength; });
+}
+function endResponseCapture(capture, complete) {
+  if (!capture || !responseCaptures.delete(capture)) return;
+  // Always close owned body files, including after an earlier logging failure.
+  try { closeSync(capture.fd); }
+  catch (error) { diagnosticIO(() => { throw error; }); }
+  diagnosticEvent({ type: 'http_body_end', request_index: capture.requestIndex,
+    complete, body_bytes: capture.bytes });
+}
+function closeDiagnostics() {
+  let error;
+  for (const capture of responseCaptures) {
+    try { endResponseCapture(capture, false); } catch (caught) { error = caught; }
+  }
+  if (diagnosticFd !== undefined) {
+    try { closeSync(diagnosticFd); }
+    catch { error = new SafeError('diagnostic_persistence_error'); }
+    diagnosticFd = undefined;
+  }
+  if (error) throw error;
+}
 
 function remoteSettled() { return requests.every(r => r.complete) && requests.every(r => !r.active); }
 function rejectTools() {
@@ -139,8 +272,11 @@ function conforms(value, schema) {
   }
 }
 function validateStart(frame) {
-  exactKeys(frame, ['protocol_version', 'run_id', 'request_id', 'type', 'provider', 'system_prompt', 'user_prompt', 'context_id', 'tools', 'private_dir']);
+  exactKeys(frame, ['protocol_version', 'run_id', 'request_id', 'type', 'provider', 'system_prompt', 'user_prompt', 'context_id', 'tools', 'private_dir', 'session_path', 'error_dir']);
   insist(frame.protocol_version === VERSION && frame.type === 'start_turn' && [frame.run_id, frame.request_id, frame.context_id].every(text));
+  for (const path of [frame.session_path, frame.error_dir]) {
+    insist(text(path) && isAbsolute(path) && !path.includes('\0'));
+  }
   insist(typeof frame.system_prompt === 'string' && typeof frame.user_prompt === 'string' && isAbsolute(frame.private_dir));
   const p = frame.provider;
   exactKeys(p, ['base_url', 'model', 'context_window', 'max_tokens', 'timeout_seconds', 'max_turns', 'max_tool_calls']);
@@ -176,21 +312,46 @@ async function guardedFetch(input, init) {
   insist(!failure && !requests.some(r => r.active || !r.complete), 'transport_rejected');
   const record = { active: true, complete: false, usage: null };
   requests.push(record);
+  const requestIndex = requests.length;
   let response;
   try {
     const signal = init?.signal ? AbortSignal.any([init.signal, aborter.signal]) : aborter.signal;
     response = await nativeFetch(input, { ...init, redirect: 'manual', signal });
-  } catch { record.active = false; throw new SafeError('provider_transport_error'); }
+  } catch (error) {
+    record.active = false;
+    diagnosticError('transport_error', error, requestIndex);
+    throw new SafeError('provider_transport_error');
+  }
   httpStatus = response.status;
   retryAfter = response.status === 429 ? retryDelay(response.headers.get('retry-after')) : null;
-  if (response.status >= 300 && response.status < 400) {
+  let capture;
+  try { if (!response.ok) capture = beginResponseCapture(response, requestIndex, url.href); }
+  catch (error) {
     await response.body?.cancel().catch(() => {});
     record.active = false;
-    // Redirect response is terminal; no credentials ever reach the redirect location.
-    record.complete = true;
+    throw error;
+  }
+  if (response.status >= 300 && response.status < 400) {
+    try {
+      // Preserve the rejected response, but never follow its Location header.
+      if (response.body) {
+        for await (const bytes of response.body) captureResponseBytes(capture, bytes);
+      }
+      endResponseCapture(capture, true);
+      record.complete = true;
+    } catch (error) {
+      diagnosticError('transport_error', error, requestIndex);
+      endResponseCapture(capture, false);
+      throw new SafeError('provider_transport_error');
+    } finally { record.active = false; }
     throw new SafeError('provider_redirect_rejected');
   }
-  if (!response.body) { record.active = false; record.complete = !response.ok; throw new SafeError('provider_transport_error'); }
+  if (!response.body) {
+    record.active = false;
+    record.complete = !response.ok;
+    endResponseCapture(capture, true);
+    throw new SafeError('provider_transport_error');
+  }
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -226,19 +387,26 @@ async function guardedFetch(input, init) {
         if (done) {
           record.active = false;
           record.complete = !response.ok || (doneMarker && finishReason);
+          endResponseCapture(capture, true);
           reader.releaseLock();
           controller.close();
-        } else { inspect(value); controller.enqueue(value); }
-      } catch {
+        } else { captureResponseBytes(capture, value); inspect(value); controller.enqueue(value); }
+      } catch (error) {
         record.active = false;
         try { await reader.cancel(); } catch {}
+        try {
+          diagnosticError('transport_error', error, requestIndex);
+          endResponseCapture(capture, false);
+        } catch { /* diagnosticIO has already failed the operation. */ }
         controller.error(new SafeError('provider_transport_error'));
       }
     },
     async cancel() {
       // A consumer may cancel immediately after [DONE], before requesting EOF.
       record.complete = !response.ok || (doneMarker && finishReason);
-      try { await reader.cancel(); } finally { record.active = false; }
+      try { await reader.cancel(); }
+      catch (error) { diagnosticError('transport_error', error, requestIndex); }
+      finally { record.active = false; endResponseCapture(capture, false); }
     },
   });
   return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
@@ -292,8 +460,11 @@ function reportedUsage() {
 }
 async function run(frame, options, keyPromise) {
   let completion;
+  let nativeSession;
+  let validStart = false;
   try {
     validateStart(frame);
+    validStart = true;
     usedIds.add(frame.request_id);
     timer = setTimeout(() => stop('timeout'), frame.provider.timeout_seconds * 1000);
     const privateInfo = await stat(frame.private_dir);
@@ -325,23 +496,28 @@ async function run(frame, options, keyPromise) {
     await runtime.setRuntimeApiKey(PROVIDER_ID, key);
     const model = runtime.getModel(PROVIDER_ID, p.model);
     insist(model && model.provider === PROVIDER_ID && model.id === p.model && model.baseUrl === p.base_url, 'model_mismatch');
+    const sessionManager = sdk.SessionManager.inMemory(frame.private_dir);
     const result = await sdk.createAgentSession({
       cwd: frame.private_dir, agentDir: frame.private_dir, modelRuntime: runtime, model, thinkingLevel: 'off',
       scopedModels: [{ model, thinkingLevel: 'off' }], noTools: 'builtin', tools: TOOL_NAMES,
       customTools: frame.tools.map(toolBridge), resourceLoader: emptyLoader(sdk),
-      sessionManager: sdk.SessionManager.inMemory(frame.private_dir),
+      sessionManager,
       settingsManager: sdk.SettingsManager.inMemory({ cacheWarming: 'off', compaction: { enabled: false }, retry: { enabled: false, maxRetries: 0, provider: { maxRetries: 0 } } }),
     });
     session = result.session;
+    nativeSession = new NativeSessionWriter(sessionManager);
+    nativeSession.open(frame.session_path);
     const active = session.getActiveToolNames();
     insist(active.length === TOOL_NAMES.length && TOOL_NAMES.every(name => active.includes(name)), 'tool_isolation_error');
     unsubscribe = session.subscribe(event => {
+      if (event.type === 'message_end' || event.type === 'entry_appended') nativeSession.schedule();
       if (event.type === 'agent_settled') settledEvent = !event.aborted;
       if (event.type === 'message_end' && event.message.role === 'assistant') finalAssistant = event.message;
     });
     if (failure) throw new SafeError(failure);
     await session.prompt(frame.user_prompt);
     await session.waitForIdle();
+    nativeSession.checkpoint();
     insist(!failure, failure);
     insist(settledEvent && remoteSettled() && requests.length > 0, 'provider_unsettled');
     if (!finalAssistant || finalAssistant.stopReason !== 'stop') {
@@ -358,15 +534,22 @@ async function run(frame, options, keyPromise) {
     completion = { type: 'turn_complete', final_text: finalText, remote_settled: true, tool_calls: toolCalls, model_turns: modelTurns, usage: reportedUsage(), request_count: requests.length, active_tools: active,
       provider_metadata: { provider: PROVIDER_ID, base_url: p.base_url, model: p.model, api: 'openai-completions', sdk_version: '1.4.0', node_version: process.versions.node, pricing: 'unknown', context_window: p.context_window, max_tokens: p.max_tokens, bounds_source: 'client_configuration', capability_admission: 'unverified' } };
   } catch (error) {
+    if (validStart && !(error instanceof SafeError)) {
+      try { diagnosticError('adapter_error', error); }
+      catch { /* diagnosticIO has already failed the operation. */ }
+    }
     failure ??= error instanceof SafeError ? error.code : 'adapter_error';
   } finally {
     clearTimeout(timer);
     if (failure) { aborter.abort(); rejectTools(); }
     if (session) {
       try { if (failure) await session.abort(); await session.waitForIdle(); } catch { failure ??= 'cleanup_error'; }
+      try { nativeSession?.checkpoint(); } catch (error) { failure = error.code; }
       unsubscribe?.();
       try { session.dispose(); } catch { failure ??= 'cleanup_error'; }
     }
+    try { nativeSession?.close(); } catch (error) { failure = error.code; }
+    try { closeDiagnostics(); } catch (error) { failure = error.code; }
     if (runtime) { try { await runtime.removeRuntimeApiKey(PROVIDER_ID); } catch { failure ??= 'cleanup_error'; } }
     finished = true;
     const terminal = failure ? { type: 'turn_failed', error_code: failure, remote_settled: remoteSettled(), retry_after_seconds: retryAfter, http_status: httpStatus, request_count: requests.length } : completion;

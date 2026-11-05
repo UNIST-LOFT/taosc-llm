@@ -91,7 +91,7 @@ async def run_adapter(context: SynthesisContext, provider: ProviderConfig,
         def receive(line):
             if not line or len(line) > MAX_FRAME + 1 or not line.endswith(b"\n"):
                 raise AdapterError("missing or oversized adapter frame")
-            # Raw SDK diagnostics are never persisted; protocol is the sole channel.
+            # Private diagnostics are persisted separately; stdout stays bounded and credential-free.
             if provider.api_key.encode() in line:
                 raise AdapterError("credential detected in adapter output")
             try:
@@ -194,7 +194,9 @@ async def run_adapter(context: SynthesisContext, provider: ProviderConfig,
             await send({**envelope, "type": "start_turn", "request_id": request_id,
                         "provider": provider.public_dict(), "context_id": context.context_id,
                         "system_prompt": context.system_prompt(), "user_prompt": context.initial_prompt(),
-                        "tools": context.tool_definitions(), "private_dir": private})
+                        "tools": context.tool_definitions(), "private_dir": private,
+                        "session_path": str(journal.with_suffix(".pi.jsonl").absolute()),
+                        "error_dir": str(journal.with_suffix(".errors").absolute())})
             terminal = await asyncio.wait_for(conversation(), timeout=provider.timeout_seconds + 20)
             return terminal
         except BaseException:
