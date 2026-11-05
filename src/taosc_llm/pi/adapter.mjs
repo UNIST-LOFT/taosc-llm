@@ -10,6 +10,7 @@ const VERSION = 1;
 const MAX_FRAME = 4 * 1024 * 1024;
 const TOOL_NAMES = ['get_patch_context', 'get_function_analysis', 'list_cases', 'get_case', 'evaluate_predicate', 'test_candidate', 'get_candidate_result'];
 const PROVIDER_ID = 'taosc-ollama-cloud';
+const REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 const nativeFetch = globalThis.fetch.bind(globalThis);
 const output = process.stdout.write.bind(process.stdout);
 // Some SDK dependencies log diagnostics with payload-bearing exception messages.
@@ -279,7 +280,8 @@ function validateStart(frame) {
   }
   insist(typeof frame.system_prompt === 'string' && typeof frame.user_prompt === 'string' && isAbsolute(frame.private_dir));
   const p = frame.provider;
-  exactKeys(p, ['base_url', 'model', 'context_window', 'max_tokens', 'timeout_seconds', 'max_turns', 'max_tool_calls']);
+  exactKeys(p, ['base_url', 'model', 'context_window', 'max_tokens', 'timeout_seconds', 'max_turns', 'max_tool_calls', 'reasoning_effort']);
+  insist(p.reasoning_effort === null || REASONING_EFFORTS.includes(p.reasoning_effort), 'configuration_error');
   insist(text(p.base_url) && !/[\x00-\x20\x7f]/.test(p.base_url) && text(p.model), 'configuration_error');
   let base;
   try { base = new URL(p.base_url); } catch { throw new SafeError('configuration_error'); }
@@ -357,6 +359,7 @@ async function guardedFetch(input, init) {
   let buffer = '';
   let doneMarker = false;
   let finishReason = false;
+  let cancelled = false;
   const inspect = bytes => {
     if (!response.ok) return;
     buffer += decoder.decode(bytes, { stream: true });
@@ -384,6 +387,8 @@ async function guardedFetch(input, init) {
     async pull(controller) {
       try {
         const { value, done } = await reader.read();
+        // cancel() closes this controller while a read may still be pending.
+        if (cancelled) return;
         if (done) {
           record.active = false;
           record.complete = !response.ok || (doneMarker && finishReason);
@@ -403,10 +408,16 @@ async function guardedFetch(input, init) {
     },
     async cancel() {
       // A consumer may cancel immediately after [DONE], before requesting EOF.
-      record.complete = !response.ok || (doneMarker && finishReason);
-      try { await reader.cancel(); }
-      catch (error) { diagnosticError('transport_error', error, requestIndex); }
-      finally { record.active = false; endResponseCapture(capture, false); }
+      cancelled = true;
+      try {
+        await reader.cancel();
+        record.complete = !response.ok || (doneMarker && finishReason);
+      } catch (error) { diagnosticError('transport_error', error, requestIndex); }
+      finally {
+        record.active = false;
+        reader.releaseLock();
+        endResponseCapture(capture, false);
+      }
     },
   });
   return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
@@ -474,21 +485,25 @@ async function run(frame, options, keyPromise) {
     insist(!failure, failure);
     runtime = await sdk.ModelRuntime.create({ credentials: new ai.InMemoryCredentialStore(), modelsPath: null, allowModelNetwork: false, refreshOnCreate: false });
     const p = frame.provider;
+    const reasoningEffort = p.reasoning_effort ?? undefined;
+    const thinkingLevel = reasoningEffort ?? 'off';
     runtime.registerProvider(PROVIDER_ID, {
       baseUrl: p.base_url, api: 'openai-completions', authHeader: true,
-      models: [{ id: p.model, name: p.model, input: ['text'], reasoning: false,
+      models: [{ id: p.model, name: p.model, input: ['text'], reasoning: reasoningEffort !== undefined,
+        // Pi otherwise clamps extended efforts for explicitly registered models.
+        thinkingLevelMap: { xhigh: 'xhigh', max: 'max' },
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: p.context_window, maxTokens: p.max_tokens,
-        compat: { supportsStore: false, supportsDeveloperRole: false, supportsReasoningEffort: false, supportsUsageInStreaming: true, maxTokensField: 'max_tokens' } }],
+        compat: { supportsStore: false, supportsDeveloperRole: false, supportsReasoningEffort: reasoningEffort !== undefined, thinkingFormat: 'openai', supportsUsageInStreaming: true, maxTokensField: 'max_tokens' } }],
       streamSimple(model, context, opts) {
         if (failure) throw new SafeError(failure);
         if (++modelTurns > p.max_turns) { stop('resource_limit'); throw new SafeError('resource_limit'); }
         insist(model.provider === PROVIDER_ID && model.id === p.model && model.baseUrl === p.base_url, 'model_mismatch');
         return chat.streamSimple(model, context, { ...opts, env: {}, fetch: guardedFetch, maxTokens: p.max_tokens, maxRetries: 0,
-          timeoutMs: p.timeout_seconds * 1000, cacheRetention: 'none', reasoning: undefined,
+          timeoutMs: p.timeout_seconds * 1000, cacheRetention: 'none', reasoning: reasoningEffort,
           onPayload(payload) {
-            // No forced tool_choice, provider-specific thinking knobs, or hidden cache warming.
+            // Only an explicit provider effort enables the OpenAI reasoning field.
             delete payload.tool_choice;
-            delete payload.reasoning_effort;
+            if (reasoningEffort === undefined) delete payload.reasoning_effort;
             return payload;
           } });
       },
@@ -498,8 +513,8 @@ async function run(frame, options, keyPromise) {
     insist(model && model.provider === PROVIDER_ID && model.id === p.model && model.baseUrl === p.base_url, 'model_mismatch');
     const sessionManager = sdk.SessionManager.inMemory(frame.private_dir);
     const result = await sdk.createAgentSession({
-      cwd: frame.private_dir, agentDir: frame.private_dir, modelRuntime: runtime, model, thinkingLevel: 'off',
-      scopedModels: [{ model, thinkingLevel: 'off' }], noTools: 'builtin', tools: TOOL_NAMES,
+      cwd: frame.private_dir, agentDir: frame.private_dir, modelRuntime: runtime, model, thinkingLevel,
+      scopedModels: [{ model, thinkingLevel }], noTools: 'builtin', tools: TOOL_NAMES,
       customTools: frame.tools.map(toolBridge), resourceLoader: emptyLoader(sdk),
       sessionManager,
       settingsManager: sdk.SettingsManager.inMemory({ cacheWarming: 'off', compaction: { enabled: false }, retry: { enabled: false, maxRetries: 0, provider: { maxRetries: 0 } } }),
@@ -532,7 +547,7 @@ async function run(frame, options, keyPromise) {
     const finalText = finalAssistant.content.filter(c => c.type === 'text').map(c => c.text).join('');
     insist(text(finalText), 'empty_response');
     completion = { type: 'turn_complete', final_text: finalText, remote_settled: true, tool_calls: toolCalls, model_turns: modelTurns, usage: reportedUsage(), request_count: requests.length, active_tools: active,
-      provider_metadata: { provider: PROVIDER_ID, base_url: p.base_url, model: p.model, api: 'openai-completions', sdk_version: '1.4.0', node_version: process.versions.node, pricing: 'unknown', context_window: p.context_window, max_tokens: p.max_tokens, bounds_source: 'client_configuration', capability_admission: 'unverified' } };
+      provider_metadata: { provider: PROVIDER_ID, base_url: p.base_url, model: p.model, api: 'openai-completions', sdk_version: '1.4.0', node_version: process.versions.node, pricing: 'unknown', context_window: p.context_window, max_tokens: p.max_tokens, reasoning_effort: p.reasoning_effort, bounds_source: 'client_configuration', capability_admission: 'unverified' } };
   } catch (error) {
     if (validStart && !(error instanceof SafeError)) {
       try { diagnosticError('adapter_error', error); }

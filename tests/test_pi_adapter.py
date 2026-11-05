@@ -12,6 +12,8 @@ from taosc_llm.provider import ProviderConfig
 
 PRELOAD = r'''
 const mode = __MODE__;
+const streamEnd = __STREAM_END__;
+const reasoningEffort = __REASONING_EFFORT__;
 let count = 0;
 const encode = x => new TextEncoder().encode(x);
 if (mode === 'write-failure') {
@@ -31,6 +33,7 @@ globalThis.fetch = async (input, init) => {
   if (url !== 'https://example.invalid/v1/chat/completions') throw Error('unexpected endpoint');
   const body = JSON.parse(init.body);
   if (body.model !== 'offline-exact-model' || body.tool_choice !== undefined) throw Error('wrong model/protocol');
+  if (body.reasoning_effort !== (reasoningEffort ?? undefined)) throw Error('reasoning effort changed or omitted');
   count++;
   if (mode === 'rate') return new Response(JSON.stringify({error:{message:'offline-secret-for-transport'}}), {status:429,headers:{'retry-after':'2'}});
   if (mode === 'auth' || mode === 'write-failure' || (mode === 'failure-prefix' && count === 2)) return new Response(JSON.stringify({error:{message:'private-provider-body offline-secret-for-transport',detail:'private-response-detail'}}), {status:401});
@@ -81,7 +84,8 @@ globalThis.fetch = async (input, init) => {
     model:body.model,choices:[{index:0,delta,finish_reason:finish}],
     ...(finish ? {usage:{prompt_tokens:11,completion_tokens:7,total_tokens:18}} : {})}) + '\n\n';
   let data;
-  if (mode === 'truncated') data = chunk({role:'assistant',content:'incomplete'},'stop');
+  if (mode === 'missing-finish') data = chunk({role:'assistant',content:'incomplete'}) + 'data: [DONE]\n\n';
+  else if (mode === 'truncated') data = chunk({role:'assistant',content:'incomplete'},'stop');
   else if (count <= 2 && mode !== 'abstain') {
     const name = count === 1 ? 'get_patch_context' : 'evaluate_predicate';
     const args = count === 1 ? {context_id:context} : {context_id:context,predicate:'rax <= 0'};
@@ -99,7 +103,14 @@ globalThis.fetch = async (input, init) => {
     const proposal = {schema_version:1,context_id:context,decision:mode === 'abstain' ? 'abstain' : 'candidate',predicate:mode === 'abstain' ? null : 'rax <= 0',evidence_ids:[],assumptions:[],reason:'Offline transport fixture only.'};
     data = chunk({role:'assistant',content:JSON.stringify(proposal)}) + chunk({},'stop') + 'data: [DONE]\n\n';
   }
-  return new Response(new ReadableStream({start(c){c.enqueue(encode(data));c.close();}}),{headers:{'content-type':'text/event-stream'}});
+  return new Response(new ReadableStream({
+    start(c) { c.enqueue(encode(data)); if (streamEnd === 'eof') c.close(); },
+    cancel() {
+      if (streamEnd === 'cancel-error') {
+        throw new Error('private cancellation failure', {cause:new Error('private cancellation cause')});
+      }
+    },
+  }), {headers:{'content-type':'text/event-stream'}});
 };
 '''
 
@@ -114,16 +125,19 @@ def adapter_context(tmp_path):
 
 
 def operation(adapter_context, tmp_path, mode, *, journal=None,
-              api_key="offline-secret-for-transport"):
+              api_key="offline-secret-for-transport", stream_end="eof", reasoning_effort=None):
     context, root = adapter_context
     journal = journal if journal is not None else tmp_path / "turn.jsonl"
     preload = tmp_path / "provider.mjs"
     preload.write_text(PRELOAD.replace("__MODE__", json.dumps(mode))
+                       .replace("__STREAM_END__", json.dumps(stream_end))
+                       .replace("__REASONING_EFFORT__", json.dumps(reasoning_effort))
                        .replace("__SESSION_PATH__", json.dumps(str(journal.with_suffix(".pi.jsonl")))))
     command = adapter_command(root)
     command[1:1] = ["--import", str(preload)]
     provider = ProviderConfig(api_key=api_key, base_url="https://example.invalid/v1",
-                              model="offline-exact-model", timeout_seconds=30)
+                              model="offline-exact-model", timeout_seconds=30,
+                              reasoning_effort=reasoning_effort)
     result = asyncio.run(run_adapter(context, provider, command, "offline", journal))
     assert provider.api_key not in journal.read_text()
     return result, context
@@ -180,8 +194,9 @@ console.log(JSON.stringify({header:session.getHeader(),entries:session.getEntrie
     return json.loads(completed.stdout)
 
 
-def test_pi_custom_tools_and_settled_final_proposal(adapter_context, tmp_path):
-    result, context = operation(adapter_context, tmp_path, "tools")
+@pytest.mark.parametrize("stream_end", ["eof", "pending"])
+def test_pi_custom_tools_and_settled_final_proposal(adapter_context, tmp_path, stream_end):
+    result, context = operation(adapter_context, tmp_path, "tools", stream_end=stream_end)
     assert result["type"] == "turn_complete", result
     assert result["remote_settled"] is True
     assert result["request_count"] == 3
@@ -189,6 +204,19 @@ def test_pi_custom_tools_and_settled_final_proposal(adapter_context, tmp_path):
     assert result["host_checked_predicates"] == ["rax <= 0"]
     assert set(result["active_tools"]) == {"get_patch_context", "get_function_analysis", "list_cases", "get_case", "evaluate_predicate", "test_candidate", "get_candidate_result"}
     assert context.validate_proposal(result["final_text"])["predicate"] == "rax <= 0"
+    assert result["usage"] == {"scope": "all_requests", "input": 33, "output": 21, "totalTokens": 54}
+    assert not (tmp_path / "turn.errors").exists()
+
+
+@pytest.mark.parametrize("effort", ["xhigh", "max"])
+def test_pi_extended_reasoning_effort_is_not_clamped(adapter_context, tmp_path, effort):
+    result, context = operation(adapter_context, tmp_path, "tools",
+                                stream_end="pending", reasoning_effort=effort)
+    assert result["type"] == "turn_complete", result
+    assert result["remote_settled"] is True
+    assert result["request_count"] == 3
+    assert context.validate_proposal(result["final_text"])["predicate"] == "rax <= 0"
+    assert not (tmp_path / "turn.errors").exists()
 
 
 def test_pi_continues_after_actual_offline_result_reference(adapter_context, tmp_path):
@@ -365,6 +393,18 @@ def test_private_transport_errors_retain_stack_and_cause(adapter_context, tmp_pa
     assert "at " in errors[0]["error"]
 
 
+def test_failed_stream_cancellation_remains_unsettled(adapter_context, tmp_path):
+    result, _ = operation(adapter_context, tmp_path, "abstain", stream_end="cancel-error")
+    assert result["type"] == "turn_failed"
+    assert result["remote_settled"] is False
+    assert result["request_count"] == 1
+    events = native_records(tmp_path / "turn.errors" / "events.jsonl")
+    errors = [event for event in events if event["type"] == "transport_error"]
+    assert len(errors) == 1
+    assert "private cancellation failure" in errors[0]["error"]
+    assert "private cancellation cause" in errors[0]["error"]
+
+
 def test_partial_http_body_survives_cancellation(adapter_context, tmp_path):
     result, _ = operation(adapter_context, tmp_path, "partial-cancel")
     assert result["type"] == "turn_failed"
@@ -485,7 +525,10 @@ def test_synthesis_processes_ignore_legacy_global_state(adapter_context, tmp_pat
     await new Promise(resolve => setTimeout(resolve, 10));
   }
 '''.replace("__RENDEZVOUS__", json.dumps(str(rendezvous)))
-    preload.write_text(PRELOAD.replace("__MODE__", '"abstain"').replace("  count++;", "  count++;" + barrier))
+    preload.write_text(PRELOAD.replace("__MODE__", '"abstain"')
+                       .replace("__STREAM_END__", '"pending"')
+                       .replace("__REASONING_EFFORT__", "null")
+                       .replace("  count++;", "  count++;" + barrier))
     provider_file = tmp_path / "offline-provider.conf"
     provider_file.write_text('TAOSC_LLM_PROFILE=openai-compatible\n'
                              'OPENAI_API_KEY=offline-secret-for-transport\n'
@@ -548,12 +591,14 @@ print(json.dumps(result))
         assert json.loads(record.read_text())["status"] == "abstained"
         journal = record.parent / "trials" / "1" / "turn-1.jsonl"
         assert "offline-secret-for-transport" not in journal.read_text()
+        assert not journal.with_suffix(".errors").exists()
     assert {path.name: path.read_bytes() for path in quota.iterdir()} == before
 
 
-@pytest.mark.parametrize("mode", ["truncated", "cancel"])
-def test_pi_unfinished_transport_remains_unsettled(adapter_context, tmp_path, mode):
-    result, _ = operation(adapter_context, tmp_path, mode)
+@pytest.mark.parametrize("mode,stream_end", [("truncated", "eof"), ("cancel", "pending"),
+                                           ("missing-finish", "pending")])
+def test_pi_unfinished_transport_remains_unsettled(adapter_context, tmp_path, mode, stream_end):
+    result, _ = operation(adapter_context, tmp_path, mode, stream_end=stream_end)
     assert result["type"] == "turn_failed"
     assert result["request_count"] == 1
     assert result["remote_settled"] is False

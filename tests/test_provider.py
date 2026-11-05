@@ -25,13 +25,22 @@ def provider_file(tmp_path, extra=""):
 def test_explicit_loading_ignores_ambient_and_redacts(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "ambient-secret")
     monkeypatch.setenv("OPENAI_MODEL", "ambient-model")
+    monkeypatch.setenv("TAOSC_LLM_REASONING_EFFORT", "high")
     config = load_provider(provider_file(tmp_path))
     assert config.api_key == SECRET
+    assert config.reasoning_effort is None
     assert config.model == "deepseek-v4.1-flash:1017"
     assert SECRET not in repr(config)
     assert SECRET not in json.dumps(config.public_dict())
     with pytest.raises(FrozenInstanceError):
         setattr(config, "model", "changed")
+
+
+@pytest.mark.parametrize("value", ["", "HIGH", "off", "none", "secret-value"])
+def test_invalid_reasoning_effort_is_rejected_without_echo(tmp_path, value):
+    path = provider_file(tmp_path, f"TAOSC_LLM_REASONING_EFFORT={value}\n")
+    with pytest.raises(ProviderConfigError, match="^invalid reasoning_effort$"):
+        load_provider(path)
 
 
 def test_nonsecret_override_precedence(tmp_path):
@@ -50,6 +59,7 @@ def test_nonsecret_override_precedence(tmp_path):
     "export OPENAI_API_KEY=secret-value\n", "TAOSC_LLM_WORKERS=2\n",
     "TAOSC_LLM_MAX_IN_FLIGHT=3\n",
     "TAOSC_LLM_TIMEOUT_SECONDS=1.5\n",
+    "TAOSC_LLM_REASONING_EFFORT=high\nTAOSC_LLM_REASONING_EFFORT=low\n",
 ])
 def test_invalid_fields_do_not_echo_values(tmp_path, extra):
     with pytest.raises(ProviderConfigError) as error:
@@ -84,6 +94,8 @@ def test_unsupported_routing_and_invalid_overrides(tmp_path, overrides):
     ("context_window", 0), ("max_tokens", 0), ("timeout_seconds", 0),
     ("max_turns", 0), ("max_tool_calls", 0),
     ("timeout_seconds", True), ("max_turns", 1.5),
+    ("reasoning_effort", True), ("reasoning_effort", 1),
+    ("reasoning_effort", []), ("reasoning_effort", "unknown"),
 ])
 def test_direct_api_rejects_invalid_operation_bounds(name, value):
     with pytest.raises(ProviderConfigError):

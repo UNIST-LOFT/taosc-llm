@@ -22,6 +22,7 @@ class ProviderConfig:
     timeout_seconds: int = 600
     max_turns: int = 16
     max_tool_calls: int = 64
+    reasoning_effort: str | None = None
 
     def __post_init__(self):
         for name in ("api_key", "base_url", "model"):
@@ -31,6 +32,9 @@ class ProviderConfig:
             value = getattr(self, name)
             if type(value) is not int or value < 1:
                 raise ProviderConfigError(f"invalid {name}")
+        if self.reasoning_effort is not None and self.reasoning_effort not in (
+                "minimal", "low", "medium", "high", "xhigh", "max"):
+            raise ProviderConfigError("invalid reasoning_effort")
         if self.max_tokens > self.context_window:
             raise ProviderConfigError("invalid max_tokens")
         hostname = urlsplit(self.base_url).hostname
@@ -53,6 +57,7 @@ _FIELDS = {
     "OPENAI_BASE_URL": "base_url",
     "OPENAI_MODEL": "model",
     "TAOSC_LLM_PROFILE": "profile",
+    "TAOSC_LLM_REASONING_EFFORT": "reasoning_effort",
     **{f"TAOSC_LLM_{name.upper()}": name for name in (
         "context_window", "max_tokens", "timeout_seconds", "max_turns", "max_tool_calls")},
 }

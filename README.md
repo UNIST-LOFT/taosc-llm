@@ -217,7 +217,11 @@ sequentially. Remove obsolete `TAOSC_LLM_MAX_IN_FLIGHT`/`TAOSC_LLM_WORKERS` fiel
 from provider files. Provider `--max-in-flight`/`--workers` are also removed;
 evaluator `--workers` and synthesis `--execution-workers` remain supported.
 Use an explicit provider file; no home credentials, ambient provider defaults or
-fallback models are discovered. Guix supplies its SDK root automatically.
+fallback models are discovered. To request reasoning effort, add
+`TAOSC_LLM_REASONING_EFFORT=high` to that file. Exact accepted values and the
+omitted/default behavior are in the [provider configuration contract](../../agent-docs/taosc-llm/PROVIDER_AND_PI.md#explicit-configuration);
+this is not a CLI option or an ambient environment override. Guix supplies its
+SDK root automatically.
 
 ### Results and artifacts
 
