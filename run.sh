@@ -115,13 +115,15 @@ cleanup() {
 
 default_rea() {
   if [ -n "${TAOSC_LLM_REA:-}" ]; then printf '%s' "$TAOSC_LLM_REA"; return; fi
-  local candidate
-  candidate=$(ls -d /gnu/store/*-taosc-llm-rea-*/bin/rea 2>/dev/null | sort | tail -1) || true
-  if [ -n "$candidate" ] && "$candidate" --version >/dev/null 2>&1; then
-    printf '%s' "$candidate"; return
+  if ! command -v guix >/dev/null 2>&1; then
+    echo "Guix is required for the pinned REA runtime; pass --rea PATH or set TAOSC_LLM_REA to override" >&2
+    return 1
   fi
-  candidate=$(command -v rea || true)
-  if [ -n "$candidate" ] && "$candidate" --version >/dev/null 2>&1; then printf '%s' "$candidate"; fi
+  # Resolve this checkout's recipe, never a store hash ordering or an ambient shim.
+  # A project-local profile supplies atomic updates and GC roots across runs.
+  guix package --profile="$TAOSC_LLM/.guix-rea" \
+    --install-from-file="$TAOSC_LLM/static-runtime.scm" >&2 || return
+  printf '%s/.guix-rea/bin/rea\n' "$TAOSC_LLM"
 }
 
 main() {
@@ -130,6 +132,7 @@ main() {
   SUBJECT=$REPO/benchmarks/loftix/binutils/CVE-2017-14745 # subject directory with config.env
   WORKDIR_NAME=workdir-0.1.24
   OUTDIR= TIMEOUT=7200 READY_TIMEOUT=0 PROVIDER_ENV=$TAOSC_LLM/.env PREDICATE= NO_LLM=0 REA=
+  SKIP_CONCRETE=0 ONLY_CONCRETE=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --subject|--workdir|--outdir|--timeout|--ready-timeout|--provider-env|--predicate|--rea)
@@ -141,12 +144,22 @@ main() {
         esac
         shift 2 ;;
       --no-llm) NO_LLM=1; shift ;;
+      --skip-concrete) SKIP_CONCRETE=1; shift ;;
+      --only-concrete) ONLY_CONCRETE=1; shift ;;
       -h|--help)
         cat <<'HELP'
 Usage: run.sh [--subject DIR] [--workdir NAME] [--outdir DIR]
               [--timeout SECONDS] [--ready-timeout SECONDS]
+              [--skip-concrete | --only-concrete]
               [--provider-env FILE | --no-llm --predicate PREDICATE] [--rea PATH]
-Debug example: requires a prepared workdir, REA, JAVA_HOME and GHIDRA_INSTALL_DIR.
+Debug example: requires a prepared workdir. By default Guix builds/resolves the
+pinned REA runtime, including Java and Ghidra, at utils/taosc-llm/.guix-rea.
+--rea PATH overrides TAOSC_LLM_REA; either bypasses automatic Guix resolution.
+Custom REA executables must supply their own Java/Ghidra environment.
+--skip-concrete reuses br-gen-con under the selected output base; it must already
+have a nonempty minimizer.sbsv. Concrete setup and generation are skipped.
+--only-concrete runs concrete setup/generation only: no REA, replay or Taosc.
+These two flags are mutually exclusive; omitted means run the full pipeline.
 --timeout controls native generation only (default 7200; 0 means unlimited).
 --ready-timeout bounds the whole readiness wait, including PROBE (default 0:
 unlimited). A failed producer always ends the wait promptly.
@@ -156,6 +169,9 @@ HELP
       *) echo "unknown option: $1" >&2; return 2 ;;
     esac
   done
+  if [ "$SKIP_CONCRETE" -eq 1 ] && [ "$ONLY_CONCRETE" -eq 1 ]; then
+    echo "--skip-concrete and --only-concrete are mutually exclusive" >&2; return 2
+  fi
   [[ "$READY_TIMEOUT" =~ ^[0-9]+([.][0-9]+)?$ ]] || {
     echo "--ready-timeout must be nonnegative seconds" >&2; return 2;
   }
@@ -165,61 +181,83 @@ HELP
   [ -f "$WORKDIR/patch-location" ] || {
     echo "$WORKDIR has no patch-location; run taosc-fix (or taosc-fix-prepare) first" >&2; return 2;
   }
-  if [ -z "$REA" ]; then REA=$(default_rea); fi
-  [ -n "$REA" ] || { echo "REA not found; pass --rea PATH or set TAOSC_LLM_REA" >&2; return 2; }
-  if [[ "$REA" == */* ]]; then REA=$(absolute_path "$REA"); fi
-  if [ -n "$PROVIDER_ENV" ]; then PROVIDER_ENV=$(absolute_path "$PROVIDER_ENV"); fi
-  if [ -z "${JAVA_HOME:-}" ] || [ -z "${GHIDRA_INSTALL_DIR:-}" ]; then
-    echo "note: checkout static analysis needs JAVA_HOME/GHIDRA_INSTALL_DIR (Guix wrappers supply both)" >&2
-  fi
-  if [ "$NO_LLM" -eq 1 ]; then
-    [ -n "$PREDICATE" ] || { echo "--no-llm needs --predicate" >&2; return 2; }
-  elif [ -z "$PROVIDER_ENV" ]; then
-    echo "model mode needs --provider-env; use --no-llm for the manual predicate path" >&2; return 2
-  fi
   OUTDIR=$(absolute_path "${OUTDIR:-$WORKDIR/out}")
+  if [ "$SKIP_CONCRETE" -eq 1 ] && [ ! -s "$OUTDIR/br-gen-con/minimizer.sbsv" ]; then
+    echo "--skip-concrete requires an existing nonempty $OUTDIR/br-gen-con/minimizer.sbsv" >&2
+    return 2
+  fi
+  if [ "$ONLY_CONCRETE" -eq 0 ]; then
+    if [ -z "$REA" ]; then REA=$(default_rea); fi
+    [ -n "$REA" ] || { echo "REA not found; pass --rea PATH or set TAOSC_LLM_REA" >&2; return 2; }
+    if [[ "$REA" == */* ]]; then REA=$(absolute_path "$REA"); fi
+    if [ -n "$PROVIDER_ENV" ]; then PROVIDER_ENV=$(absolute_path "$PROVIDER_ENV"); fi
+    printf 'REA runtime: %s\n' "$REA"
+    if [ "$NO_LLM" -eq 1 ]; then
+      [ -n "$PREDICATE" ] || { echo "--no-llm needs --predicate" >&2; return 2; }
+    elif [ -z "$PROVIDER_ENV" ]; then
+      echo "model mode needs --provider-env; use --no-llm for the manual predicate path" >&2; return 2
+    fi
+  fi
   OWNED_PIDS=() CONCRETE_PID= MUTATION_PID= MUTATION_SOCKET= LOG=
   trap cleanup EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
   allocate_runs "$OUTDIR"
-  DATASET=$RUNS/dataset RESULT=$RUNS/taosc-llm-result CACHE=$RUNS/taosc-llm-cache
-  mkdir -p -- "$LOG" "$CACHE"
-  printf 'producer outputs:\n  concrete     %s\n  mutation     %s\nartifact root: %s\n' \
-    "$OUTDIR/br-gen-con" "$OUTDIR/br-gen-bin" "$RUNS"
+  mkdir -p -- "$LOG"
+  printf 'producer outputs:\n  concrete     %s\n' "$CONCRETE_RUN"
+  if [ "$ONLY_CONCRETE" -eq 0 ]; then printf '  mutation     %s\n' "$MUTATION_RUN"; fi
+  printf 'artifact root: %s\n' "$RUNS"
 
-  echo "== preparing both generation environments =="
-  run_uv "$REPO" binradar-setup --generate-concrete -c "$SUBJECT" -w "$WORKDIR"
-  run_uv "$REPO" binradar-setup --generate-binradar -c "$SUBJECT" -w "$WORKDIR"
+  echo "== preparing selected generation environments =="
+  if [ "$SKIP_CONCRETE" -eq 0 ]; then
+    run_uv "$REPO" binradar-setup --generate-concrete -c "$SUBJECT" -w "$WORKDIR"
+  else
+    echo "== reusing concrete output: $CONCRETE_RUN =="
+  fi
+  if [ "$ONLY_CONCRETE" -eq 0 ]; then
+    run_uv "$REPO" binradar-setup --generate-binradar -c "$SUBJECT" -w "$WORKDIR"
+  fi
 
-  echo "== starting concrete generation and resident mutation generation =="
   # The subshell immediately execs setsid; the owned PID is the new group leader.
-  (
-    cd "$SUBJECT"
-    exec setsid uv run --project "$REPO" binradar -w "$WORKDIR_NAME" --output "$CONCRETE_RUN" \
-      --generate-concrete --timeout "$TIMEOUT"
-  ) >"$LOG/concrete.log" 2>&1 &
-  CONCRETE_PID=$!; OWNED_PIDS+=("$CONCRETE_PID")
-  (
-    cd "$SUBJECT"
-    exec setsid uv run --project "$REPO" binradar -w "$WORKDIR_NAME" --output "$MUTATION_RUN" \
-      --generate-binradar --replay-server --timeout "$TIMEOUT"
-  ) >"$LOG/mutation.log" 2>&1 &
-  MUTATION_PID=$!; OWNED_PIDS+=("$MUTATION_PID")
+  if [ "$SKIP_CONCRETE" -eq 0 ]; then
+    echo "== starting concrete generation =="
+    (
+      cd "$SUBJECT"
+      exec setsid uv run --project "$REPO" binradar -w "$WORKDIR_NAME" --output "$CONCRETE_RUN" \
+        --generate-concrete --timeout "$TIMEOUT"
+    ) >"$LOG/concrete.log" 2>&1 &
+    CONCRETE_PID=$!; OWNED_PIDS+=("$CONCRETE_PID")
+  fi
+  if [ "$ONLY_CONCRETE" -eq 0 ]; then
+    echo "== starting resident mutation generation =="
+    (
+      cd "$SUBJECT"
+      exec setsid uv run --project "$REPO" binradar -w "$WORKDIR_NAME" --output "$MUTATION_RUN" \
+        --generate-binradar --replay-server --timeout "$TIMEOUT"
+    ) >"$LOG/mutation.log" 2>&1 &
+    MUTATION_PID=$!; OWNED_PIDS+=("$MUTATION_PID")
 
-  echo "== waiting for the resident server to report ready =="
-  # Start immediately: the explicit readiness policy includes directory creation,
-  # PROBE, generation and handshake. Native generation timeout is independent.
-  run_uv "$TAOSC_LLM" python -m taosc_llm.replay wait \
-    --socket "$MUTATION_SOCKET" --pid "$MUTATION_PID" --timeout "$READY_TIMEOUT" >"$LOG/status.json"
-  cat "$LOG/status.json"
-  echo "== waiting for concrete generation =="
+    echo "== waiting for the resident server to report ready =="
+    # Readiness includes directory creation, PROBE, generation and handshake.
+    run_uv "$TAOSC_LLM" python -m taosc_llm.replay wait \
+      --socket "$MUTATION_SOCKET" --pid "$MUTATION_PID" --timeout "$READY_TIMEOUT" >"$LOG/status.json"
+    cat "$LOG/status.json"
+  fi
+  if [ "$SKIP_CONCRETE" -eq 0 ]; then echo "== waiting for concrete generation =="; fi
   while [ -n "$CONCRETE_PID" ]; do producer_health; sleep 0.1; done
   producer_health
   [ -s "$CONCRETE_RUN/minimizer.sbsv" ] || {
     echo "concrete run $CONCRETE_RUN has no minimizer.sbsv; dataset setup would fail" >&2; return 1;
   }
 
+  if [ "$ONLY_CONCRETE" -eq 1 ]; then
+    printf 'artifacts:\n  run root     %s\n  concrete     %s\n  logs         %s\n' \
+      "$RUNS" "$CONCRETE_RUN" "$LOG"
+    return 0
+  fi
+
+  DATASET=$RUNS/dataset RESULT=$RUNS/taosc-llm-result CACHE=$RUNS/taosc-llm-cache
+  mkdir -p -- "$CACHE"
   echo "== freezing the dataset (concrete run + live mutation run) =="
   run_uv "$TAOSC_LLM" taosc-llm-setup -c "$SUBJECT/config.env" -w "$WORKDIR" \
     --concrete-run "$CONCRETE_RUN" --binradar-run "$MUTATION_RUN" \

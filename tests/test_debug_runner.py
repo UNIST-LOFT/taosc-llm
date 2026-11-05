@@ -1,10 +1,12 @@
 """Focused Bash runner contracts; not simulated pipeline acceptance.
 
-Only preparation uses a stub uv to hold/fail a child. Producer supervision uses
-real local sleep/exit processes. Real generation/setup/synthesis belongs to the
-benign integration smoke, not these lifecycle tests.
+Preparation uses a stub uv to hold/fail a child; runtime-resolution failure uses
+a failing Guix command. Producer supervision uses real local sleep/exit processes.
+Real generation/setup/synthesis belongs to the benign integration smoke, not
+these lifecycle tests.
 """
 import os
+import shutil
 import signal
 import subprocess
 import time
@@ -14,11 +16,16 @@ import pytest
 
 
 RUNNER = Path(__file__).resolve().parents[1] / "run.sh"
+BASH = shutil.which("bash")
+assert BASH is not None
 
 
 def shell(code, *args, cwd=None, timeout=15):
+    # Guix can inherit SIGINT=SIG_IGN; Bash cannot trap an initially ignored
+    # signal. Model a foreground invocation without changing pytest's handlers.
     return subprocess.run(
-        ["bash", "-c", 'source "$1"; shift; ' + code, "runner-test", str(RUNNER), *map(str, args)],
+        ["env", "--default-signal=INT", BASH, "-c",
+         'source "$1"; shift; ' + code, "runner-test", str(RUNNER), *map(str, args)],
         cwd=cwd, text=True, capture_output=True, timeout=timeout,
     )
 
@@ -94,7 +101,7 @@ def test_short_symlink_root_is_not_resolved(tmp_path):
     target.mkdir()
     # /tmp keeps the alias genuinely short regardless of pytest's own root.
     import tempfile
-    with tempfile.TemporaryDirectory(prefix="br-alias-") as short:
+    with tempfile.TemporaryDirectory(prefix="br-alias-", dir="/tmp") as short:
         alias = Path(short) / "a"
         alias.symlink_to(target, target_is_directory=True)
         result = shell('allocate_runs "$(absolute_path "$1")"; printf "%s\\n" "$RUNS"', alias)
@@ -127,24 +134,101 @@ wait_job "$STARTED_PID"
         assert "generation" in result.stderr
 
 
-def preparation_runner(tmp_path, command, outdir="out"):
+def preparation_runner(tmp_path, command, outdir="out", *, rea="/bin/true", flags=()):
     subject = tmp_path / "subject"
     workdir = subject / "prepared"
-    workdir.mkdir(parents=True)
+    workdir.mkdir(parents=True, exist_ok=True)
     (workdir / "patch-location").write_text("prepared\n")
     bindir = tmp_path / "bin"
-    bindir.mkdir()
+    bindir.mkdir(exist_ok=True)
     uv = bindir / "uv"
-    uv.write_text("#!/bin/bash\n" + command + "\n")
+    uv.write_text(f"#!{BASH}\n" + command + "\n")
     uv.chmod(0o755)
     env = dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}", CHILD_FILE=str(tmp_path / "child"))
     process = subprocess.Popen(
-        [str(RUNNER), "--subject", "subject", "--workdir", "prepared",
+        ["env", "--default-signal=INT", str(RUNNER),
+         "--subject", "subject", "--workdir", "prepared",
          *(["--outdir", outdir] if outdir is not None else []),
-         "--rea", "/bin/true", "--no-llm", "--predicate", "0"],
+         *(["--rea", rea] if rea is not None else []), "--no-llm", "--predicate", "0", *flags],
         cwd=tmp_path, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     return process
+
+
+def test_concrete_modes_are_mutually_exclusive_before_work(tmp_path):
+    process = preparation_runner(
+        tmp_path, 'touch "$CHILD_FILE"; exit 9', rea=None,
+        flags=("--skip-concrete", "--only-concrete"))
+    stdout, stderr = process.communicate(timeout=10)
+    assert process.returncode == 2, (stdout, stderr)
+    assert "--skip-concrete" in stderr and "--only-concrete" in stderr
+    assert not (tmp_path / "child").exists()
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize("empty_manifest", [False, True])
+def test_skip_requires_concrete_evidence_before_mutating_outputs(tmp_path, empty_manifest):
+    output = tmp_path / "subject/prepared/out"
+    concrete, mutation = output / "br-gen-con", output / "br-gen-bin"
+    concrete.mkdir(parents=True)
+    mutation.mkdir()
+    (concrete / "retained-input").write_bytes(b"prior concrete input")
+    (mutation / "prior-run").write_bytes(b"prior mutation output")
+    if empty_manifest:
+        (concrete / "minimizer.sbsv").touch()
+    process = preparation_runner(
+        tmp_path, 'touch "$CHILD_FILE"; exit 9', outdir=None, rea=None,
+        flags=("--skip-concrete",))
+    stdout, stderr = process.communicate(timeout=10)
+    assert process.returncode == 2, (stdout, stderr)
+    assert "--skip-concrete" in stderr
+    assert not (tmp_path / "child").exists()
+    assert {path.name for path in output.iterdir()} == {"br-gen-con", "br-gen-bin"}
+    assert (concrete / "retained-input").read_bytes() == b"prior concrete input"
+    assert (mutation / "prior-run").read_bytes() == b"prior mutation output"
+
+
+def test_concrete_only_does_not_require_analysis_or_a_predicate(tmp_path, monkeypatch):
+    monkeypatch.delenv("TAOSC_LLM_REA", raising=False)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    guix = bindir / "guix"
+    guix.write_text(f'#!{BASH}\ntouch "$CHILD_FILE"; exit 17\n')
+    guix.chmod(0o755)
+    # Reaching concrete preparation, rather than runtime or predicate validation,
+    # must preserve the actual preparation failure status.
+    process = preparation_runner(
+        tmp_path, "exit 7", rea=None,
+        flags=("--only-concrete", "--predicate", "", "--provider-env", ""))
+    stdout, stderr = process.communicate(timeout=10)
+    assert process.returncode == 7, (stdout, stderr)
+    assert not (tmp_path / "child").exists()
+
+
+def test_runtime_resolution_failure_preserves_existing_outputs(tmp_path, monkeypatch):
+    monkeypatch.delenv("TAOSC_LLM_REA", raising=False)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    guix = bindir / "guix"
+    guix.write_text(f"#!{BASH}\nexit 17\n")
+    guix.chmod(0o755)
+    # A failing build must not fall back to a seemingly usable ambient executable.
+    rea = bindir / "rea"
+    rea.write_text(f"#!{BASH}\nexit 0\n")
+    rea.chmod(0o755)
+    output = tmp_path / "subject/prepared/out"
+    for name in ("br-gen-con", "br-gen-bin"):
+        directory = output / name
+        directory.mkdir(parents=True)
+        (directory / "prior-run").write_bytes(b"preserve this producer output")
+    process = preparation_runner(tmp_path, 'touch "$CHILD_FILE"; exit 9',
+                                 outdir=None, rea=None)
+    stdout, stderr = process.communicate(timeout=10)
+    assert process.returncode == 17, (stdout, stderr)
+    assert not (tmp_path / "child").exists()
+    assert {path.name for path in output.iterdir()} == {"br-gen-con", "br-gen-bin"}
+    for name in ("br-gen-con", "br-gen-bin"):
+        assert (output / name / "prior-run").read_bytes() == b"preserve this producer output"
 
 
 @pytest.mark.parametrize("outdir", [None, "custom-output"])

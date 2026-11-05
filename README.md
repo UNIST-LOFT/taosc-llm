@@ -332,8 +332,8 @@ and the single authoritative
 
 ## Debug orchestration example
 
-`run.sh` is a runnable example, not the production Taosc driver. It starts both
-generation modes together, waits on `status`, freezes one dataset from both
+`run.sh` is a runnable example, not the production Taosc driver. By default it
+starts both generation modes together, waits on `status`, freezes one dataset from both
 producer runs, then evaluates and synthesizes against the live snapshot:
 
 ```sh
@@ -342,18 +342,48 @@ utils/taosc-llm/run.sh --no-llm --predicate 'rax <= 0' --timeout 600
 
 # Model path: the host adds --replay-socket/--cache-dir; the model cannot.
 utils/taosc-llm/run.sh --provider-env /abs/provider.env --timeout 7200
+
+# Generate concrete cases once, without REA/Ghidra, a provider or replay.
+utils/taosc-llm/run.sh --only-concrete --timeout 600
+
+# Reuse those concrete cases; regenerate mutations and run the remaining stages.
+utils/taosc-llm/run.sh --skip-concrete --provider-env /abs/provider.env --timeout 7200
 ```
+
+`--only-concrete` runs only concrete setup and generation, requires a nonempty
+`br-gen-con/minimizer.sbsv`, and exits without preparing/starting the resident
+server or running REA, dataset setup, cache warm or synthesis. No provider or
+predicate is required. Existing `br-gen-bin` output is untouched; the diagnostic
+root contains only logs.
+
+`--skip-concrete` skips concrete setup and generation, preserving its existing
+output and environment. It requires a nonempty `br-gen-con/minimizer.sbsv`
+before runtime resolution or output allocation. Reuse a completed run for the
+same workdir/binary; the preflight is not a replacement for dataset evidence
+validation. Mutation generation, a fresh dataset, cache warm and synthesis still
+run. Both flags use the selected output base, so repeat the same `--outdir` if
+you used one. The two flags are mutually exclusive (exit 2).
+
+For resident modes without an override, the runner installs/resolves the current checkout's
+`static-runtime.scm` into the project-local Guix profile
+`utils/taosc-llm/.guix-rea`, then uses `.guix-rea/bin/rea`. Its wrapper supplies
+Java and Ghidra; no store hash, `JAVA_HOME` or `GHIDRA_INSTALL_DIR` needs to be
+entered manually. An unchanged recipe reuses the installed build. Selection
+precedence is `--rea PATH`, then `TAOSC_LLM_REA`, then automatic Guix resolution;
+custom executables must supply their own Java/Ghidra environment. Runtime
+resolution fails before allocating diagnostics or replacing producer outputs,
+without falling back to an arbitrary store entry or ambient `rea` shim.
 
 Options: `--subject DIR`, `--workdir NAME`, `--outdir DIR`, `--rea PATH`,
 `--timeout SECONDS`, `--ready-timeout SECONDS`, `--predicate`, `--no-llm`,
-`--provider-env FILE`. Relative subject/output paths are made absolute before
-changing cwd, without expanding user-provided symlinks. The default layout is:
+`--provider-env FILE`, `--skip-concrete`, `--only-concrete`. Relative subject/output
+paths are made absolute before changing cwd, without expanding user-provided symlinks. The default layout is:
 
 ```text
 workdir/out/
-  br-gen-con/                  # concrete generation; replaced on rerun
-  br-gen-bin/                  # resident mutation generation; replaced on rerun
-  runs-debug-<random>/         # fresh logs, dataset, result and cache
+  br-gen-con/                  # replaced unless --skip-concrete
+  br-gen-bin/                  # replaced unless --only-concrete
+  runs-debug-<random>/         # fresh logs; dataset/result/cache in resident modes
 ```
 
 `--outdir DIR` overrides this base directory. Each producer receives its own
@@ -376,21 +406,13 @@ must not be attached to a different server merely because its path was reused.
 Both producers are monitored throughout readiness, dataset setup and evaluation;
 a failed concrete producer or premature resident exit stops the example promptly.
 
-The Guix REA wrapper supplies `JAVA_HOME` and `GHIDRA_INSTALL_DIR`; callers
-using it do not need to export them. An unwrapped checkout must configure both
-for static analysis. The script's parent-shell note does not inspect wrapper
-exports. Do not rely on a bare `rea` on `PATH`: a mise shim can exist without a
-selected version and exit nonzero. The script prefers an explicit
-`--rea`/`TAOSC_LLM_REA`, then a Guix `taosc-llm-rea-*/bin/rea` that actually runs,
-then `PATH`.
-
 Exit codes 2 (`reject_same_crash`) and 3 (`unavailable`) from `--warm` and
 synthesis are scoped results, not orchestration failures; the script reports
 them, still shuts the resident server down, and exits 0. A readiness deadline,
 a dead launcher, a failed producer or a protocol error exits nonzero and keeps
 the logs. SIGINT exits 130; SIGTERM exits 143, never success.
 
-Order and failure rules the example encodes:
+Default full-pipeline order and failure rules:
 
 1. `binradar-setup --generate-concrete` and `--generate-binradar` run first;
    they prepare different `.env` files and do not run patches.
@@ -448,6 +470,28 @@ remaining gates are recorded in the
 [integration reference](../../agent-docs/taosc-llm/IMPLEMENTATION_PLAN.md#packaging-and-acceptance-evidence).
 
 ## Packaging and Guix
+
+REA alone, including Java/Ghidra, can be built from the repository root:
+
+```sh
+guix build -f utils/taosc-llm/static-runtime.scm
+
+# Optional manual equivalent of run.sh's automatic runtime selection:
+guix package --profile=utils/taosc-llm/.guix-rea \
+  --install-from-file=utils/taosc-llm/static-runtime.scm
+utils/taosc-llm/.guix-rea/bin/rea --version
+```
+
+`taosc-llm-rea` is the package's name; `rea-runtime` is its file-local Scheme
+binding. Neither becomes a searchable package merely by loading `guix.scm` with
+`-f`. Do not append `taosc-llm-rea` to a `guix build -f ...` command: that requests
+an additional registry lookup, which reports `unknown package` here. The
+standalone `static-runtime.scm` returns the REA package directly. The local
+profile supplies GC roots and repeatable updates; unlike `guix build --root`, it
+does not fail when the link already exists. It does not modify the user's global
+Guix profile.
+
+Full application:
 
 ```sh
 guix build -L utils/loftix -f utils/taosc-llm/guix.scm

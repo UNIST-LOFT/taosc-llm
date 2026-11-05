@@ -4,6 +4,7 @@
              (gnu packages compression)
              (gnu packages base)
              (gnu packages commencement)
+             (gnu packages linux)
              (gnu packages patchutils)
              (gnu packages python-build)
              (guix build-system pyproject)
@@ -84,7 +85,7 @@ This package supplies SDK imports, not npm CLI executable shims.")
   (let ((relative (if (string=? file package-directory)
                       ""
                       (string-drop file (+ 1 (string-length package-directory))))))
-    (or (member relative '("" "pyproject.toml" "README.md" "LICENSE" "uv.lock"
+    (or (member relative '("" "pyproject.toml" "README.md" "LICENSE" "uv.lock" "run.sh"
                            "src" "src/taosc_llm" "tests"
                            "src/taosc_llm/pi" "src/taosc_llm/prompts"))
         (member relative '("src/taosc_llm/runtime.c"
@@ -194,7 +195,7 @@ This package supplies SDK imports, not npm CLI executable shims.")
   (inputs (list analysis-node pi-sdk rea-runtime ghidra-runtime
                 `(,openjdk21 "jdk") gcc-toolchain binutils e9patch
                 coreutils bash-minimal))
-  (native-inputs (list python-setuptools python-pytest gcc-toolchain e9patch))
+  (native-inputs (list python-setuptools python-pytest gcc-toolchain e9patch util-linux))
   (propagated-inputs (list local-binradar))
   (supported-systems '("x86_64-linux"))
   (home-page "https://github.com/UNIST-LOFT/binradar")

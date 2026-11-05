@@ -2,6 +2,7 @@
 import json
 import os
 import socket
+import tempfile
 import threading
 from pathlib import Path
 
@@ -35,18 +36,28 @@ class FakeServer:
         self._socket: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
+        self._directory = None
 
     def start(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        if self.path.exists():
+        if self.path.exists() or self.path.is_symlink():
             self.path.unlink()
-        self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._socket.bind(str(self.path))
-        self._socket.listen(4)
-        self._thread = threading.Thread(target=self._serve, daemon=True)
-        self._thread.start()
-        self._ready.wait(5)
-        return self
+        # Match BinRadar's public-link/private-socket contract even when Guix
+        # gives pytest a long TMPDIR and parametrized test directory.
+        self._directory = tempfile.TemporaryDirectory(prefix="br-peer-", dir="/tmp")
+        try:
+            endpoint = Path(self._directory.name) / "replay.sock"
+            self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self._socket.bind(str(endpoint))
+            self._socket.listen(4)
+            self.path.symlink_to(endpoint)
+            self._thread = threading.Thread(target=self._serve, daemon=True)
+            self._thread.start()
+            self._ready.wait(5)
+            return self
+        except BaseException:
+            self.close()
+            raise
 
     def _serve(self):
         listener = self._socket
@@ -88,6 +99,12 @@ class FakeServer:
         if self._thread is not None:
             self._thread.join(timeout=5)
             self._thread = None
+        if self._directory is not None:
+            endpoint = Path(self._directory.name) / "replay.sock"
+            if self.path.is_symlink() and self.path.readlink() == endpoint:
+                self.path.unlink()
+            self._directory.cleanup()
+            self._directory = None
 
 
 @pytest.fixture
@@ -260,7 +277,6 @@ def test_wait_cli_zero_waits_until_ready(run_dir, capsys):
 
 @pytest.mark.parametrize("leaf", ["long-run-" + "x" * 110, "é" * 60])
 def test_long_published_socket_supports_all_operations(dataset, tmp_path, leaf):
-    import tempfile
     target = tmp_path / leaf
     target.mkdir()
     public = target / replay.SOCKET_NAME
@@ -286,7 +302,6 @@ def test_long_published_socket_supports_all_operations(dataset, tmp_path, leaf):
 
 @pytest.mark.parametrize("dangling", [False, True])
 def test_wait_retries_until_public_endpoint_is_available(tmp_path, monkeypatch, dangling):
-    import tempfile
     public = tmp_path / ("long-run-" + "x" * 110) / replay.SOCKET_NAME
     public.parent.mkdir()
     sleeps = []

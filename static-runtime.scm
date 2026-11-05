@@ -1,11 +1,20 @@
 ;;; Local, hash-pinned Linux x86-64 static analysis dependencies.
 ;;; Official binary distributions retain their bundled license material.
-(use-modules (gnu packages bash)
+(use-modules (gnu packages base)
+             (gnu packages bash)
              (gnu packages elf)
              (gnu packages gcc)
              (gnu packages java)
              (gnu packages linux)
-             (gnu packages compression))
+             (gnu packages compression)
+             (guix build-system trivial)
+             (guix download)
+             (guix gexp)
+             ((guix licenses) #:prefix license:)
+             (guix packages))
+
+(define static-runtime-directory
+  (canonicalize-path (dirname (current-filename))))
 
 (define analysis-jdk (gexp-input openjdk21 "jdk"))
 
@@ -114,7 +123,7 @@
     (description "The official Ghidra 12.1 release, with the Linux x86-64 decompiler relocated for Guix. Analysis runs with private writable projects outside the store.")
     (license license:asl2.0)))
 
-(define rea-directory (string-append package-directory "/thirdparty/rea"))
+(define rea-directory (string-append static-runtime-directory "/thirdparty/rea"))
 (define rea-tarballs (primitive-load (string-append rea-directory "/npm-closure.scm")))
 (define rea-runtime
   (package
@@ -155,3 +164,6 @@
     (license (list license:expat license:asl2.0 license:isc license:bsd-2
                    license:bsd-3 license:zlib license:blue-oak1.0.0
                    license:lgpl3+))))
+
+;; guix.scm imports the definitions; -f static-runtime.scm builds REA directly.
+rea-runtime
