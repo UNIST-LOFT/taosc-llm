@@ -160,6 +160,8 @@ Custom REA executables must supply their own Java/Ghidra environment.
 have a nonempty minimizer.sbsv. Concrete setup and generation are skipped.
 --only-concrete runs concrete setup/generation only: no REA, replay or Taosc.
 These two flags are mutually exclusive; omitted means run the full pipeline.
+Resident modes admit only ERM generic/ERM CWE-805: other nonempty patch formats
+print [skip] and exit 0 before preparation; missing/empty metadata exits 2.
 --timeout controls native generation only (default 7200; 0 means unlimited).
 --ready-timeout bounds the whole readiness wait, including PROBE (default 0:
 unlimited). A failed producer always ends the wait promptly.
@@ -178,6 +180,25 @@ HELP
   SUBJECT=$(absolute_path "$SUBJECT")
   WORKDIR=$SUBJECT/$WORKDIR_NAME
   [ -d "$SUBJECT" ] || { echo "subject directory not found: $SUBJECT" >&2; return 2; }
+  if [ "$ONLY_CONCRETE" -eq 0 ]; then
+    # Match generation setup: workdir metadata wins; only absence permits fallback.
+    local format_file=$WORKDIR/patch-format patch_format
+    if [ ! -e "$format_file" ]; then format_file=$SUBJECT/patch-format; fi
+    [ -f "$format_file" ] || {
+      echo "patch-format file not found: $format_file" >&2; return 2;
+    }
+    if ! patch_format=$(cat -- "$format_file"); then return 2; fi
+    # Trim surrounding whitespace, not internal whitespace or extra lines.
+    patch_format="${patch_format#"${patch_format%%[![:space:]]*}"}"
+    patch_format="${patch_format%"${patch_format##*[![:space:]]}"}"
+    [ -n "$patch_format" ] || {
+      echo "patch-format is empty: $format_file" >&2; return 2;
+    }
+    case "$patch_format" in
+      'ERM generic'|'ERM CWE-805') ;;
+      *) printf '[skip] unsupported patch-format: %s (%s)\n' "$patch_format" "$format_file"; return 0 ;;
+    esac
+  fi
   [ -f "$WORKDIR/patch-location" ] || {
     echo "$WORKDIR has no patch-location; run taosc-fix (or taosc-fix-prepare) first" >&2; return 2;
   }

@@ -350,14 +350,26 @@ utils/taosc-llm/run.sh --only-concrete --timeout 600
 utils/taosc-llm/run.sh --skip-concrete --provider-env /abs/provider.env --timeout 7200
 ```
 
+Before either resident mode (default or `--skip-concrete`) does any preparation,
+the runner reads `<workdir>/patch-format`, falling back to
+`<subject>/patch-format` only when the workdir entry is absent. It trims
+surrounding whitespace and admits only `ERM generic` and `ERM CWE-805`.
+Other nonempty values print `[skip] unsupported patch-format: ...` and exit 0,
+so batch runners do not record them as failures. Missing, empty/whitespace-only,
+unreadable or non-file metadata exits 2; an existing invalid workdir entry never
+falls back to subject metadata. This check precedes patch-location/concrete
+requirements, REA/Guix resolution, setup and output allocation. It neither
+creates a diagnostic root nor changes producer outputs or existing generation
+environments. `--only-concrete` bypasses this format check entirely.
+
 `--only-concrete` runs only concrete setup and generation, requires a nonempty
 `br-gen-con/minimizer.sbsv`, and exits without preparing/starting the resident
 server or running REA, dataset setup, cache warm or synthesis. No provider or
 predicate is required. Existing `br-gen-bin` output is untouched; the diagnostic
 root contains only logs.
 
-`--skip-concrete` skips concrete setup and generation, preserving its existing
-output and environment. It requires a nonempty `br-gen-con/minimizer.sbsv`
+For admitted ERM subjects, `--skip-concrete` skips concrete setup and generation,
+preserving its existing output and environment. It requires a nonempty `br-gen-con/minimizer.sbsv`
 before runtime resolution or output allocation. Reuse a completed run for the
 same workdir/binary; the preflight is not a replacement for dataset evidence
 validation. Mutation generation, a fresh dataset, cache warm and synthesis still
@@ -412,7 +424,7 @@ them, still shuts the resident server down, and exits 0. A readiness deadline,
 a dead launcher, a failed producer or a protocol error exits nonzero and keeps
 the logs. SIGINT exits 130; SIGTERM exits 143, never success.
 
-Default full-pipeline order and failure rules:
+After format admission, the default full-pipeline order and failure rules are:
 
 1. `binradar-setup --generate-concrete` and `--generate-binradar` run first;
    they prepare different `.env` files and do not run patches.

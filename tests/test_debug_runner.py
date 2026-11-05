@@ -134,11 +134,14 @@ wait_job "$STARTED_PID"
         assert "generation" in result.stderr
 
 
-def preparation_runner(tmp_path, command, outdir="out", *, rea="/bin/true", flags=()):
+def preparation_runner(tmp_path, command, outdir="out", *, rea="/bin/true", flags=(),
+                       format_text="ERM generic\n"):
     subject = tmp_path / "subject"
     workdir = subject / "prepared"
     workdir.mkdir(parents=True, exist_ok=True)
     (workdir / "patch-location").write_text("prepared\n")
+    if format_text is not None:
+        (workdir / "patch-format").write_text(format_text)
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
     uv = bindir / "uv"
@@ -153,6 +156,73 @@ def preparation_runner(tmp_path, command, outdir="out", *, rea="/bin/true", flag
         cwd=tmp_path, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     return process
+
+
+@pytest.mark.parametrize("flags", [(), ("--skip-concrete",)])
+def test_non_erm_skips_before_runtime_or_output_changes(tmp_path, monkeypatch, flags):
+    monkeypatch.delenv("TAOSC_LLM_REA", raising=False)
+    output = tmp_path / "subject/prepared/out"
+    for leaf in ("br-gen-con", "br-gen-bin"):
+        directory = output / leaf
+        directory.mkdir(parents=True)
+        (directory / "prior-output").write_bytes(b"preserve existing results")
+    generation_env = output.parent / "generate-binradar.env"
+    generation_env.write_text("preserve existing generation environment\n")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    guix = bindir / "guix"
+    guix.write_text(f'#!{BASH}\ntouch "$CHILD_FILE"; exit 17\n')
+    guix.chmod(0o755)
+    # No concrete manifest: unsupported subjects must skip before that check too.
+    process = preparation_runner(
+        tmp_path, 'touch "$CHILD_FILE"; exit 9', outdir=None, rea=None,
+        format_text="Single CWE-805\n", flags=flags)
+    stdout, stderr = process.communicate(timeout=10)
+    assert process.returncode == 0, (stdout, stderr)
+    assert "Single CWE-805" in stdout
+    assert not (tmp_path / "child").exists()
+    assert {path.name for path in output.iterdir()} == {"br-gen-con", "br-gen-bin"}
+    assert generation_env.read_text() == "preserve existing generation environment\n"
+    for leaf in ("br-gen-con", "br-gen-bin"):
+        assert (output / leaf / "prior-output").read_bytes() == b"preserve existing results"
+
+
+@pytest.mark.parametrize("work_format,subject_format,expected", [
+    ("ERM generic\n", "Single CWE-805\n", 7),
+    (" \tERM CWE-805\r\n", "Single CWE-805\n", 7),
+    ("Single CWE-805\n", "ERM generic\n", 0),
+    (None, "ERM generic\n", 7),
+    (None, "Single CWE-617\n", 0),
+    ("", "ERM generic\n", 2),
+    (" \t\r\n", None, 2),
+    (None, None, 2),
+    ("ERM generic\nunexpected extra line\n", None, 0),
+])
+def test_patch_format_admission_and_metadata_precedence(
+        tmp_path, work_format, subject_format, expected):
+    subject = tmp_path / "subject"
+    subject.mkdir()
+    if subject_format is not None:
+        (subject / "patch-format").write_text(subject_format)
+    process = preparation_runner(
+        tmp_path, 'touch "$CHILD_FILE"; exit 7', format_text=work_format)
+    stdout, stderr = process.communicate(timeout=10)
+    assert process.returncode == expected, (stdout, stderr)
+    assert (tmp_path / "child").exists() == (expected == 7)
+    if expected != 7:
+        assert not (tmp_path / "out").exists()
+
+
+def test_non_file_workdir_format_does_not_fall_back(tmp_path):
+    subject = tmp_path / "subject"
+    (subject / "prepared/patch-format").mkdir(parents=True)
+    (subject / "patch-format").write_text("ERM generic\n")
+    process = preparation_runner(
+        tmp_path, 'touch "$CHILD_FILE"; exit 7', format_text=None)
+    stdout, stderr = process.communicate(timeout=10)
+    assert process.returncode == 2, (stdout, stderr)
+    assert not (tmp_path / "child").exists()
+    assert not (tmp_path / "out").exists()
 
 
 def test_concrete_modes_are_mutually_exclusive_before_work(tmp_path):
@@ -198,7 +268,7 @@ def test_concrete_only_does_not_require_analysis_or_a_predicate(tmp_path, monkey
     # Reaching concrete preparation, rather than runtime or predicate validation,
     # must preserve the actual preparation failure status.
     process = preparation_runner(
-        tmp_path, "exit 7", rea=None,
+        tmp_path, "exit 7", rea=None, format_text=None,
         flags=("--only-concrete", "--predicate", "", "--provider-env", ""))
     stdout, stderr = process.communicate(timeout=10)
     assert process.returncode == 7, (stdout, stderr)
