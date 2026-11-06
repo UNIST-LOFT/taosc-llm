@@ -159,3 +159,130 @@ def test_blocking_tool_cancellation_waits_for_worker():
             await task
         assert finished.is_set()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("outcome", ["not_rejected", "unavailable", "abstained", "refinement_exhausted"])
+def test_feedback_follows_final_host_outcome_only(tmp_path, monkeypatch, outcome):
+    context = prepare_context(make_dataset(tmp_path / "dataset"), run_dir=tmp_path / "runs")
+    provider = ProviderConfig(api_key="offline-only", base_url="https://example.invalid/v1", model="offline")
+    monkeypatch.setattr(synthesis, "adapter_command", lambda _: ["not-executed"])
+    prompts = []
+    settled = []
+
+    async def model(current, provider, command, run_id, journal, *, on_complete):
+        # First round is invalid; it must settle/release without a review call.
+        first = not settled
+        final = (proposal(current, predicate="rax &&") if first or outcome == "refinement_exhausted"
+                 else proposal(current, decision="abstain", predicate=None) if outcome == "abstained"
+                 else proposal(current))
+        response = terminal(current, final, ["rax < 0"])
+        prompt = await on_complete(response)
+        settled.append(final)
+        prompts.append(prompt)
+        if prompt is not None:
+            assert outcome in prompt
+            assert "private-host-path" not in prompt
+            assert "raw-provider-secret" not in prompt
+            response["session_feedback"] = {"type": "feedback_complete", "final_text": "# Review\nBounded evidence.",
+                "remote_settled": True, "model_turns": 1, "tool_calls": 0,
+                "request_count": 1, "usage": None}
+        return response
+
+    async def build(*args):
+        return {"status": "built", "verified": False}
+
+    def evaluate(*args, **kwargs):
+        return {"status": outcome, "evaluation_mode": "host", "private_path": "private-host-path",
+                "report_summary": {"domains": {}}, "cases": [{"case_id": "function:0", "source": "raw-provider-secret",
+                    "report": {"case_id": "function:0", "domain": "function",
+                               "candidate": {"outcome": "unknown"}}}]}
+
+    monkeypatch.setattr(synthesis, "run_adapter", model)
+    monkeypatch.setattr(synthesis, "_build", build)
+    from taosc_llm import evaluation
+    monkeypatch.setattr(evaluation, "evaluate_dataset", evaluate)
+    result = asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=2, session_feedback=True))
+    assert result["status"] == outcome and result["verified"] is False
+    assert prompts[0] is None and prompts[1] is not None
+    path = context.run_dir / result["run_id"] / "session-feedback.md"
+    assert path.read_text() == "# Review\nBounded evidence."
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert "final_text" not in result["session_feedback"]
+    assert all("session_feedback" not in attempt for attempt in result["attempts"])
+
+
+def test_review_samples_noteworthy_cases_and_identifies_original_tools(tmp_path):
+    import hashlib
+    context = prepare_context(make_dataset(tmp_path / "dataset", count=12), run_dir=tmp_path / "runs")
+    provider = ProviderConfig(api_key="offline-only", base_url="https://example.invalid/v1", model="offline")
+    cases = [{"case_id": f"function:{index}", "report": {
+        "case_id": f"function:{index}", "domain": "function",
+        "candidate": {"outcome": "target_crash" if index == 11 else "unknown"},
+        "activation": {"status": "fired" if index == 11 else "unknown"}}}
+        for index in range(12)]
+    evaluated = {"status": "reject_same_crash", "cases": cases, "report_summary": {"domains": {}}}
+    prompt = synthesis._review_prompt(context, {"status": "refinement_exhausted"},
+        {"round": 2, "status": "reject_same_crash", "evaluation": evaluated}, provider)
+    payload = json.loads(prompt.split("Final host result:\n", 1)[1])
+    assert payload["reports"][0]["case_id"] == "function:11"
+    assert payload["reports"][0]["why_selected"] == "target_crash:fired"
+    assert len(payload["reports"]) == 8 and payload["reports_omitted"] == 4
+    assert payload["host_run_status"] == "refinement_exhausted"
+    assert payload["evaluation_engine_status"] == "reject_same_crash"
+    definitions = context.tool_definitions()
+    assert payload["original_synthesis_tools"] == {
+        "names": [tool["name"] for tool in definitions],
+        "schema_sha256": hashlib.sha256(synthesis.canonical(definitions)).hexdigest()}
+    assert synthesis._noteworthy_reports(context, evaluated) == payload["reports"]
+
+
+def test_feedback_failure_is_separate_from_abstention(tmp_path, monkeypatch):
+    context = prepare_context(make_dataset(tmp_path / "dataset"), run_dir=tmp_path / "runs")
+    provider = ProviderConfig(api_key="offline-only", base_url="https://example.invalid/v1", model="offline")
+    monkeypatch.setattr(synthesis, "adapter_command", lambda _: ["not-executed"])
+
+    async def model(current, provider, command, run_id, journal, *, on_complete):
+        response = terminal(current, proposal(current, decision="abstain", predicate=None), [])
+        assert await on_complete(response) is not None
+        response["session_feedback"] = {"type": "feedback_failed", "error_code": "timeout",
+                                        "remote_settled": False, "request_count": 1}
+        return response
+
+    monkeypatch.setattr(synthesis, "run_adapter", model)
+    result = asyncio.run(synthesis.synthesize_context(context, provider, session_feedback=True))
+    assert result["status"] == "abstained"
+    assert result["session_feedback"]["error_code"] == "timeout"
+    assert not (context.run_dir / result["run_id"] / "session-feedback.md").exists()
+
+
+def test_review_preparation_failure_preserves_frozen_verdict(tmp_path, monkeypatch):
+    context = prepare_context(make_dataset(tmp_path / "dataset"), run_dir=tmp_path / "runs")
+    provider = ProviderConfig(api_key="offline-only", base_url="https://example.invalid/v1", model="offline")
+    monkeypatch.setattr(synthesis, "adapter_command", lambda _: ["not-executed"])
+
+    def fail_review(*args):
+        raise ValueError("evidence changed after final host result")
+
+    async def model(current, provider, command, run_id, journal, *, on_complete):
+        response = terminal(current, proposal(current, decision="abstain", predicate=None), [])
+        assert await on_complete(response) is None
+        return response
+
+    monkeypatch.setattr(synthesis, "_review_prompt", fail_review)
+    monkeypatch.setattr(synthesis, "run_adapter", model)
+    result = asyncio.run(synthesis.synthesize_context(context, provider, session_feedback=True))
+    assert result["status"] == "abstained" and result["verified"] is False
+    assert result["session_feedback"]["error_code"] == "feedback_preparation_error"
+    record = json.loads((context.run_dir / result["run_id"] / "run.json").read_text())
+    assert record["status"] == "abstained"
+    assert not (context.run_dir / result["run_id"] / "session-feedback.md").exists()
+
+
+def test_manual_cli_rejects_session_feedback_before_preparing(tmp_path):
+    from taosc_llm.cli import main
+    output = tmp_path / "must-not-exist"
+    with pytest.raises(SystemExit) as error:
+        main(["--dataset", str(tmp_path), "--predicate", "0", "--session-feedback", "--output", str(output)])
+    assert error.value.code == 2 and not output.exists()
+
+

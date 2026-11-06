@@ -103,6 +103,11 @@ let finished = false;
 let failure;
 let settledEvent = false;
 let finalAssistant;
+let reviewPhase = false;
+let outcomeWaiter;
+let feedbackRequestId;
+let synthesisRequestCount = 0;
+let synthesisModelTurns = 0;
 let toolCalls = 0;
 let modelTurns = 0;
 let serial = 0;
@@ -193,6 +198,7 @@ function rejectTools() {
 function stop(code) {
   if (finished || failure) return;
   failure = code;
+  outcomeWaiter?.reject(new SafeError(code));
   aborter.abort();
   rejectTools();
   // Do not await from an event callback: prompt() owns cleanup and terminal output.
@@ -248,7 +254,7 @@ async function loadSdk(root) {
 // Unsupported schema vocabulary fails closed rather than silently weakening checks.
 function schemaSupported(schema, depth = 0) {
   insist(object(schema) && depth < 16, 'invalid_tool_schema');
-  const keys = ['type', 'properties', 'required', 'additionalProperties', 'enum', 'const', 'items', 'minLength', 'maxLength', 'minItems', 'maxItems', 'description', 'title', 'minimum', 'maximum'];
+  const keys = ['type', 'properties', 'required', 'additionalProperties', 'enum', 'const', 'items', 'minLength', 'maxLength', 'minItems', 'maxItems', 'uniqueItems', 'description', 'title', 'minimum', 'maximum'];
   insist(Object.keys(schema).every(k => keys.includes(k)), 'invalid_tool_schema');
   insist(['object', 'string', 'array', 'integer', 'number', 'boolean', 'null'].includes(schema.type), 'invalid_tool_schema');
   if (schema.type === 'object') {
@@ -264,7 +270,7 @@ function conforms(value, schema) {
   switch (schema.type) {
     case 'object': return object(value) && Object.keys(value).every(k => Object.hasOwn(schema.properties, k)) && (schema.required ?? []).every(k => Object.hasOwn(value, k)) && Object.entries(value).every(([k, v]) => conforms(v, schema.properties[k]));
     case 'string': return typeof value === 'string' && value.length >= (schema.minLength ?? 0) && value.length <= (schema.maxLength ?? Infinity);
-    case 'array': return Array.isArray(value) && value.length >= (schema.minItems ?? 0) && value.length <= (schema.maxItems ?? Infinity) && value.every(v => conforms(v, schema.items));
+    case 'array': return Array.isArray(value) && value.length >= (schema.minItems ?? 0) && value.length <= (schema.maxItems ?? Infinity) && value.every(v => conforms(v, schema.items)) && (!schema.uniqueItems || new Set(value.map(v => JSON.stringify(v))).size === value.length);
     case 'integer': return Number.isSafeInteger(value) && value >= (schema.minimum ?? -Infinity) && value <= (schema.maximum ?? Infinity);
     case 'number': return typeof value === 'number' && Number.isFinite(value) && value >= (schema.minimum ?? -Infinity) && value <= (schema.maximum ?? Infinity);
     case 'boolean': return typeof value === 'boolean';
@@ -273,7 +279,9 @@ function conforms(value, schema) {
   }
 }
 function validateStart(frame) {
-  exactKeys(frame, ['protocol_version', 'run_id', 'request_id', 'type', 'provider', 'system_prompt', 'user_prompt', 'context_id', 'tools', 'private_dir', 'session_path', 'error_dir']);
+  const required = ['protocol_version', 'run_id', 'request_id', 'type', 'provider', 'system_prompt', 'user_prompt', 'context_id', 'tools', 'private_dir', 'session_path', 'error_dir'];
+  exactKeys(frame, [...required, 'session_feedback'], required);
+  insist(frame.session_feedback === undefined || frame.session_feedback === true);
   insist(frame.protocol_version === VERSION && frame.type === 'start_turn' && [frame.run_id, frame.request_id, frame.context_id].every(text));
   for (const path of [frame.session_path, frame.error_dir]) {
     insist(text(path) && isAbsolute(path) && !path.includes('\0'));
@@ -427,6 +435,7 @@ function toolBridge(tool) {
   return {
     ...tool, label: tool.name, executionMode: 'sequential',
     async execute(_id, args, signal) {
+      if (reviewPhase) { stop('feedback_tool_forbidden'); throw new SafeError('feedback_tool_forbidden'); }
       if (failure || signal?.aborted) throw new SafeError('cancelled');
       if (++toolCalls > start.provider.max_tool_calls) { stop('resource_limit'); throw new SafeError('resource_limit'); }
       if (!conforms(args, tool.parameters) || args.context_id !== start.context_id) {
@@ -461,10 +470,11 @@ function emptyLoader(sdk) {
     extendResources() {}, async reload() {},
   };
 }
-function reportedUsage() {
-  if (!requests.length || requests.some(r => r.usage === null)) return null;
+function reportedUsage(offset = 0) {
+  const selected = requests.slice(offset);
+  if (!selected.length || selected.some(r => r.usage === null)) return null;
   const result = { scope: 'all_requests', input: 0, output: 0, totalTokens: 0 };
-  for (const request of requests) {
+  for (const request of selected) {
     for (const key of ['input', 'output', 'totalTokens']) result[key] += request.usage[key];
   }
   return ['input', 'output', 'totalTokens'].every(k => Number.isSafeInteger(result[k])) ? result : null;
@@ -496,13 +506,17 @@ async function run(frame, options, keyPromise) {
         compat: { supportsStore: false, supportsDeveloperRole: false, supportsReasoningEffort: reasoningEffort !== undefined, thinkingFormat: 'openai', supportsUsageInStreaming: true, maxTokensField: 'max_tokens' } }],
       streamSimple(model, context, opts) {
         if (failure) throw new SafeError(failure);
-        if (++modelTurns > p.max_turns) { stop('resource_limit'); throw new SafeError('resource_limit'); }
+        if (reviewPhase ? modelTurns - synthesisModelTurns >= 1 : modelTurns >= p.max_turns) {
+          stop('resource_limit'); throw new SafeError('resource_limit');
+        }
+        modelTurns++;
         insist(model.provider === PROVIDER_ID && model.id === p.model && model.baseUrl === p.base_url, 'model_mismatch');
         return chat.streamSimple(model, context, { ...opts, env: {}, fetch: guardedFetch, maxTokens: p.max_tokens, maxRetries: 0,
           timeoutMs: p.timeout_seconds * 1000, cacheRetention: 'none', reasoning: reasoningEffort,
           onPayload(payload) {
             // Only an explicit provider effort enables the OpenAI reasoning field.
             delete payload.tool_choice;
+            if (reviewPhase) delete payload.tools;
             if (reasoningEffort === undefined) delete payload.reasoning_effort;
             return payload;
           } });
@@ -548,6 +562,39 @@ async function run(frame, options, keyPromise) {
     insist(text(finalText), 'empty_response');
     completion = { type: 'turn_complete', final_text: finalText, remote_settled: true, tool_calls: toolCalls, model_turns: modelTurns, usage: reportedUsage(), request_count: requests.length, active_tools: active,
       provider_metadata: { provider: PROVIDER_ID, base_url: p.base_url, model: p.model, api: 'openai-completions', sdk_version: '1.4.0', node_version: process.versions.node, pricing: 'unknown', context_window: p.context_window, max_tokens: p.max_tokens, reasoning_effort: p.reasoning_effort, bounds_source: 'client_configuration', capability_admission: 'unverified' } };
+    if (frame.session_feedback) {
+      // The proposal is settled, but its original in-memory session remains owned
+      // until the host decides whether this is the final refinement round.
+      clearTimeout(timer);
+      synthesisRequestCount = requests.length;
+      synthesisModelTurns = modelTurns;
+      const outcome = new Promise((resolve, reject) => { outcomeWaiter = { resolve, reject }; });
+      emit({ request_id: frame.request_id, ...completion });
+      const review = await outcome;
+      outcomeWaiter = undefined;
+      feedbackRequestId = review.request_id;
+      reviewPhase = true;
+      if (review.review_prompt !== null) {
+        settledEvent = false;
+        finalAssistant = undefined;
+        timer = setTimeout(() => stop('timeout'), p.timeout_seconds * 1000);
+        await session.prompt(review.review_prompt);
+        await session.waitForIdle();
+        nativeSession.checkpoint();
+        insist(!failure, failure);
+        insist(settledEvent && remoteSettled() && requests.length === synthesisRequestCount + 1,
+          'provider_unsettled');
+        insist(finalAssistant?.stopReason === 'stop', 'feedback_response_error');
+        const markdown = finalAssistant.content.filter(c => c.type === 'text').map(c => c.text).join('');
+        insist(text(markdown), 'empty_response');
+        completion = { type: 'feedback_complete', final_text: markdown, remote_settled: true,
+          tool_calls: 0, model_turns: modelTurns - synthesisModelTurns,
+          request_count: requests.length - synthesisRequestCount, usage: reportedUsage(synthesisRequestCount) };
+      } else {
+        completion = { type: 'feedback_complete', final_text: '', remote_settled: true,
+          tool_calls: 0, model_turns: 0, request_count: 0, usage: null };
+      }
+    }
   } catch (error) {
     if (validStart && !(error instanceof SafeError)) {
       try { diagnosticError('adapter_error', error); }
@@ -567,9 +614,13 @@ async function run(frame, options, keyPromise) {
     try { closeDiagnostics(); } catch (error) { failure = error.code; }
     if (runtime) { try { await runtime.removeRuntimeApiKey(PROVIDER_ID); } catch { failure ??= 'cleanup_error'; } }
     finished = true;
-    const terminal = failure ? { type: 'turn_failed', error_code: failure, remote_settled: remoteSettled(), retry_after_seconds: retryAfter, http_status: httpStatus, request_count: requests.length } : completion;
-    try { emit({ request_id: frame.request_id, ...terminal }); }
-    catch { emit({ request_id: frame.request_id, type: 'turn_failed', error_code: 'resource_limit', remote_settled: remoteSettled(), retry_after_seconds: null, http_status: httpStatus, request_count: requests.length }); }
+    const failed = code => feedbackRequestId
+      ? { type: 'feedback_failed', error_code: code, remote_settled: remoteSettled(), request_count: requests.length - synthesisRequestCount,
+          model_turns: modelTurns - synthesisModelTurns, tool_calls: 0, usage: reportedUsage(synthesisRequestCount) }
+      : { type: 'turn_failed', error_code: code, remote_settled: remoteSettled(), retry_after_seconds: retryAfter, http_status: httpStatus, request_count: requests.length };
+    const terminal = failure ? failed(failure) : completion;
+    try { emit({ request_id: feedbackRequestId ?? frame.request_id, ...terminal }); }
+    catch { emit({ request_id: feedbackRequestId ?? frame.request_id, ...failed('resource_limit') }); }
     process.stdin.destroy();
     // No lingering SDK telemetry/background handles may extend the credential worker lifetime.
     process.exitCode = failure ? 1 : 0;
@@ -585,7 +636,15 @@ function receive(frame, options, keyPromise) {
     return;
   }
   insist(frame.run_id === start.run_id);
-  if (frame.type === 'cancel') {
+  if (frame.type === 'host_outcome') {
+    exactKeys(frame, ['protocol_version', 'run_id', 'request_id', 'type', 'review_prompt']);
+    insist(start.session_feedback && outcomeWaiter && !failure && !usedIds.has(frame.request_id));
+    insist(frame.review_prompt === null || (text(frame.review_prompt) && Buffer.byteLength(frame.review_prompt) <= 65536));
+    usedIds.add(frame.request_id);
+    outcomeWaiter.resolve(frame);
+    // Reject duplicate host outcomes before the awaiting continuation runs.
+    outcomeWaiter = undefined;
+  } else if (frame.type === 'cancel') {
     exactKeys(frame, ['protocol_version', 'run_id', 'request_id', 'type']);
     insist(!usedIds.has(frame.request_id));
     usedIds.add(frame.request_id);

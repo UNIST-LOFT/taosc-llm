@@ -52,12 +52,19 @@ async def _kill(process) -> None:
 
 
 async def run_adapter(context: SynthesisContext, provider: ProviderConfig,
-                      command: list[str], run_id: str, journal: Path) -> dict:
-    """Validate the terminal frame and worker exit; drain cancellation before killing."""
+                      command: list[str], run_id: str, journal: Path, *, on_complete=None) -> dict:
+    """Own one SDK worker through synthesis and optional final-outcome review.
+
+    on_complete receives the settled synthesis terminal while the original session
+    stays live. Its awaited host work is outside the provider deadline; return a
+    bounded review prompt or None to release a nonfinal round without a model call.
+    Feedback metadata is separate and cannot replace the synthesis terminal.
+    """
     process = None
     terminal = None
     seen = set()
-    inspected = False
+    # The initial prompt already supplies the frozen model-safe projection.
+    inspected = bool(context.projection)
     checked = set()
     request_id = uuid.uuid4().hex
     read_fd, write_fd = os.pipe()
@@ -128,11 +135,13 @@ async def run_adapter(context: SynthesisContext, provider: ProviderConfig,
                 if frame["type"] in ("turn_complete", "turn_failed"):
                     result = final(frame)
                     record("adapter", frame)
+                    result["host_inspected_context"] = inspected
+                    result["host_checked_predicates"] = sorted(checked)
+                    if on_complete is not None and frame["type"] == "turn_complete":
+                        return result
                     await process.wait()
                     if process.returncode != (0 if frame["type"] == "turn_complete" else 1):
                         raise AdapterError("adapter exit disagrees with terminal frame")
-                    result["host_inspected_context"] = inspected
-                    result["host_checked_predicates"] = sorted(checked)
                     return result
                 if (frame["type"] != "tool_request" or set(frame) != {
                         *envelope, "request_id", "type", "context_id", "tool", "arguments"}
@@ -159,15 +168,15 @@ async def run_adapter(context: SynthesisContext, provider: ProviderConfig,
                 await send({**envelope, "type": "tool_result", "request_id": frame["request_id"], "result": result})
 
         async def cancel_and_drain():
-            nonlocal terminal
             assert process is not None and process.stdout is not None
             try:
                 await send({**envelope, "type": "cancel", "request_id": uuid.uuid4().hex})
                 # Do not service more model work after cancellation.
                 while True:
                     frame = receive(await process.stdout.readline())
-                    if frame["type"] in ("turn_complete", "turn_failed"):
-                        terminal = final(frame)
+                    if frame["type"] in ("turn_complete", "turn_failed", "feedback_complete", "feedback_failed"):
+                        if frame["type"].startswith("turn_"):
+                            final(frame)
                         record("adapter", frame)
                         await process.wait()
                         return
@@ -193,11 +202,62 @@ async def run_adapter(context: SynthesisContext, provider: ProviderConfig,
                 pipe.write(key_bytes)
             await send({**envelope, "type": "start_turn", "request_id": request_id,
                         "provider": provider.public_dict(), "context_id": context.context_id,
-                        "system_prompt": context.system_prompt(), "user_prompt": context.initial_prompt(),
+                        "system_prompt": context.system_prompt(),
+                        "user_prompt": (context.initial_prompt() + "\nHost client budgets (not provider maxima): "
+                            + json.dumps({key: getattr(provider, key) for key in (
+                                "context_window", "max_tokens", "timeout_seconds", "max_turns", "max_tool_calls")})
+                            + ". Synthesis phase: inspect the supplied inline evidence; evaluate the exact final predicate."
+                            + (" After the host outcome, a separate tool-free Markdown review may be requested in this session."
+                               if on_complete is not None else "")),
+                        **({"session_feedback": True} if on_complete is not None else {}),
                         "tools": context.tool_definitions(), "private_dir": private,
                         "session_path": str(journal.with_suffix(".pi.jsonl").absolute()),
                         "error_dir": str(journal.with_suffix(".errors").absolute())})
             terminal = await asyncio.wait_for(conversation(), timeout=provider.timeout_seconds + 20)
+            if on_complete is not None and terminal["type"] == "turn_complete":
+                # Native build/evaluation is host work, outside the provider deadline.
+                prompt = await on_complete(terminal)
+                feedback_id = uuid.uuid4().hex
+                try:
+                    await send({**envelope, "type": "host_outcome", "request_id": feedback_id,
+                                "review_prompt": prompt})
+                    assert process.stdout is not None
+                    frame = receive(await asyncio.wait_for(process.stdout.readline(), provider.timeout_seconds + 20))
+                    record("adapter", frame)
+                    common = {*envelope, "type", "request_id", "remote_settled", "request_count",
+                              "model_turns", "tool_calls", "usage"}
+                    fields = {"final_text"} if frame["type"] == "feedback_complete" else {"error_code"}
+                    if (frame["request_id"] != feedback_id or set(frame) != common | fields
+                            or frame["type"] not in ("feedback_complete", "feedback_failed")
+                            or type(frame["remote_settled"]) is not bool
+                            or type(frame["request_count"]) is not int
+                            or frame["request_count"] < 0
+                            or type(frame["model_turns"]) is not int or not 0 <= frame["model_turns"] <= 1
+                            or type(frame["tool_calls"]) is not int or frame["tool_calls"] != 0
+                            or (frame["type"] == "feedback_failed" and (
+                                not isinstance(frame["error_code"], str)
+                                or not re.fullmatch(r"[a-z_]+", frame["error_code"])))
+                            or (frame["type"] == "feedback_complete" and (
+                                not frame["remote_settled"] or not isinstance(frame["final_text"], str)
+                                or (prompt is not None and not frame["final_text"].strip())))):
+                        raise AdapterError("invalid feedback terminal frame")
+                    await asyncio.wait_for(process.wait(), 15)
+                    if process.returncode != (0 if frame["type"] == "feedback_complete" else 1):
+                        raise AdapterError("adapter exit disagrees with feedback frame")
+                    if prompt is not None:
+                        terminal["session_feedback"] = frame
+                except (OSError, ValueError, TimeoutError, AdapterError, asyncio.CancelledError) as error:
+                    if process.returncode is None:
+                        try:
+                            await asyncio.wait_for(cancel_and_drain(), 15)
+                        except (OSError, ValueError, TimeoutError, AdapterError, asyncio.CancelledError):
+                            pass
+                    # Proposal/build/evaluation have settled. Review cannot replace their verdict.
+                    terminal["session_feedback"] = {"type": "feedback_failed",
+                        "error_code": "cancelled" if isinstance(error, asyncio.CancelledError)
+                            else "timeout" if isinstance(error, TimeoutError) else "feedback_transport_error",
+                        "remote_settled": False, "request_count": None,
+                        "model_turns": None, "tool_calls": 0, "usage": None}
             return terminal
         except BaseException:
             if process is not None and process.returncode is None:

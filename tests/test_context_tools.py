@@ -27,8 +27,36 @@ def make_dataset(root, *, count=2, patch_format="ERM generic", binradar_run=None
         path = workdir / name
         path.write_bytes(data)
         artifacts[name] = {"path": "workdir/" + name, "sha256": digest(data)}
-    analysis = root / "instructions.txt"
-    analysis.write_text("é" * 10000)
+    analysis_records = []
+    procedure = {"address": "0x1000", "body": {"available": True,
+                 "ranges": [{"start": "0x1000", "end": "0x11ff"}]}}
+    extent = {"entry": 4096, "start": 4096, "end": 4608,
+              "ranges": [{"start": 4096, "end": 4608}], "confidence": "ghidra-function-body",
+              "address_domain": "elf-va"}
+    def evidence(operation, address, normalized):
+        return {"ok": True, "data": {"subject": {"digest": {"sha256": artifacts["fixture.orig"]["sha256"]}},
+            "provider": {"id": "ghidra", "version": "12.1"}, "operation": operation,
+            "parameters": {"address" if operation in ("resolve_containing_procedure", "xrefs") else "procedure": hex(address)},
+            "normalized_result": normalized}}
+    for role, address in (("patch", 4096), ("destination", 4097)):
+        resolution = evidence("resolve_containing_procedure", address,
+            {"query_address": hex(address), "found": True, "procedure": procedure})
+        for view in ("instructions", "decompilation", "references"):
+            path = root / (role + "-" + view + ".json")
+            operation = {"instructions": "read_function_instructions", "decompilation": "analyze_function", "references": "xrefs"}[view]
+            normalized = ({"procedure": procedure, "instructions": [hex(4096 + i) + ": NOP" for i in range(512)]}
+                if view == "instructions" else {"procedure": procedure, "pseudocode": "\n".join("  /* é */ step_" + str(i) + "();" for i in range(500)),
+                    "facet_availability": {"pseudocode": {"available": True}}} if view == "decompilation" else ["0x1002"])
+            record = {"function_id": role, "view": view, "path": path.name, "availability": "available",
+                "reason": None, "complete": True, "backend": "ghidra", "backend_version": "12.1",
+                "range": extent, "requested_address": address, "analysis_address": address if view == "references" else 4096,
+                "artifact_sha256": artifacts["fixture.orig"]["sha256"]}
+            payload = {"metadata": record, "resolution": resolution,
+                       "evidence": evidence(operation, record["analysis_address"], normalized)}
+            if view == "decompilation":
+                payload["value"] = normalized["pseudocode"]
+            path.write_bytes(canonical(payload))
+            analysis_records.append({**record, "sha256": digest(path.read_bytes())})
     capture = root / "state.brch"
     capture.write_bytes(predicates.CACHED_SNAPSHOT_HEADER.pack(
         predicates.CACHED_SNAPSHOT_MAGIC, 1, 0, 0, 0, 2 if cwe805 else 0)
@@ -47,9 +75,7 @@ def make_dataset(root, *, count=2, patch_format="ERM generic", binradar_run=None
                 "patch": {"location": 4096, "destination": 4097, "address_domain": "elf-va"},
                 "artifacts": artifacts, "sources": {"concrete_run": concrete_run,
                                                    "binradar_run": None if binradar_run is None else str(binradar_run)},
-                "analysis": [{"function_id": "function:patch", "view": "instructions", "path": "instructions.txt",
-                              "sha256": digest(analysis.read_bytes()), "availability": "available", "reason": None,
-                              "complete": True, "backend": "fixture-static", "backend_version": "1"}],
+                "analysis": analysis_records,
                 "cases": {"path": "cases.jsonl", "sha256": digest(case_path.read_bytes())}}
     from taosc_llm.dataset import canonical as dataset_canonical
     manifest["dataset_id"] = digest(dataset_canonical(manifest))
@@ -87,7 +113,7 @@ def test_dataset_identity_and_private_projection(context):
 
 @pytest.mark.parametrize('name,args', [
     ('get_patch_context', {}),
-    ('get_function_analysis', {'function_id': 'function:patch', 'view': 'instructions'}),
+    ('get_function_analysis', {'procedure_id': 'procedure:0x1000', 'view': 'instructions'}),
     ('list_cases', {'domain': 'all'}),
     ('get_case', {'case_id': 'function:0'}),
     ('evaluate_predicate', {'predicate': '0'}),
@@ -133,7 +159,7 @@ def test_parallel_tool_evaluation_does_not_share_validation_scope(context, monke
             release.set()
         first = running.result(timeout=10)
     assert first['ok'] is True
-    assert first['cases']['items'][0]['branches'] == [0]
+    assert first['cases']['items'][0]['activation']['status'] == 'not_fired'
     assert context.dataset is original
 
 
@@ -171,22 +197,30 @@ def test_unavailable_result_capture_rejects_state_and_cursor(context):
     context._results["unavailable-result"] = {"cases": [{"case_id": "function:0", "capture": None}]}
     args = {"case_id": "function:0", "result_id": "unavailable-result"}
     unavailable = query(context, "get_case", **args)
-    assert unavailable["ok"] and unavailable["availability"] == "unavailable"
+    assert unavailable["ok"] and unavailable["state_capture"]["status"] == "unavailable"
     assert "zero_hits" not in unavailable
     prepared = query(context, "get_case", case_id="function:0")
     state_id = prepared["states"]["items"][0]["state_id"]
     assert query(context, "get_case", **args, state_id=state_id)["error"]["code"] == "out_of_scope"
     assert query(context, "get_case", **args, cursor="malformed")["error"]["code"] == "invalid_cursor"
-    analysis = query(context, "get_function_analysis", function_id="function:patch", view="instructions")
+    analysis = query(context, "get_function_analysis", procedure_id="procedure:0x1000", view="decompilation")
     assert query(context, "get_case", **args, cursor=analysis["next_cursor"])["error"]["code"] == "invalid_cursor"
 
 
 def test_analysis_pagination_and_cursor_scope(context):
-    first = query(context, "get_function_analysis", function_id="function:patch", view="instructions")
+    first = query(context, "get_function_analysis", procedure_id="procedure:0x1000", view="decompilation")
     assert len(first["text"].encode()) <= 8192 and first["truncated"]
-    second = query(context, "get_function_analysis", function_id="function:patch", view="instructions", cursor=first["next_cursor"])
-    assert second["byte_offset"] == len(first["text"].encode())
-    assert query(context, "list_cases", domain="all", cursor=first["next_cursor"])["error"]["code"] == "invalid_cursor"
+    pages = [first["text"]]
+    current = first
+    while current["next_cursor"]:
+        current = query(context, "get_function_analysis", procedure_id="procedure:0x1000",
+                        view="decompilation", cursor=current["next_cursor"])
+        assert current["ok"]
+        pages.append(current["text"])
+    assert "".join(pages) == "\n".join("  /* é */ step_" + str(i) + "();" for i in range(500))
+    wrong = query(context, "list_cases", domain="all", cursor=first["next_cursor"])
+    assert wrong["error"]["code"] == "invalid_cursor"
+    assert "decompilation" in wrong["error"]["message"] and "cases" in wrong["error"]["message"]
 
 
 def test_large_dataset_pages_not_global_cap(tmp_path):
@@ -194,7 +228,7 @@ def test_large_dataset_pages_not_global_cap(tmp_path):
     first = query(context, "list_cases", domain="all")
     assert first["total"] == 1100 and len(first["items"]) == 32
     second = query(context, "list_cases", domain="all", cursor=first["next_cursor"])
-    assert second["items"][0]["id"] == "function:32"
+    assert second["items"][0]["case_id"] == "function:32"
 
 
 @pytest.mark.parametrize("expression", ["", "rax &&", "rax; return 1", "rip == 0", "0xff"])

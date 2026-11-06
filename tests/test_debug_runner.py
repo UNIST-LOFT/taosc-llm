@@ -225,6 +225,17 @@ def test_non_file_workdir_format_does_not_fall_back(tmp_path):
     assert not (tmp_path / "out").exists()
 
 
+@pytest.mark.parametrize("flags", [("--session-feedback", "--no-llm"),
+                                    ("--session-feedback", "--only-concrete")])
+def test_session_feedback_requires_provider_before_work(tmp_path, flags):
+    process = preparation_runner(tmp_path, 'touch "$CHILD_FILE"; exit 9', rea=None, flags=flags)
+    stdout, stderr = process.communicate(timeout=10)
+    assert process.returncode == 2, (stdout, stderr)
+    assert "--session-feedback requires provider synthesis" in stderr
+    assert not (tmp_path / "child").exists()
+    assert not (tmp_path / "out").exists()
+
+
 def test_concrete_modes_are_mutually_exclusive_before_work(tmp_path):
     process = preparation_runner(
         tmp_path, 'touch "$CHILD_FILE"; exit 9', rea=None,

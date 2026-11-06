@@ -42,7 +42,11 @@ Instructions and address references are frozen before the function dossier;
 pseudocode is extracted from that same dossier without a second decompile.
 Timeout cancellation retires the session, awaits REA's detached-backend cleanup,
 and leaves completed views intact; it does not repeat cold startup for each
-missing view. Unavailable/partial views stay explicitly unavailable. `prepared`
+missing view. Model context lists each canonical procedure once, binds patch and
+destination as site roles, and supplies bounded instruction windows and exact-site
+references. Available facets survive unrelated partial dossier relationships;
+limitations remain explicit. Decompilation pages contain actual pseudocode (up to
+120 lines/8192 UTF-8 bytes), never the raw dossier. `prepared`
 means dataset publication, not that all static views succeeded. Inspect
 `manifest.json`'s `analysis` entries before relying on that context.
 
@@ -213,8 +217,12 @@ Pi SDK 1.4.0 receives exactly seven restricted host tools:
 evaluation of concrete cases and, when the trusted host configured a replay
 bridge, of loaded function cases as well. No shell, arbitrary file access, debugger, built-in tools,
 extensions, MCP, REA invocation or subagents are exposed. REA views were frozen at
-setup. Candidate proposals require context inspection and evaluation of the exact
-expression. Strict response parsing, native builds and actual evaluation feedback
+setup. Inline context satisfies context availability; `get_patch_context` is optional.
+Candidate proposals require evaluation of the exact expression. Results separate
+original/neutral/candidate outcomes, fixed domain oracles, actual activation and
+capture availability. Eight noteworthy cases expose counterexamples, control gaps,
+transitions and distinct unknown reasons; `list_cases` supports structured filters
+and explicit-feature similarity without new execution authority. Strict response parsing, native builds and actual evaluation feedback
 feed bounded refinement rounds (`--max-rounds` 1–16, default 4, provider-only);
 manual mode rejects provider options instead of ignoring them. Abstention stops
 without a candidate. No final BinRadar verification is run.
@@ -234,6 +242,30 @@ omitted/default behavior are in the [provider configuration contract](../../agen
 this is not a CLI option or an ambient environment override. Guix supplies its
 SDK root automatically.
 
+### Evaluate the original session after its result
+
+Add `--session-feedback` to provider synthesis (or `run.sh`):
+
+```sh
+uv run --project utils/taosc-llm taosc-llm \
+  --dataset /path/to/new-dataset --provider-env /absolute/path/to/provider.env \
+  --pi-sdk-root utils/taosc-llm/thirdparty/pi \
+  --output /path/to/model-runs --session-feedback
+```
+
+After the final host result is persisted, the **same live Pi SDK session** receives
+that result and a tool-free review request. It evaluates its prompts, tool calls,
+evidence interpretation and workflow; it cannot change the candidate or host verdict.
+The final run directory contains private `session-feedback.md`, with separate
+status/usage/request/settlement metadata in `run.json.session_feedback`. Review gets
+one model response and a fresh configured timeout, not another synthesis loop.
+Failure is recorded separately and leaves the settled result intact. Manual mode
+rejects the flag. It is disabled by default and consumes an additional provider
+request when used; this self-review is not independent correctness verification.
+
+This preserves the original custom tool history unlike `pi --session` reopening,
+which does not restore the taosc host. See the [review lifecycle and limits](../../agent-docs/taosc-llm/PROVIDER_AND_PI.md#optional-post-result-session-feedback).
+
 ### Results and artifacts
 
 Stdout contains one JSON result; diagnostics go to stderr. Common CLI exits:
@@ -250,6 +282,10 @@ Stdout contains one JSON result; diagnostics go to stderr. Common CLI exits:
 `warmed` status. Rejection takes precedence over unavailable cases; absent any
 rejection, any unavailable case (or no cases) makes the aggregate unavailable.
 `not_rejected` only means admitted observations did not reject this candidate.
+These are host/CLI statuses. Model tools instead expose direct case outcomes and
+aggregate `rejects_target|observed|unknown`; `report_summary` separates actual firing,
+neutral transitions, capture gaps and oracle warnings. Offline predictions are not
+actual activity, and other-crash is not normal termination.
 With `--replay-socket`, a result also carries a `replay` block (endpoint,
 coverage, mutation count, unavailable count). The endpoint never enters the
 model projection or a tool result, and it is not a patch field.
@@ -290,7 +326,7 @@ checked = evaluate_dataset(dataset, "rax <= 0", workers=4, execute=False)
 manual = generate_manual(dataset.root, "rax <= 0", execution_workers=4)
 proposed = generate_with_pi(dataset.root, Path("provider.env"),
                            sdk_root=Path("utils/taosc-llm/thirdparty/pi"),
-                           execution_workers=4, max_rounds=4)
+                           execution_workers=4, max_rounds=4, session_feedback=True)
 ```
 
 ### Inspecting model sessions
@@ -403,7 +439,7 @@ without falling back to an arbitrary store entry or ambient `rea` shim.
 
 Options: `--subject DIR`, `--workdir NAME`, `--outdir DIR`, `--rea PATH`,
 `--timeout SECONDS`, `--ready-timeout SECONDS`, `--predicate`, `--no-llm`,
-`--provider-env FILE`, `--skip-concrete`, `--only-concrete`. Relative subject/output
+`--provider-env FILE`, `--session-feedback`, `--skip-concrete`, `--only-concrete`. Relative subject/output
 paths are made absolute before changing cwd, without expanding user-provided symlinks. The default layout is:
 
 ```text

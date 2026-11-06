@@ -1,6 +1,7 @@
 """Identity-bound offline inference and independent concrete candidate evaluation.
 
-Results intentionally say only rejected, not rejected, or unavailable: neither
+Host rejection statuses remain rejected, not rejected, or unavailable. Attached
+reports distinguish outcomes, neutral controls and actual activation; neither
 branch equivalence nor a normal process exit is a claim of repair verification.
 """
 from __future__ import annotations
@@ -252,7 +253,8 @@ def _case_result(dataset, case, candidate, descriptor, execute, root, base_ident
                  metadata, producer):
     base = {'case_id': case['id'], 'domain': case['domain'], 'source': 'unavailable',
             'status': 'unavailable', 'reason': 'capture-unavailable', 'branches': None,
-            'offline_branches': None, 'first_divergence': None}
+            'descriptor': descriptor, 'offline_branches': None, 'first_divergence': None,
+            'offline_reference': None}
     if candidate is not None and candidate.required_stack_bytes > metadata.stack_bytes:
         return {**base, 'reason': 'candidate-stack-unavailable'}
     identity = {**base_identity, 'input': case.get('input_sha256'), 'case': case['id'],
@@ -284,11 +286,14 @@ def _case_result(dataset, case, candidate, descriptor, execute, root, base_ident
                     raise ValueError('representative-evaluator-mismatch')
                 branches = _vector(descriptor, snapshots)
                 base['offline_branches'] = branches
+                base['offline_reference'] = capture
                 divergence = next((i for i, (a, b) in enumerate(zip(branches, actual)) if a != b), None)
                 base['first_divergence'] = divergence
                 if branches != actual:
                     base['reason'] = 'branch-divergence'
                     continue
+                base['reuse'] = ('exact-descriptor' if descriptor == capture['descriptor']
+                                 else 'full-vector-equivalent')
                 if 2 in branches:
                     return {**base, 'source': source, 'branches': branches,
                             'reason': 'predicate-trap', 'outcome': capture.get('outcome'), 'capture': capture}
@@ -305,7 +310,7 @@ def _case_result(dataset, case, candidate, descriptor, execute, root, base_ident
             # Save actual executions even when BRCH is unavailable. Such entries
             # are diagnostic only and never become reusable branch evidence.
             _atomic(record_path, {'identity': identity, 'capture': capture})
-            base.update(source='executed', branches=capture.get('branches'),
+            base.update(source='executed', reuse='fresh', branches=capture.get('branches'),
                         outcome=capture.get('outcome'), capture=capture)
             snapshots = _validated_snapshots(dataset, capture, metadata)
             if _vector(descriptor, snapshots) != capture['branches']:
@@ -392,9 +397,20 @@ def _evaluate(dataset, candidate, descriptor, *, case_ids, workers, execute, cac
                 if any(case['domain'] == 'system'
                        and type(case.get('source', {}).get('case_id')) is int
                        for case in cases) else None)
-    def evaluate(case):
-        return _case_result(dataset, case, candidate, descriptor, execute, root,
+    def neutral_baseline(case):
+        # Finish the p0 operation before taking the candidate lock. Equal keys
+        # (warming/neutral candidates) must never recursively acquire flock.
+        return _case_result(dataset, case, None, 'p0', execute, root,
                             base_identity, metadata, producer)
+
+    def evaluate(case):
+        neutral = neutral_baseline(case)
+        item = (dict(live[case['id']]) if case['id'] in live else
+                neutral.copy() if descriptor == 'p0' else
+                _case_result(dataset, case, candidate, descriptor, execute, root,
+                             base_identity, metadata, producer))
+        item['neutral_baseline'] = neutral
+        return item
     live = {}
     replay_result = None
     if use_replay:
@@ -402,11 +418,13 @@ def _evaluate(dataset, candidate, descriptor, *, case_ids, workers, execute, cac
                                          case_ids=sorted(c['id'] for c in live_cases),
                                          socket_path=replay_socket)
         live = {item['case_id']: item for item in replay_result['cases']}
-    concrete = [case for case in cases if case['id'] not in live]
     with ThreadPoolExecutor(max_workers=workers) as pool:
         evaluated = {item['case_id']: item
-                     for item in pool.map(evaluate, concrete)}
-    results = [live.get(case['id']) or evaluated[case['id']] for case in cases]
+                     for item in pool.map(evaluate, cases)}
+    from .evidence import _project_case, summarize_reports
+    results = [evaluated[case['id']] for case in cases]
+    for case, item in zip(cases, results):
+        item['report'] = _project_case(dataset, case, item, metadata=metadata, descriptor=descriptor)
     counts = {status: sum(c['status'] == status for c in results)
               for status in ('reject_same_crash', 'not_rejected', 'unavailable')}
     status = ('reject_same_crash' if counts['reject_same_crash'] else
@@ -414,7 +432,9 @@ def _evaluate(dataset, candidate, descriptor, *, case_ids, workers, execute, cac
     result = {'dataset_id': dataset.dataset_id, 'candidate_id': _digest({'base': base_identity, 'descriptor': descriptor}),
               'predicate': candidate.expression if candidate is not None else None,
               'descriptor': descriptor, 'status': status, 'verified': False,
-              'cases': results, 'summary': {'total': len(results), **counts}}
+              'cases': results, 'summary': {'total': len(results), **counts},
+              'evaluation_mode': 'host' if execute else 'offline',
+              'report_summary': summarize_reports(item['report'] for item in results)}
     if replay_result is not None:
         result['replay'] = replay_result['replay']
         result['candidate_id'] = _digest({'base': base_identity,

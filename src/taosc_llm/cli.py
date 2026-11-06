@@ -72,11 +72,13 @@ def main(argv: list[str] | None = None) -> int:
         "--cache-dir", type=Path,
         help=("host-owned evaluation cache shared with taosc-llm-evaluate; default "
               "is private to each run directory"))
+    parser.add_argument("--session-feedback", action="store_true",
+                        help="review the final host result in the original provider session; saves private session-feedback.md")
     parser.add_argument("--base-url")
     parser.add_argument("--model")
     args = parser.parse_args(arguments)
-    if args.predicate is not None and any(value is not None for value in (
-            args.pi_sdk_root, args.base_url, args.model, args.max_rounds)):
+    if args.predicate is not None and (args.session_feedback or any(value is not None for value in (
+            args.pi_sdk_root, args.base_url, args.model, args.max_rounds))):
         parser.error("provider options require --provider-env")
 
     def execute():
@@ -90,7 +92,7 @@ def main(argv: list[str] | None = None) -> int:
                                 sdk_root=args.pi_sdk_root, base_url=args.base_url, model=args.model,
                                 execution_workers=args.execution_workers, max_rounds=4 if args.max_rounds is None else args.max_rounds,
                                 output=args.output, replay_socket=args.replay_socket,
-                                cache_dir=args.cache_dir)
+                                cache_dir=args.cache_dir, session_feedback=args.session_feedback)
     return _run("taosc-llm", execute)
 
 

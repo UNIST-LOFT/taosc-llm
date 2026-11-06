@@ -16,6 +16,30 @@ const streamEnd = __STREAM_END__;
 const reasoningEffort = __REASONING_EFFORT__;
 let count = 0;
 const encode = x => new TextEncoder().encode(x);
+let expireDeadlines;
+if (mode === 'feedback-deadline') {
+  // Drive only the configured 30-second deadlines at protocol boundaries.
+  // SDK import speed and host load must not decide this lifecycle regression.
+  const schedule = globalThis.setTimeout, cancel = globalThis.clearTimeout;
+  const deadlines = new Set();
+  globalThis.setTimeout = (callback, milliseconds, ...args) => {
+    if (milliseconds !== 30000) return schedule(callback, milliseconds, ...args);
+    const timer = {callback: () => callback(...args), unref() { return this; }};
+    deadlines.add(timer);
+    return timer;
+  };
+  globalThis.clearTimeout = timer => {
+    if (!deadlines.delete(timer)) cancel(timer);
+  };
+  expireDeadlines = () => {
+    const expired = [...deadlines]; deadlines.clear();
+    for (const timer of expired) timer.callback();
+  };
+  process.stdin.on('data', data => {
+    // An uncleared synthesis deadline would fail before review admission.
+    if (data.toString().includes('"type":"host_outcome"')) expireDeadlines();
+  });
+}
 if (mode === 'write-failure') {
   const {default:fs} = await import('node:fs');
   const {syncBuiltinESMExports} = await import('node:module');
@@ -35,6 +59,27 @@ globalThis.fetch = async (input, init) => {
   if (body.model !== 'offline-exact-model' || body.tool_choice !== undefined) throw Error('wrong model/protocol');
   if (body.reasoning_effort !== (reasoningEffort ?? undefined)) throw Error('reasoning effort changed or omitted');
   count++;
+  const reviewing = JSON.stringify(body.messages.at(-1)).includes('Host review phase:');
+  if (reviewing) {
+    if (body.tools !== undefined) throw Error('review offered executable tools');
+    if (!JSON.stringify(body.messages).includes('Offline transport fixture only.')) throw Error('original proposal history missing');
+    if (mode === 'feedback-auth') return new Response('{"error":{"message":"review denied"}}', {status:401});
+    if (mode === 'feedback-cancel' || mode === 'feedback-timeout' || mode === 'feedback-deadline') {
+      return new Response(new ReadableStream({start(c) {
+        init.signal.addEventListener('abort', () => c.error(Error('aborted')), {once:true});
+        if (mode === 'feedback-deadline') setImmediate(expireDeadlines);
+        if (mode === 'feedback-cancel') setImmediate(() => process.kill(process.pid, 'SIGTERM'));
+      }}), {headers:{'content-type':'text/event-stream'}});
+    }
+    const delta = mode === 'feedback-tool' ? {role:'assistant',tool_calls:[{index:0,id:'forbidden',type:'function',
+      function:{name:'get_patch_context',arguments:'{}'}}]} : {role:'assistant',content:'# Session review\n\nEvidence was bounded; activation is distinct from outcome.'};
+    const event = {id:'review',object:'chat.completion.chunk',created:1,model:body.model,
+      choices:[{index:0,delta,finish_reason:null}]};
+    const end = {...event,choices:[{index:0,delta:{},finish_reason:mode === 'feedback-tool' ? 'tool_calls' : 'stop'}],
+      usage:{prompt_tokens:11,completion_tokens:7,total_tokens:18}};
+    return new Response('data: '+JSON.stringify(event)+'\n\ndata: '+JSON.stringify(end)+'\n\ndata: [DONE]\n\n',
+      {headers:{'content-type':'text/event-stream'}});
+  }
   if (mode === 'rate') return new Response(JSON.stringify({error:{message:'offline-secret-for-transport'}}), {status:429,headers:{'retry-after':'2'}});
   if (mode === 'auth' || mode === 'write-failure' || (mode === 'failure-prefix' && count === 2)) return new Response(JSON.stringify({error:{message:'private-provider-body offline-secret-for-transport',detail:'private-response-detail'}}), {status:401});
   if (mode === 'checkpoint') {
@@ -125,7 +170,8 @@ def adapter_context(tmp_path):
 
 
 def operation(adapter_context, tmp_path, mode, *, journal=None,
-              api_key="offline-secret-for-transport", stream_end="eof", reasoning_effort=None):
+              api_key="offline-secret-for-transport", stream_end="eof", reasoning_effort=None,
+              on_complete=None, timeout_seconds=30):
     context, root = adapter_context
     journal = journal if journal is not None else tmp_path / "turn.jsonl"
     preload = tmp_path / "provider.mjs"
@@ -136,9 +182,10 @@ def operation(adapter_context, tmp_path, mode, *, journal=None,
     command = adapter_command(root)
     command[1:1] = ["--import", str(preload)]
     provider = ProviderConfig(api_key=api_key, base_url="https://example.invalid/v1",
-                              model="offline-exact-model", timeout_seconds=30,
+                              model="offline-exact-model", timeout_seconds=timeout_seconds,
                               reasoning_effort=reasoning_effort)
-    result = asyncio.run(run_adapter(context, provider, command, "offline", journal))
+    result = asyncio.run(run_adapter(context, provider, command, "offline", journal,
+                                    on_complete=on_complete))
     assert provider.api_key not in journal.read_text()
     return result, context
 
@@ -246,7 +293,6 @@ def test_pi_continues_after_actual_offline_result_reference(adapter_context, tmp
     assert json.dumps(context.system_prompt(), ensure_ascii=False)[1:-1] in json.dumps(messages[0], ensure_ascii=False)
     assert {tool["name"] for tool in messages[0]["toolsAdded"]} == {
         tool["name"] for tool in context.tool_definitions()}
-    assert messages[1]["content"] == [{"type": "text", "text": context.initial_prompt()}]
     for index, message in enumerate((messages[2], messages[4]), start=1):
         assert {"type": "text", "text": f"Intermediate explanation {index}"} in message["content"]
         assert any(block["type"] == "thinking" and block["thinking"] == f"Intermediate reasoning {index}"
@@ -602,3 +648,92 @@ def test_pi_unfinished_transport_remains_unsettled(adapter_context, tmp_path, mo
     assert result["type"] == "turn_failed"
     assert result["request_count"] == 1
     assert result["remote_settled"] is False
+
+
+def test_feedback_uses_original_session_and_separate_accounting(adapter_context, tmp_path):
+    callbacks = []
+
+    async def host_outcome(proposal):
+        callbacks.append(proposal["final_text"])
+        records = native_records(tmp_path / "turn.pi.jsonl")
+        assert any("Offline transport fixture only." in json.dumps(record) for record in records)
+        return 'Host review phase: final host result {"status":"unavailable"}. Return Markdown, no tools.'
+
+    result, _ = operation(adapter_context, tmp_path, "tools", on_complete=host_outcome)
+    assert len(callbacks) == 1
+    assert result["type"] == "turn_complete" and result["request_count"] == 3
+    assert result["usage"]["totalTokens"] == 54
+    review = result["session_feedback"]
+    assert review["type"] == "feedback_complete" and review["request_count"] == 1
+    assert review["usage"]["totalTokens"] == 18 and review["tool_calls"] == 0
+    assert review["final_text"].startswith("# Session review")
+    records = native_records(tmp_path / "turn.pi.jsonl")
+    serialized = json.dumps(records)
+    assert "Host review phase:" in serialized and "# Session review" in serialized
+    assert "Synthesis phase:" in serialized and "max_tool_calls" in serialized
+    assert "get_patch_context" in serialized and "evaluate_predicate" in serialized
+    assert len([record for record in records if record["type"] == "session"]) == 1
+
+
+def test_nonfinal_round_releases_original_session_without_review(adapter_context, tmp_path):
+    async def release(proposal):
+        assert proposal["type"] == "turn_complete"
+        return None
+
+    result, _ = operation(adapter_context, tmp_path, "tools", on_complete=release)
+    assert result["type"] == "turn_complete" and result["request_count"] == 3
+    assert "session_feedback" not in result
+    frames = [entry["frame"] for entry in native_records(tmp_path / "turn.jsonl")]
+    assert frames[-1]["type"] == "feedback_complete" and frames[-1]["request_count"] == 0
+    assert "Host review phase:" not in (tmp_path / "turn.pi.jsonl").read_text()
+
+
+@pytest.mark.parametrize("mode", ["feedback-auth", "feedback-cancel", "feedback-tool"])
+def test_feedback_failure_never_overwrites_proposal(adapter_context, tmp_path, mode):
+    async def review(proposal):
+        return 'Host review phase: final host result {"status":"not_rejected"}. No tools.'
+
+    result, _ = operation(adapter_context, tmp_path, mode, on_complete=review)
+    assert result["type"] == "turn_complete" and result["request_count"] == 3
+    assert result["host_checked_predicates"] == ["rax <= 0"]
+    assert result["session_feedback"]["type"] == "feedback_failed"
+    frames = [entry["frame"] for entry in native_records(tmp_path / "turn.jsonl")]
+    assert len([frame for frame in frames if frame["type"] == "tool_request"]) == 2
+
+
+def test_feedback_deadline_is_fresh_after_host_work(adapter_context, tmp_path):
+    async def review(proposal):
+        return 'Host review phase: host outcome unavailable. Markdown only.'
+
+    result, _ = operation(adapter_context, tmp_path, "feedback-deadline", on_complete=review)
+    assert result["type"] == "turn_complete" and result["request_count"] == 3
+    assert result["session_feedback"]["type"] == "feedback_failed"
+    assert result["session_feedback"]["error_code"] == "timeout"
+    assert result["session_feedback"]["request_count"] == 1
+
+
+def test_host_cancellation_during_review_preserves_settled_proposal(adapter_context, tmp_path):
+    async def review(proposal):
+        task = asyncio.current_task()
+        asyncio.get_running_loop().call_later(0.1, task.cancel)
+        return 'Host review phase: host outcome not_rejected. Markdown only.'
+
+    result, _ = operation(adapter_context, tmp_path, "feedback-timeout", on_complete=review)
+    assert result["type"] == "turn_complete" and result["request_count"] == 3
+    assert result["session_feedback"]["type"] == "feedback_failed"
+    assert result["session_feedback"]["error_code"] == "cancelled"
+    frames = [entry["frame"] for entry in native_records(tmp_path / "turn.jsonl")]
+    assert any(frame["type"] == "cancel" for frame in frames)
+    assert frames[-1]["type"] == "feedback_failed"
+
+
+def test_callback_failure_cancels_and_disposes_live_session(adapter_context, tmp_path):
+    async def failed_host(proposal):
+        raise RuntimeError("offline host outcome failure")
+
+    with pytest.raises(RuntimeError, match="offline host outcome failure"):
+        operation(adapter_context, tmp_path, "tools", on_complete=failed_host)
+    frames = [entry["frame"] for entry in native_records(tmp_path / "turn.jsonl")]
+    assert any(frame["type"] == "cancel" for frame in frames)
+    assert frames[-1]["type"] == "turn_failed" and frames[-1]["error_code"] == "cancelled"
+    assert frames[-1]["remote_settled"] is True

@@ -132,7 +132,7 @@ main() {
   SUBJECT=$REPO/benchmarks/loftix/binutils/CVE-2017-14745 # subject directory with config.env
   WORKDIR_NAME=workdir-0.1.24
   OUTDIR= TIMEOUT=7200 READY_TIMEOUT=0 PROVIDER_ENV=$TAOSC_LLM/.env PREDICATE= NO_LLM=0 REA=
-  SKIP_CONCRETE=0 ONLY_CONCRETE=0
+  SKIP_CONCRETE=0 ONLY_CONCRETE=0 SESSION_FEEDBACK=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --subject|--workdir|--outdir|--timeout|--ready-timeout|--provider-env|--predicate|--rea)
@@ -144,6 +144,7 @@ main() {
         esac
         shift 2 ;;
       --no-llm) NO_LLM=1; shift ;;
+      --session-feedback) SESSION_FEEDBACK=1; shift ;;
       --skip-concrete) SKIP_CONCRETE=1; shift ;;
       --only-concrete) ONLY_CONCRETE=1; shift ;;
       -h|--help)
@@ -151,7 +152,7 @@ main() {
 Usage: run.sh [--subject DIR] [--workdir NAME] [--outdir DIR]
               [--timeout SECONDS] [--ready-timeout SECONDS]
               [--skip-concrete | --only-concrete]
-              [--provider-env FILE | --no-llm --predicate PREDICATE] [--rea PATH]
+              [--provider-env FILE [--session-feedback] | --no-llm --predicate PREDICATE] [--rea PATH]
 Debug example: requires a prepared workdir. By default Guix builds/resolves the
 pinned REA runtime, including Java and Ghidra, at utils/taosc-llm/.guix-rea.
 --rea PATH overrides TAOSC_LLM_REA; either bypasses automatic Guix resolution.
@@ -171,6 +172,9 @@ HELP
       *) echo "unknown option: $1" >&2; return 2 ;;
     esac
   done
+  if [ "$SESSION_FEEDBACK" -eq 1 ] && { [ "$NO_LLM" -eq 1 ] || [ "$ONLY_CONCRETE" -eq 1 ]; }; then
+    echo "--session-feedback requires provider synthesis" >&2; return 2
+  fi
   if [ "$SKIP_CONCRETE" -eq 1 ] && [ "$ONLY_CONCRETE" -eq 1 ]; then
     echo "--skip-concrete and --only-concrete are mutually exclusive" >&2; return 2
   fi
@@ -296,6 +300,7 @@ HELP
   local mode_args=()
   if [ "$NO_LLM" -eq 1 ]; then mode_args=(--predicate "$PREDICATE"); else
     mode_args=(--provider-env "$PROVIDER_ENV" --pi-sdk-root "$TAOSC_LLM/thirdparty/pi" --max-rounds 4)
+    if [ "$SESSION_FEEDBACK" -eq 1 ]; then mode_args+=(--session-feedback); fi
   fi
   if run_uv "$TAOSC_LLM" taosc-llm --dataset "$DATASET" "${mode_args[@]}" \
     --execution-workers 4 --output "$RESULT" --replay-socket "$MUTATION_SOCKET" \

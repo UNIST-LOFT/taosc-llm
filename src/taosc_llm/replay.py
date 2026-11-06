@@ -13,8 +13,11 @@ mutation snapshot.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import socket
+import stat
 import sys
 import time
 from pathlib import Path
@@ -100,6 +103,7 @@ def _read_objects(socket_path: Path, payload: dict, *,
                 f"replay request failed: {socket_path}: {exc}") from exc
         data = bytearray()
         objects: list[dict] = []
+        received = 0
         while True:
             try:
                 chunk = connection.recv(65536)
@@ -113,7 +117,8 @@ def _read_objects(socket_path: Path, payload: dict, *,
             if not chunk:
                 break
             data.extend(chunk)
-            if len(data) > RESPONSE_LIMIT:
+            received += len(chunk)
+            if received > RESPONSE_LIMIT:
                 raise ReplayError(
                     f"replay response exceeds {RESPONSE_LIMIT} bytes")
             while b"\n" in data:
@@ -248,7 +253,7 @@ def validate_dataset(dataset, socket_path) -> tuple[Path, list[dict], dict]:
 
 
 def _validate_row(value: dict) -> dict:
-    _reject_extra(value, {"mutation", "patch", "source", "outcome", "reason"},
+    _reject_extra(value, {"mutation", "patch", "source", "outcome", "reason", "capture"},
                   "replay case")
     mutation = _integer(value.get("mutation"), positive=True, what="case mutation")
     if _integer(value.get("patch"), positive=True, what="case patch") != 1:
@@ -286,7 +291,79 @@ def _validate_done(value: dict) -> dict:
     return value
 
 
-def _case_result(row: dict) -> dict:
+def _capture(dataset, row: dict, candidate) -> dict | None:
+    """Authenticate the native-owned representative, not the caller's selector."""
+    from binradar.binradar_taosc_predicates import parse_cached_snapshots
+    from .evaluation import _capture_metadata, _validated_snapshots, _vector
+
+    identity = row.get("capture")
+    if row["outcome"] == "unavailable":
+        if identity is not None:
+            raise ReplayError("unavailable replay case carries candidate state")
+        return None
+    fields = {"mutation", "path", "sha256", "descriptor", "patch_id", "reuse"}
+    if not isinstance(identity, dict) or set(identity) != fields:
+        raise ReplayError("available replay case has no complete capture identity")
+    if type(identity["mutation"]) is not int or identity["mutation"] != row["mutation"]:
+        raise ReplayError("replay capture belongs to another mutation")
+    if type(identity["patch_id"]) is not int or identity["patch_id"] not in (0, 1):
+        raise ReplayError("replay capture has an unknown selector")
+    reuse = identity["reuse"]
+    if reuse not in ("fresh", "exact-descriptor", "full-vector-equivalent") or \
+            (row["source"] == "executed") != (reuse == "fresh"):
+        raise ReplayError("replay capture has inconsistent reuse provenance")
+    descriptor = identity["descriptor"]
+    digest = identity["sha256"]
+    if reuse == "fresh" and (identity["patch_id"] != 1 or descriptor != candidate.descriptor):
+        raise ReplayError("replay fresh capture does not identify the executed predicate")
+    if not isinstance(descriptor, str) or not descriptor or \
+            len(descriptor.encode("utf-8")) > 4095:
+        raise ReplayError("replay capture descriptor is invalid")
+    if not isinstance(digest, str) or len(digest) != 64 or \
+            any(c not in "0123456789abcdef" for c in digest):
+        raise ReplayError("replay capture digest is invalid")
+    raw_path = identity["path"]
+    if not isinstance(raw_path, str) or len(raw_path.encode("utf-8")) > 8192:
+        raise ReplayError("replay capture path is invalid")
+    try:
+        run = dataset_socket(dataset).parent.resolve(strict=True)
+        root = (run / "replay").resolve(strict=True)
+        path = Path(raw_path)
+        if not path.is_absolute() or root.parent != run or \
+                not path.resolve(strict=True).is_relative_to(root):
+            raise ReplayError("replay capture is outside the frozen run replay directory")
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= 64 * 1024 * 1024:
+                raise ReplayError("replay capture has invalid type or size")
+            payload = stream.read(64 * 1024 * 1024 + 1)
+        if len(payload) != info.st_size or hashlib.sha256(payload).hexdigest() != digest:
+            raise ReplayError("replay capture hash mismatch")
+        snapshots, error = parse_cached_snapshots(payload)
+        if error:
+            raise ValueError(error)
+        branches = [state.branch for state in snapshots]
+        if not branches or any(branch not in (0, 1) for branch in branches):
+            raise ValueError("replay-capture-incomplete-or-trapped")
+        metadata = _capture_metadata(dataset)
+        capture = {"path": str(path), "sha256": digest,
+                   "artifact_sha256": metadata.artifact_sha256,
+                   "descriptor": descriptor, "branches": branches,
+                   "complete": True, "patch_id": identity["patch_id"],
+                   "outcome": {"outcome": row["outcome"]},
+                   "same_crash": row["outcome"] == "target-crash"}
+        snapshots = _validated_snapshots(dataset, capture, metadata)
+        if _vector(descriptor, snapshots) != branches or \
+                _vector(candidate.descriptor, snapshots) != branches:
+            raise ValueError("replay-capture-vector-mismatch")
+        return capture
+    except (OSError, ValueError, KeyError, RuntimeError) as exc:
+        raise ReplayError(f"replay capture authentication failed: {exc}") from exc
+
+
+def _case_result(dataset, row: dict, candidate) -> dict:
+    capture = _capture(dataset, row, candidate)
     mutation = row["mutation"]
     outcome = row["outcome"]
     if outcome == "target-crash":
@@ -303,7 +380,9 @@ def _case_result(row: dict) -> dict:
         "source": row["source"],
         "status": status,
         "reason": reason,
-        "branches": None,
+        "branches": capture["branches"] if capture is not None else None,
+        "capture": capture,
+        "reuse": row["capture"]["reuse"] if capture is not None else None,
         "offline_branches": None,
         "first_divergence": None,
         "outcome": {"outcome": outcome},
@@ -336,6 +415,14 @@ def evaluate_replay(dataset, candidate, *, socket_path=None,
                     admission_timeout: float = ADMISSION_TIMEOUT,
                     response_timeout: float = RESPONSE_TIMEOUT) -> dict:
     """Evaluate one candidate over every retained mutation in the live snapshot."""
+    with dataset.validation() as validated:
+        return _evaluate_replay(validated, candidate, socket_path=socket_path,
+                                admission_timeout=admission_timeout,
+                                response_timeout=response_timeout)
+
+
+def _evaluate_replay(dataset, candidate, *, socket_path, admission_timeout,
+                     response_timeout):
     path, cases, _info = validate_dataset(
         dataset, dataset_socket(dataset) if socket_path is None else socket_path)
     if not cases:
@@ -374,10 +461,11 @@ def evaluate_replay(dataset, candidate, *, socket_path=None,
     if len(observed) != len(cases) or set(observed) != expected:
         raise ReplayError("replay mutation set does not match the frozen dataset")
     if terminal["cases"] != len(rows) or terminal["patches"] != 1 or \
-            terminal["mutations"] != len(cases):
+            terminal["mutations"] != len(cases) or \
+            terminal["unavailable"] != sum(row["outcome"] == "unavailable" for row in rows):
         raise ReplayError("replay terminal counts disagree with streamed cases")
     by_mutation = {row["mutation"]: row for row in rows}
-    results = [_case_result(by_mutation[int(case["id"].split(":", 1)[1])])
+    results = [_case_result(dataset, by_mutation[int(case["id"].split(":", 1)[1])], candidate)
                for case in cases]
     counts = {status: sum(item["status"] == status for item in results)
               for status in ("reject_same_crash", "not_rejected", "unavailable")}

@@ -123,7 +123,11 @@ def test_missing_or_partial_capture_requires_independent_execution(dataset, tmp_
     monkeypatch.setattr(evaluation, 'execute_capture', run)
     result = evaluation.evaluate_dataset(dataset, 'rax != 0', cache_dir=tmp_path / 'cache')
     assert calls == ['system:0']
-    assert result['cases'][0]['source'] == 'executed'
+    # The host collected a real neutral control, then reused its equal vector.
+    row = result['cases'][0]
+    assert row['neutral_baseline']['source'] == 'executed'
+    assert row['capture'] == row['neutral_baseline']['capture']
+    assert row['report']['activation']['status'] == 'not_fired'
 
 
 def test_owned_cache_reused_offline_and_environment_invalidates(dataset, tmp_path, monkeypatch):

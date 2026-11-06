@@ -77,6 +77,10 @@ def test_prepares_original_rows_and_revision_isolation(tmp_path, family):
     assert case["source"]["case_id"] == 0
     assert (first.root / case["input_path"]).read_bytes() == b"case bytes"
     assert all(record["availability"] == "unavailable" for record in first.manifest["analysis"])
+    inventory = analysis.analysis_inventory(first)
+    assert inventory["procedures"] == inventory["windows"] == []
+    assert inventory["references"] == {} and inventory["same_procedure"] is False
+    assert all(site["procedure_id"] is None and site["limitation"] for site in inventory["sites"].values())
     if family == "ERM CWE-805":
         assert first.execution_environment()["BRCACHE_STACK_SIZE"] == "8"
         assert first.artifact("trace/malloc.calls").is_file()
@@ -271,8 +275,9 @@ def static_session(monkeypatch, transform=lambda payload: payload):
                 "resolve_containing_procedure": {"query_address": hex(address), "found": True, "procedure": procedure},
                 "analyze_function": {"procedure": procedure, "assembly": [f"{hex(entry)}: NOP"],
                                      "pseudocode": "void fixture(void) { return; }",
-                                     "facet_availability": {"pseudocode": {"available": True}}},
-                "read_function_instructions": {"procedure": procedure, "instructions": [f"{hex(entry)}: NOP"]},
+                                     "facet_availability": {"assembly": {"available": True}, "pseudocode": {"available": True}}},
+                "read_function_instructions": {"procedure": procedure,
+                    "instructions": [f"{hex(entry + index)}: NOP" for index in range(16)]},
                 "xrefs": [{"to": hex(address)}],
             }
             data = {"subject": {"digest": {"sha256": self.digest}},
@@ -300,7 +305,7 @@ def test_analysis_backend_failure_and_partial_output_remain_unavailable(tmp_path
                for row in dataset.manifest["analysis"])
 
 
-@pytest.mark.parametrize("defect", [None, "artifact", "provider", "operation", "address", "missing-result", "facet"])
+@pytest.mark.parametrize("defect", [None, "artifact", "provider", "operation", "address", "missing-result"])
 def test_static_views_require_bound_producer_evidence(tmp_path, monkeypatch, defect):
     config, work, run = preparation_inputs(tmp_path)
 
@@ -316,8 +321,6 @@ def test_static_views_require_bound_producer_evidence(tmp_path, monkeypatch, def
             data["parameters"] = {key: "0xffff" for key in data["parameters"]}
         elif defect == "missing-result":
             data.pop("normalized_result")
-        elif defect == "facet":
-            data["facet_availability"] = {"pseudocode": {"available": False}}
         return payload
 
     static_session(monkeypatch, corrupt)
@@ -358,6 +361,12 @@ def test_different_function_destination_is_collected_separately(tmp_path, monkey
     dataset = prepare_dataset(config, work, run, None, output=tmp_path / "dataset", rea="/host/rea")
     assert {address for operation, address in calls if operation == "analyze_function"} == {patch, destination}
     assert all("reused_from" not in row for row in dataset.manifest["analysis"])
+    inventory = analysis.analysis_inventory(dataset)
+    assert inventory["same_procedure"] is False
+    assert len(inventory["procedures"]) == len(inventory["windows"]) == 2
+    assert inventory["sites"]["patch"]["procedure_id"] != inventory["sites"]["destination"]["procedure_id"]
+    with pytest.raises(ValueError, match="valid sites: patch"):
+        analysis.analysis_view(dataset, inventory["sites"]["patch"]["procedure_id"], "references", site="destination")
 
 
 def test_containment_does_not_infer_across_body_gaps(tmp_path, monkeypatch):
@@ -394,8 +403,12 @@ def test_native_decompile_failure_preserves_completed_listing_views(tmp_path, mo
     static_session(monkeypatch, decompile_timeout)
     dataset = prepare_dataset(config, work, run, None, output=tmp_path / "dataset", rea="/host/rea")
     for row in dataset.manifest["analysis"]:
-        if row["view"] in ("instructions", "references"):
+        if row["view"] in ("instructions", "references", "function"):
             assert row["availability"] == "available"
+            if row["view"] == "function":
+                assert row["complete"] is False
+                assert row["facets"]["assembly"]["available"] is True
+                assert row["facets"]["pseudocode"]["available"] is False
         else:
             assert row["availability"] == "unavailable"
             assert row["reason"] == "native decompile deadline exceeded"
@@ -425,3 +438,243 @@ def test_hashes_and_scoped_ids_are_enforced(tmp_path):
     dataset.artifact("fixture.orig").write_bytes(b"changed")
     with pytest.raises(ValueError, match="hash mismatch"):
         load_dataset(dataset.root)
+
+
+def test_static_inventory_has_one_procedure_and_distinct_site_references(tmp_path, monkeypatch):
+    config, work, run = preparation_inputs(tmp_path)
+    calls = static_session(monkeypatch)
+    dataset = prepare_dataset(config, work, run, None, output=tmp_path / "dataset", rea="/host/rea")
+    collected_calls = list(calls)
+    inventory = analysis.analysis_inventory(dataset)
+    assert calls == collected_calls  # Retrieval cannot create new analyzer authority.
+    assert inventory["same_procedure"] is True
+    assert len(inventory["procedures"]) == len(inventory["windows"]) == 1
+    procedure = inventory["procedures"][0]
+    patch = dataset.manifest["patch"]["location"]
+    assert procedure["procedure_id"] == f"procedure:{hex(patch)}"
+    assert set(procedure["available_views"]) == {"function", "instructions", "decompilation", "references"}
+    assert set(inventory["windows"][0]["sites"]) == {"patch", "destination"}
+    assert {site["procedure_id"] for site in inventory["sites"].values()} == {procedure["procedure_id"]}
+    references = inventory["references"]
+    assert references["patch"]["references"] == [{"to": hex(patch)}]
+    assert references["destination"]["references"] == [{"to": hex(patch + 1)}]
+    assert references["patch"]["evidence_id"] != references["destination"]["evidence_id"]
+    view = analysis.analysis_view(dataset, procedure["procedure_id"], "decompilation")
+    assert view["text"] == "void fixture(void) { return; }"
+    assert view["address_mapping"] == "unavailable"
+    assert "normalized_result" not in json.dumps(inventory)
+    assert "subject" not in json.dumps(view)
+
+
+def test_partial_callee_does_not_hide_independent_static_facets(tmp_path, monkeypatch):
+    config, work, run = preparation_inputs(tmp_path)
+
+    def partial(payload):
+        if payload["data"]["operation"] == "analyze_function":
+            value = payload["data"]["normalized_result"]
+            value["callees"] = [{"address": "0x42", "name": "known_call",
+                                  "relationship_coverage": {"status": "partial", "reason": "indirect target unresolved"}}]
+        return payload
+
+    static_session(monkeypatch, partial)
+    dataset = prepare_dataset(config, work, run, None, output=tmp_path / "dataset", rea="/host/rea")
+    function_records = [row for row in dataset.manifest["analysis"] if row["view"] == "function"]
+    assert all(row["availability"] == "available" and not row["complete"] for row in function_records)
+    # Reproduce a saved dataset's old coarse classification without changing raw evidence.
+    for record in function_records:
+        record["availability"], record["complete"], record["reason"] = "unavailable", False, "partial"
+    manifest = dataset.manifest
+    manifest.pop("dataset_id")
+    manifest["dataset_id"] = hashlib.sha256(canonical(manifest)).hexdigest()
+    (dataset.root / "manifest.json").write_bytes(canonical(manifest))
+    dataset = load_dataset(dataset.root)
+    inventory = analysis.analysis_inventory(dataset)
+    procedure = inventory["procedures"][0]
+    assert "function" in procedure["available_views"]
+    assert procedure["facets"]["pseudocode"]["available"] is True
+    assert any("indirect target unresolved" in reason for reason in procedure["limitations"])
+    function = analysis.analysis_view(dataset, procedure["procedure_id"], "function")
+    assert function["availability"] == "available" and not function["complete"]
+    assert function["records"] == [{"facet": "callees", "address": "0x42", "name": "known_call"}]
+    decompilation = analysis.analysis_view(dataset, procedure["procedure_id"], "decompilation")
+    assert decompilation["text"] == "void fixture(void) { return; }"
+
+
+def test_static_paging_preserves_actual_multibyte_pseudocode_and_instruction_order(tmp_path, monkeypatch):
+    config, work, run = preparation_inputs(tmp_path)
+    patch = int((work / "patch-location").read_text(), 16)
+    pseudocode = "".join(f"  /* строка {index} */ return_value += {index};\n" for index in range(400))
+
+    def large(payload):
+        value = payload["data"]["normalized_result"]
+        if isinstance(value, dict) and "procedure" in value:
+            value["procedure"]["body"]["ranges"] = [{"start": hex(patch), "end": hex(patch + 511)}]
+        if payload["data"]["operation"] == "analyze_function":
+            value["pseudocode"] = pseudocode
+        if payload["data"]["operation"] == "read_function_instructions":
+            value["instructions"] = [f"{hex(patch + index)}: NOP" for index in range(512)]
+        return payload
+
+    static_session(monkeypatch, large)
+    dataset = prepare_dataset(config, work, run, None, output=tmp_path / "dataset", rea="/host/rea")
+    procedure_id = f"procedure:{hex(patch)}"
+    offset, chunks, evidence_ids = 0, [], set()
+    while offset is not None:
+        page = analysis.analysis_view(dataset, procedure_id, "decompilation", offset=offset)
+        assert len(page["text"].encode()) <= 8192
+        assert len(page["text"].splitlines()) <= 120
+        assert page["range"]["start"] == offset
+        assert page["range"]["end"] == offset + len(page["text"].encode())
+        assert page["total"] == len(pseudocode.encode())
+        assert page["address_mapping"] == "unavailable"
+        assert page["evidence_id"] not in evidence_ids
+        evidence_ids.add(page["evidence_id"])
+        chunks.append(page["text"])
+        offset = page["next_offset"]
+    assert "".join(chunks) == pseudocode
+    assert len(chunks) > 1
+    window = {"address": hex(patch + 200), "before": 100, "after": 100}
+    offset, addresses = 0, []
+    while offset is not None:
+        page = analysis.analysis_view(dataset, procedure_id, "instructions", window=window, offset=offset)
+        addresses.extend(row["address"] for row in page["instructions"])
+        assert page["total"] == 201
+        offset = page["next_offset"]
+    assert addresses == [hex(patch + index) for index in range(100, 301)]
+
+
+def test_instruction_windows_stop_at_body_gaps_and_reject_noninstructions(tmp_path, monkeypatch):
+    config, work, run = preparation_inputs(tmp_path)
+    patch = int((work / "patch-location").read_text(), 16)
+
+    def discontinuous(payload):
+        value = payload["data"]["normalized_result"]
+        if isinstance(value, dict) and "procedure" in value:
+            value["procedure"]["body"]["ranges"] = [
+                {"start": hex(patch), "end": hex(patch + 3)},
+                {"start": hex(patch + 8), "end": hex(patch + 15)}]
+        if payload["data"]["operation"] == "read_function_instructions":
+            value["instructions"] = [f"{hex(patch + index)}: NOP" for index in [*range(4), *range(8, 16)]]
+        return payload
+
+    static_session(monkeypatch, discontinuous)
+    dataset = prepare_dataset(config, work, run, None, output=tmp_path / "dataset", rea="/host/rea")
+    procedure_id = f"procedure:{hex(patch)}"
+    view = analysis.analysis_view(dataset, procedure_id, "instructions",
+                                  window={"address": hex(patch + 8), "before": 100, "after": 100})
+    assert [row["address"] for row in view["instructions"]] == [hex(patch + index) for index in range(8, 16)]
+    assert {row["body_range"] for row in view["instructions"]} == {1}
+    for address in (patch + 4, patch - 1, patch + 16):
+        with pytest.raises(ValueError, match="exact frozen instruction"):
+            analysis.analysis_view(dataset, procedure_id, "instructions", window={"address": hex(address)})
+
+
+@pytest.mark.parametrize("procedure,view,arguments,reason", [
+    ("patch", "instructions", {}, "valid choices"),
+    ("function:patch", "instructions", {}, "valid choices"),
+    (None, "instructions", {}, "valid choices"),
+    ("canonical", "unknown", {}, "view must"),
+    ("canonical", "references", {}, "requires site"),
+    ("canonical", "references", {"site": "unrelated"}, "valid sites"),
+    ("canonical", "function", {"window": {}}, "only supported"),
+    ("canonical", "instructions", {"window": {"before": 101}}, "0..100"),
+    ("canonical", "instructions", {"window": {"after": True}}, "0..100"),
+    ("canonical", "instructions", {"window": {"address": 1}}, "address string"),
+    ("canonical", "instructions", {"window": {"unexpected": 1}}, "window must"),
+    ("canonical", "decompilation", {"offset": -1}, "nonnegative"),
+    ("canonical", "decompilation", {"offset": 9999}, "offset outside"),
+])
+def test_static_scope_and_bounds_fail_usefully(tmp_path, monkeypatch, procedure, view, arguments, reason):
+    config, work, run = preparation_inputs(tmp_path)
+    static_session(monkeypatch)
+    dataset = prepare_dataset(config, work, run, None, output=tmp_path / "dataset", rea="/host/rea")
+    procedure_id = f"procedure:{hex(dataset.manifest['patch']['location'])}" if procedure == "canonical" else procedure
+    with pytest.raises(ValueError, match=reason):
+        analysis.analysis_view(dataset, procedure_id, view, **arguments)
+
+
+def test_static_reads_reauthenticate_frozen_evidence(tmp_path, monkeypatch):
+    config, work, run = preparation_inputs(tmp_path)
+    static_session(monkeypatch)
+    dataset = prepare_dataset(config, work, run, None, output=tmp_path / "dataset", rea="/host/rea")
+    inventory = analysis.analysis_inventory(dataset)
+    (dataset.root / dataset.manifest["analysis"][0]["path"]).write_text("{}")
+    with pytest.raises(ValueError, match="hash mismatch"):
+        analysis.analysis_view(dataset, inventory["procedures"][0]["procedure_id"], "instructions")
+    with pytest.raises(ValueError, match="hash mismatch"):
+        analysis.analysis_inventory(dataset)
+
+
+@pytest.mark.parametrize("defect,reason", [
+    ("string", "malformed frozen instruction"),
+    ("address", "malformed frozen instruction address"),
+    ("missing-text", "decoded text unavailable"),
+    ("empty-text", "decoded text unavailable"),
+    ("record", "malformed frozen instruction record"),
+    ("outside", "outside resolved procedure body"),
+    ("duplicate", "duplicate frozen instruction address"),
+])
+def test_invalid_frozen_instructions_are_not_silently_omitted(tmp_path, monkeypatch, defect, reason):
+    config, work, run = preparation_inputs(tmp_path)
+    patch = int((work / "patch-location").read_text(), 16)
+
+    def invalid(payload):
+        if payload["data"]["operation"] == "read_function_instructions":
+            rows = payload["data"]["normalized_result"]["instructions"]
+            replacement = {
+                "string": "not an addressed instruction",
+                "address": {"address": "not-an-address", "text": "NOP"},
+                "missing-text": {"address": hex(patch + 2)},
+                "empty-text": f"{hex(patch + 2)}:   ",
+                "record": None,
+                "outside": f"{hex(patch + 16)}: NOP",
+                "duplicate": rows[0],
+            }
+            rows[2] = replacement[defect]
+        return payload
+
+    static_session(monkeypatch, invalid)
+    dataset = prepare_dataset(config, work, run, None, output=tmp_path / "dataset", rea="/host/rea")
+    with pytest.raises(ValueError, match=reason):
+        analysis.analysis_view(dataset, f"procedure:{hex(patch)}", "instructions")
+    with pytest.raises(ValueError, match=reason):
+        analysis.analysis_inventory(dataset)
+
+
+@pytest.mark.parametrize("many", [False, True])
+def test_instruction_calls_expose_compact_resolved_target_without_name_facet(tmp_path, monkeypatch, many):
+    config, work, run = preparation_inputs(tmp_path)
+    patch = int((work / "patch-location").read_text(), 16)
+
+    def resolved(payload):
+        if payload["data"]["operation"] == "analyze_function":
+            value = payload["data"]["normalized_result"]
+            value["facet_availability"]["strings_names"] = {"available": False}
+            value["facet_availability"]["references"] = {"available": True}
+            value["referenced_names"] = []
+            value["outgoing_references"] = [{
+                "source_address": hex(patch), "target_address": "0x403130", "kind": {"call": True},
+                "target_procedure": {"address": "0x403130", "name": "<EXTERNAL>::qsort",
+                    "body": {"ranges": [{"start": "0x403130", "end": "0x403135"}]},
+                    "classification": {"thunk": True, "external": False, "thunk_target": "0x651080"}}}]
+            if many:
+                value["outgoing_references"].extend({"source_address": hex(patch),
+                    "target_address": hex(0x403200 + index), "kind": {"call": True},
+                    "target_procedure": {"name": "long_label_" + "x" * 1000}} for index in range(12))
+        if payload["data"]["operation"] == "read_function_instructions":
+            payload["data"]["normalized_result"]["instructions"][0] = f"{hex(patch)}: CALL 0x403130"
+        return payload
+
+    static_session(monkeypatch, resolved)
+    dataset = prepare_dataset(config, work, run, None, output=tmp_path / "dataset", rea="/host/rea")
+    page = analysis.analysis_view(dataset, f"procedure:{hex(patch)}", "instructions")
+    call = page["instructions"][0]
+    assert call["call_targets"][0] == {"address": "0x403130", "name": "<EXTERNAL>::qsort",
+                                       "thunk": True, "external": False, "thunk_target": "0x651080"}
+    assert call["call_targets_truncated"] is many
+    assert len(call["call_targets"]) == (8 if many else 1)
+    if many:
+        assert all(len(target["name"]) == 256 and target["label_truncated"]
+                   for target in call["call_targets"][1:])
+    assert all("body" not in target for target in call["call_targets"])
+    assert "referenced_names" not in call

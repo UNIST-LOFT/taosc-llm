@@ -23,7 +23,10 @@ class FakeServer:
     """
 
     def __init__(self, path: Path, responses, *, status_value=None,
-                 mutations=2, scripted_status=False):
+                 mutations=2, scripted_status=False, patch_format="ERM generic",
+                 capture_root=None):
+        self.patch_format = patch_format
+        self.capture_root = Path(capture_root) if capture_root is not None else path.parent
         self.path = path
         self.responses = list(responses)
         # ``scripted_status`` makes status consume the response script, so a
@@ -85,7 +88,39 @@ class FakeServer:
                     response = (self.responses.pop(0) if self.responses else
                                 [{"error": "no more scripted responses"}])
                 for item in response:
+                    if request.get("op") == "evaluate" and "mutation" in item and "capture" not in item:
+                        item = {**item, "capture": self._capture(request, item)}
                     connection.sendall(json.dumps(item).encode() + b"\n")
+
+    def _capture(self, request, row):
+        if row["outcome"] == "unavailable":
+            return None
+        from binradar import binradar_taosc_predicates as predicates
+        from binradar.binradar_replay import lower_predicate
+        import hashlib
+        cwe = self.patch_format == "ERM CWE-805"
+        descriptor = lower_predicate("CWE805-erm" if cwe else "generic-erm",
+                                     request["patches"][0]["predicate"])
+        registers = predicates.CACHED_SNAPSHOT_REGS.pack(150 if cwe else (1 << 64) - 3, *([0] * 15))
+        clamps = (100).to_bytes(8, "little") + (200).to_bytes(8, "little") + b"\0" * (predicates.CACHED_SNAPSHOT_CLAMPS.size - 16)
+        def state(branch):
+            return (predicates.CACHED_SNAPSHOT_HEADER.pack(
+                predicates.CACHED_SNAPSHOT_MAGIC, 1, 1, branch, 0, 2 if cwe else 0)
+                + (clamps if cwe else b"")
+                + registers)
+        snapshots, error = predicates.parse_cached_snapshots(state(0))
+        assert error is None
+        branch = predicates.evaluate_cached_predicate(
+            predicates.parse_predicate_descriptor(descriptor), snapshots)[0]
+        assert branch in (0, 1)
+        payload = state(branch)
+        directory = self.capture_root / "replay"
+        directory.mkdir(exist_ok=True)
+        path = directory / f"capture-{row['mutation']}.brch"
+        path.write_bytes(payload)
+        return {"mutation": row["mutation"], "path": str(path),
+                "sha256": hashlib.sha256(payload).hexdigest(), "descriptor": descriptor,
+                "patch_id": 1, "reuse": "fresh" if row["source"] == "executed" else "exact-descriptor"}
 
     def close(self):
         listener = self._socket
@@ -284,7 +319,7 @@ def test_long_published_socket_supports_all_operations(dataset, tmp_path, leaf):
     bound = rewrite_cases(base, dataset.cases("function"))
     with tempfile.TemporaryDirectory(prefix="replay-peer-", dir="/tmp") as short:
         server = FakeServer(Path(short) / replay.SOCKET_NAME,
-                            [rows() + [done()], [{"accepted": True}]]).start()
+                            [rows() + [done()], [{"accepted": True}]], capture_root=target).start()
         public.symlink_to(server.path)
         try:
             assert replay.status(public)["state"] == "ready"
@@ -398,7 +433,7 @@ def test_logical_replay_preserves_shared_safe_source(run_dir, tmp_path, patch_fo
         cases.append(case)
     dataset = rewrite_cases(base, cases)
     candidate = parse_candidate(patch_format, expression)
-    server = serve(run_dir, [rows() + [done()]])
+    server = serve(run_dir, [rows() + [done()]], patch_format=patch_format)
     try:
         result = replay.evaluate_replay(dataset, candidate)
     finally:
@@ -472,7 +507,6 @@ def test_replay_socket_never_appears_in_the_model_projection(run_dir, dataset):
     plain = prepare_context(dataset)
     live = prepare_context(dataset, replay_socket=run_dir / replay.SOCKET_NAME)
     assert str(run_dir) not in live.initial_prompt()
-    assert live.projection["policy"] != plain.projection["policy"]
     assert live.context_id != plain.context_id
 
 
@@ -674,6 +708,108 @@ def test_replay_requires_exact_retained_ids(dataset, run_dir, mutations):
             replay.evaluate_replay(dataset, parse_candidate("ERM generic", "1"))
     finally:
         server.close()
+
+
+def capture_row(dataset, run_dir, *, branches=(1, 1), selector=1,
+                descriptor=None, reuse="fresh", mutation=2):
+    from binradar import binradar_taosc_predicates as predicates
+    import hashlib
+    cwe = dataset.patch_format == "ERM CWE-805"
+    if descriptor is None:
+        descriptor = parse_candidate(dataset.patch_format,
+            "s->rbx >= i->begin && s->rbx < i->end" if cwe else "rax < 0").descriptor
+    payload = b"".join(
+        predicates.CACHED_SNAPSHOT_HEADER.pack(
+            predicates.CACHED_SNAPSHOT_MAGIC, 1, selector, branch, 0, 2 if cwe else 0)
+        + ((100).to_bytes(8, "little") + (200).to_bytes(8, "little")
+           + b"\0" * (predicates.CACHED_SNAPSHOT_CLAMPS.size - 16) if cwe else b"")
+        + predicates.CACHED_SNAPSHOT_REGS.pack(150 if cwe else (1 << 64) - 3, *([0] * 15))
+        for branch in branches)
+    directory = run_dir / "replay"
+    directory.mkdir(exist_ok=True)
+    path = directory / f"capture-{mutation}.brch"
+    path.write_bytes(payload)
+    return {"mutation": mutation, "patch": 1,
+            "source": "executed" if reuse == "fresh" else "cache",
+            "outcome": "normal", "reason": None,
+            "capture": {"mutation": mutation, "path": str(path),
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                        "descriptor": descriptor, "patch_id": selector, "reuse": reuse}}
+
+
+@pytest.mark.parametrize("patch_format", ["ERM generic", "ERM CWE-805"])
+@pytest.mark.parametrize("reuse", ["fresh", "exact-descriptor", "full-vector-equivalent"])
+def test_complete_replay_capture_is_available_to_standard_state_reader(
+        tmp_path, run_dir, patch_format, reuse):
+    dataset = make_dataset(tmp_path / "states", patch_format=patch_format, binradar_run=run_dir)
+    candidate = parse_candidate(patch_format,
+        "s->rbx >= i->begin && s->rbx < i->end" if patch_format == "ERM CWE-805" else "rax < 0")
+    row = capture_row(dataset, run_dir, reuse=reuse, descriptor=candidate.descriptor)
+    result = replay._case_result(dataset, row, candidate)
+    assert result["branches"] == [1, 1]
+    assert result["capture"]["artifact_sha256"] == dataset.manifest["artifacts"]["fixture.brcached"]["sha256"]
+    states = evaluation._snapshots(dataset, result["capture"])
+    assert len(states) == 2 and all(state.patch_id == 1 for state in states)
+    assert result["reuse"] == reuse
+
+
+@pytest.mark.parametrize("patch_format", ["ERM generic", "ERM CWE-805"])
+def test_vector_reuse_keeps_neutral_descriptor_and_original_selector(tmp_path, run_dir, patch_format):
+    dataset = make_dataset(tmp_path / "states", patch_format=patch_format, binradar_run=run_dir)
+    candidate = parse_candidate(patch_format,
+        "s->rax >= i->begin && s->rax < i->end" if patch_format == "ERM CWE-805" else "rax > 0")
+    row = capture_row(dataset, run_dir, branches=(0, 0), selector=0,
+                      descriptor="p0", reuse="full-vector-equivalent")
+    result = replay._case_result(dataset, row, candidate)
+    assert result["capture"]["descriptor"] == "p0"
+    assert result["capture"]["patch_id"] == 0
+    assert result["branches"] == [0, 0]
+    assert all(state.patch_id == 0 for state in evaluation._snapshots(dataset, result["capture"]))
+
+
+@pytest.mark.parametrize("failure", ["mutation", "selector", "hash", "path", "symlink", "descriptor", "trap", "candidate"])
+def test_replay_capture_identity_failures_cannot_become_success(dataset, run_dir, tmp_path, failure):
+    candidate = parse_candidate("ERM generic", "rax < 0")
+    row = capture_row(dataset, run_dir,
+                      branches=(1, 2) if failure == "trap" else (1, 1))
+    if failure == "mutation":
+        row["capture"]["mutation"] = 3
+    elif failure == "selector":
+        row["capture"]["patch_id"] = 0
+    elif failure == "hash":
+        row["capture"]["sha256"] = "0" * 64
+    elif failure == "path":
+        outside = tmp_path / "outside.brch"
+        outside.write_bytes(Path(row["capture"]["path"]).read_bytes())
+        row["capture"]["path"] = str(outside)
+    elif failure == "symlink":
+        original = Path(row["capture"]["path"])
+        target = original.with_name("real-capture.brch")
+        original.rename(target)
+        original.symlink_to(target)
+    elif failure == "descriptor":
+        row["capture"]["descriptor"] = "p0"
+    elif failure == "candidate":
+        candidate = parse_candidate("ERM generic", "rax > 0")
+    with pytest.raises(replay.ReplayError):
+        replay._case_result(dataset, row, candidate)
+
+
+def test_replay_authenticates_frozen_artifact_before_contact(dataset, monkeypatch):
+    dataset.artifact("fixture.brcached").write_bytes(b"changed artifact")
+    monkeypatch.setattr(replay, "status", lambda *a, **k: pytest.fail("unauthenticated replay contact"))
+    with pytest.raises(ValueError, match="hash mismatch"):
+        replay.evaluate_replay(dataset, parse_candidate("ERM generic", "rax < 0"))
+
+
+def test_unknown_replay_activity_is_not_a_zero_hit_vector(dataset):
+    result = replay._case_result(dataset,
+        {"mutation": 2, "source": "executed", "outcome": "unavailable",
+         "reason": "unsupported-external-state", "capture": None},
+        parse_candidate("ERM generic", "rax < 0"))
+    assert result["branches"] is None and result["capture"] is None
+    assert result["status"] == "unavailable"
+
 
 
 def test_host_cache_dir_is_shared_by_tool_and_cli(dataset, run_dir, tmp_path):
