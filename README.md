@@ -354,7 +354,7 @@ SDK root automatically.
 
 ### Evaluate the original session after its result
 
-Add `--session-feedback` to provider synthesis (or `run.sh`):
+Add `--session-feedback` to provider synthesis (or `taosc-llm-run --mode provider`):
 
 ```sh
 uv run --project utils/taosc-llm taosc-llm \
@@ -422,10 +422,10 @@ not automatically resumed. The root is private mode 0700. Keep reusable caches
 outside the result via `--cache-dir`, or use the default `<output>/cache`.
 Previous outputs and source workdir candidate artifacts are not overwritten.
 
-For `run.sh`, model output is now:
+For `taosc-llm-run --mode provider`, model output is:
 
 ```text
-run-debug-00000/taosc-llm-result/
+taosc-llm-out-00000/result/
   run.json
   context.json
   poc.json
@@ -517,128 +517,150 @@ into native sessions; no old-results migration or deletion is performed. See the
 and the single authoritative
 [raw error schema and privacy contract](../../agent-docs/taosc-llm/PROVIDER_AND_PI.md#raw-error-artifacts-authoritative-persistence-contract).
 
-## Debug orchestration example
+## Experiment runner
 
-`run.sh` is a runnable example, not the production Taosc driver. By default it
-starts both generation modes together, waits on `status`, freezes one dataset from both
-producer runs, then evaluates and synthesizes against the live snapshot:
+`taosc-llm-run` is the installed Python orchestrator; `python -m taosc_llm.runner`
+is equivalent. It replaces the Bash example, not production `taosc-fix` or FINAL.
+Default mode is `no-llm`; provider calls require explicit mode and credentials.
 
 ```sh
-# Manual predicate: no model call, still uses the live replay bridge.
-utils/taosc-llm/run.sh --no-llm --predicate 'rax <= 0' --timeout 600
+# Fresh concrete + resident producers, immutable dataset, warm, then search.
+uv run --project utils/taosc-llm taosc-llm-run \
+  --subject SUBJECT --workdir workdir-0.1.24 --generation-timeout 600
 
-# Model path: the host adds --replay-socket/--cache-dir; the model cannot.
-utils/taosc-llm/run.sh --provider-env /abs/provider.env --timeout 7200
+# Concrete-only experiment; no resident server or mutation import.
+uv run --project utils/taosc-llm taosc-llm-run \
+  --subject SUBJECT --workdir workdir-0.1.24 --concrete-only
 
-# Generate concrete cases once, without REA/Ghidra, a provider or replay.
-utils/taosc-llm/run.sh --only-concrete --timeout 600
+# Completed producer reuse; mutations default to offline observations.
+uv run --project utils/taosc-llm taosc-llm-run \
+  --subject SUBJECT --workdir workdir-0.1.24 \
+  --concrete-run OLD/concrete --binradar-run OLD/binradar
+# Add --replay-socket OLD/binradar/replay.sock only for that same live generation.
 
-# Reuse those concrete cases; regenerate mutations and run the remaining stages.
-utils/taosc-llm/run.sh --skip-concrete --provider-env /abs/provider.env --timeout 7200
+# Prepared dataset: no native preparation, producers or REA invocation.
+uv run --project utils/taosc-llm taosc-llm-run \
+  --dataset DATASET --output NEW_RUN --search-timeout 900
+
+# Explicit alternative modes; same generation/reuse options apply.
+uv run --project utils/taosc-llm taosc-llm-run \
+  --dataset DATASET --mode manual --predicate 'rax <= 0'
+uv run --project utils/taosc-llm taosc-llm-run \
+  --dataset DATASET --mode provider --provider-env /abs/provider.env
 ```
 
-Before either resident mode (default or `--skip-concrete`) does any preparation,
-the runner reads `<workdir>/patch-format`, falling back to
-`<subject>/patch-format` only when the workdir entry is absent. It trims
-surrounding whitespace and admits only `ERM generic` and `ERM CWE-805`.
-Other nonempty values print `[skip] unsupported patch-format: ...` and exit 0,
-so batch runners do not record them as failures. Missing, empty/whitespace-only,
-unreadable or non-file metadata exits 2; an existing invalid workdir entry never
-falls back to subject metadata. This check precedes patch-location/concrete
-requirements, REA/Guix resolution, setup and output allocation. It neither
-creates a diagnostic root nor changes producer outputs or existing generation
-environments. `--only-concrete` bypasses this format check entirely.
+`--subject` defaults to cwd; `--workdir` defaults to `workdir-0.1.24` relative to
+subject. Absolute workdirs are accepted; other supplied paths are relative to
+invocation cwd. Lexical symlink parents are preserved. Workdir `patch-format`
+wins, with subject fallback only when absent. Only `ERM generic`/`ERM CWE-805`
+proceed; other nonempty values emit JSON `status=skipped`, exit 0, and allocate
+nothing. Missing/invalid metadata is an error. Only concrete-only generation
+without synthesis bypasses the family check.
 
-`--only-concrete` runs only concrete setup and generation, requires a nonempty
-`br-gen-con/minimizer.sbsv`, and exits without preparing/starting the resident
-server or running REA, dataset setup, cache warm or synthesis. No provider or
-predicate is required. Existing `br-gen-bin` output is untouched; the diagnostic
-root contains only logs.
+### Run directory selection
 
-For admitted ERM subjects, `--skip-concrete` skips concrete setup and generation,
-preserving its existing output and environment. It requires a nonempty `br-gen-con/minimizer.sbsv`
-before runtime resolution or output allocation. Reuse a completed run for the
-same workdir/binary; the preflight is not a replacement for dataset evidence
-validation. Mutation generation, a fresh dataset, cache warm and synthesis still
-run. Both flags use the selected output base, so repeat the same `--outdir` if
-you used one. The two flags are mutually exclusive (exit 2).
-
-For resident modes without an override, the runner installs/resolves the current checkout's
-`static-runtime.scm` into the project-local Guix profile
-`utils/taosc-llm/.guix-rea`, then uses `.guix-rea/bin/rea`. Its wrapper supplies
-Java and Ghidra; no store hash, `JAVA_HOME` or `GHIDRA_INSTALL_DIR` needs to be
-entered manually. An unchanged recipe reuses the installed build. Selection
-precedence is `--rea PATH`, then `TAOSC_LLM_REA`, then automatic Guix resolution;
-custom executables must supply their own Java/Ghidra environment. Runtime
-resolution fails before allocating diagnostics or replacing producer outputs,
-without falling back to an arbitrary store entry or ambient `rea` shim.
-
-Options: `--subject DIR`, `--workdir NAME`, `--outdir DIR`, `--rea PATH`,
-`--timeout SECONDS`, `--ready-timeout SECONDS`, `--predicate`, `--no-llm`,
-`--provider-env FILE`, `--session-feedback`, `--skip-concrete`, `--only-concrete`. Relative subject/output
-paths are made absolute before changing cwd, without expanding user-provided symlinks. The default layout is:
+| Option | Meaning |
+|---|---|
+| omitted | `<workdir>/out/taosc-llm-no-llm-out-00000` for no-llm; `taosc-llm-out-00000` otherwise. Dataset-only runs allocate under invocation cwd. |
+| `--run-prefix PREFIX` | Simple basename replacing the mode prefix; allocate above the largest numeric suffix without filling gaps. |
+| `--run-id n` | New numbered root (default), atomic mode-0700 reservation; at least five digits. |
+| `--run-id NUMBER` | Exact numbered root, created only if absent or selected with explicit `--resume`. |
+| `--run-id l --resume` | Latest existing numbered directory; never implicit continuation. |
+| `--output DIR` | Exact root; conflicts with explicitly supplied prefix/id. Unlike BinRadar's destructive output option, never replaces existing results. |
 
 ```text
-workdir/out/
-  br-gen-con/                  # replaced unless --skip-concrete
-  br-gen-bin/                  # replaced unless --only-concrete
-  run-debug-00000/             # fresh logs; dataset/result/cache in resident modes
-  run-debug-00001/             # subsequent invocation; largest number is newest allocation
+<run>/
+  run.json                       # atomic runner summary and attempt history
+  logs/attempt-00000/             # stage stdout JSON and stderr/combined logs
+  concrete/                      # only if generated by this runner
+  binradar/                      # only if generated by this runner
+  dataset/                       # only if prepared by this runner
+  cache/                         # shared warm/synthesis evidence cache
+  result/                        # existing manual/Pi or no-LLM result contract
 ```
 
-`--outdir DIR` overrides this base directory. Each producer receives its own
-exact `binradar --output` leaf; neither `--run-prefix` nor a numeric suffix is
-used for producer leaves. Diagnostic roots use `run-debug-00000`, `run-debug-00001`,
-etc.: the next index exceeds every existing numbered entry under the selected base.
-Indices are decimal with at least five digits; gaps are not filled. Atomic mode-0700
-`mkdir` reserves each root, retrying a competing allocation without sharing or
-replacing its contents. Old `runs-debug-<random>` roots are left untouched and do not
-participate in numbering. The largest number identifies the newest allocation,
-not necessarily the last completed or successful run.
-BinRadar, not this script, creates the actual socket under
-`/tmp/binradar-replay-<random>/` and publishes `br-gen-bin/replay.sock` as a
-symlink. The script always passes the requested producer paths; there is no
-socket-length check or output-directory alias. Shutdown removes the owned
-public link and private socket directory, not the producer outputs.
+A supplied `--concrete-run` is read-only and suppresses concrete setup/generation.
+A supplied `--binradar-run` suppresses cached/mutation setup and generation; its
+snapshot is never restarted. Missing inputs generate under this run, never fixed
+shared `br-gen-*` leaves. `--concrete-only` disables mutation import/generation,
+but cached artifacts are still prepared for evaluation. Reusing concrete alone
+can therefore update the workdir's cached artifacts, not the original-only
+producer or its generation metadata. A workdir inode lock remains held through
+cleanup; cooperating runners cannot mutate that workdir concurrently. External
+tools must also respect its ownership.
 
-Stop the previous invocation before rerunning; fixed producer directories are
-not safe for overlapping runs. Setup in a shared workdir remains single-owner.
-Rebuild the dataset for each new generation, as this script does: an old dataset
-must not be attached to a different server merely because its path was reused.
+`--stop-after generation|dataset|warm|synthesis` defaults to synthesis.
+`--concrete-only --stop-after generation` collects concrete inputs without REA
+or synthesis credentials. Dataset-only mode accepts warm/synthesis stages.
+Preparation-only stages require no provider file or manual predicate.
 
-`--timeout` controls native generation (default 7200; 0 means unlimited).
-`--ready-timeout` independently bounds readiness, including startup and PROBE
-(default 0: unlimited). It is not `--timeout + grace`: PROBE has its own budget.
-Both producers are monitored throughout readiness, dataset setup and evaluation;
-a failed concrete producer or premature resident exit stops the example promptly.
+### Lifetime and time budgets
 
-Exit codes 2 (`reject_same_crash`) and 3 (`unavailable`) from `--warm` and
-synthesis are scoped results, not orchestration failures; the script reports
-them, still shuts the resident server down, and exits 0. A readiness deadline,
-a dead launcher, a failed producer or a protocol error exits nonzero and keeps
-the logs. SIGINT exits 130; SIGTERM exits 143, never success.
+Generated producers run concurrently after setup. Readiness uses the actual
+replay status protocol, including startup/PROBE. Concrete generation must finish
+and publish a nonempty manifest before freezing. Producer failure is monitored
+during foreground work. Only the generated resident is automatically attached
+and shut down. Reused mutations require explicit `--replay-socket` for live
+execution; caller-owned runs/servers are never signalled, restarted or shut down.
 
-After format admission, the default full-pipeline order and failure rules are:
+| Option | Default | Scope |
+|---|---:|---|
+| `--generation-timeout` | 7200 s | Native per-phase integer budget; 0 explicitly unlimited. |
+| `--ready-timeout` | 7200 s | Whole resident readiness wait; 0 explicitly unlimited. |
+| `--stage-timeout` | 7200 s | Each foreground stage and post-readiness concrete wait; 0 explicitly unlimited. |
+| `--graceful-timeout` | 10 s | Grace before TERM/KILL escalation; positive. |
+| `--search-timeout` | 3600 s | Persistent no-LLM search admission budget, not whole-program wall time. |
 
-1. `binradar-setup --generate-concrete` and `--generate-binradar` run first;
-   they prepare different `.env` files and do not run patches.
-2. Both `binradar` processes start together. They share the prepared workdir but
-   receive distinct exact `--output` directories, each with its own PLT metadata,
-   progress history and phase results.
-3. `python -m taosc_llm.replay wait` is the only readiness signal. A closed
-   socket, a log line or a missing socket is not completion, and a dead launcher
-   pid fails immediately.
-4. Concrete generation must exit successfully and publish `minimizer.sbsv`
-   before setup runs.
-5. `taosc-llm-setup` needs both runs; missing mutation evidence fails rather than
-   silently producing a concrete-only dataset.
-6. Warming and synthesis share one `--cache-dir`, so concrete captures are
-   reused instead of re-executed.
-7. Each pipeline stage, including preparation/warm/synthesis, belongs to an owned
-   process group. Exit cleanup attempts bounded resident shutdown, then bounded
-   TERM/KILL cleanup of those groups; it never waits indefinitely or kills an
-   unrelated run. BinRadar owns socket/link cleanup; the runner retains producer
-   outputs and diagnostic roots.
+`--execution-workers` defaults to 4 (1–32). No-LLM atom/beam/clause/factor/depth
+and evaluation/execution limits match its direct CLI. Explicit search options
+are rejected in other modes. Provider-only options are `--pi-sdk-root`,
+`--max-rounds` (1–16, default 4), and `--session-feedback`. Analysis defaults
+remain 900 s import / 120 s query.
+
+Every subprocess has an owned session. A per-job Linux subreaper guardian also
+retains descendants that call `setsid` or outlive the launcher; pidfds prevent
+PID-reuse mis-signalling. Ctrl-C marks cancellation and drains processes with
+bounded INT→TERM→KILL escalation; a second signal requests immediate KILL.
+Guardians also clean up on parent-channel loss. Handlers are restored and logs
+retained. Unkillable survivors are reported as cleanup errors, never success.
+Linux pidfds/subreapers are required; there is no unsafe group-number fallback.
+
+Stdout is one runner JSON summary; stderr is progress. `run.json` references the
+actual synthesis JSON and preserves its scoped result. Exit 0 means a completed
+requested stage or explicit skip; 2/3 preserve the final requested warm/synthesis
+result. A full pipeline accepts scoped warm outcomes 0/2/3 (the baseline may
+reject the same crash), records that code, and returns synthesis's code instead.
+Operational warm errors still stop the pipeline. Exit 124 means wall timeout;
+130/143 mean SIGINT/SIGTERM; 1 means operational failure. Argparse errors use 2.
+Inspect status and synthesis evidence, not exit 0 alone. No path runs FINAL.
+Existing no-LLM live-mutation artifact-publication limits are unchanged.
+
+### Resume and CLI cutover
+
+```sh
+# Repeat the original search limits and worker policy.
+uv run --project utils/taosc-llm taosc-llm-run \
+  --output EXISTING_RUN --resume --search-timeout 900
+```
+
+Resume requires an initialized no-LLM search. It uses the recorded dataset,
+cache and result, adds a fresh attempt log directory, and never repeats setup,
+generation or warm. The engine checks code/runtime, budget and snapshot identity.
+A lost resident remains unavailable; a replacement generation cannot restore its
+identity. Interruption before search initialization requires a fresh run, optionally
+reusing completed producers/dataset. Manual/Pi session resume is not introduced.
+
+Removed options have no aliases: `--no-llm --predicate` becomes
+`--mode manual --predicate`; `--skip-concrete` becomes `--concrete-run DIR`;
+`--only-concrete` becomes `--concrete-only --stop-after generation`; `--outdir`
+becomes non-destructive run selection; ambiguous `--timeout` becomes separate
+budgets. No implicit `.env` file is loaded.
+
+REA selection is `--rea`, then `TAOSC_LLM_REA`, then the checkout's pinned
+`static-runtime.scm` installed into `.guix-rea`. Custom executables must supply
+Java/Ghidra. Guix supplies the pinned runtime; a wheel without a checkout recipe
+needs an explicit runtime. Resolution failure retains diagnostics without
+starting or replacing producers.
 
 ## Native isolation and harmless fixture
 
@@ -682,7 +704,7 @@ REA alone, including Java/Ghidra, can be built from the repository root:
 ```sh
 guix build -f utils/taosc-llm/static-runtime.scm
 
-# Optional manual equivalent of run.sh's automatic runtime selection:
+# Optional manual equivalent of taosc-llm-run's checkout runtime selection:
 guix package --profile=utils/taosc-llm/.guix-rea \
   --install-from-file=utils/taosc-llm/static-runtime.scm
 utils/taosc-llm/.guix-rea/bin/rea --version
@@ -713,7 +735,7 @@ are preserved. This is not a published Loftix release. The integration reference
 records actual package-build and installed-smoke results separately from live
 provider acceptance and final BinRadar verification.
 
-Five installed wrappers are `taosc-llm`, `taosc-llm-no-llm`, `taosc-llm-setup`,
+Six installed wrappers are `taosc-llm`, `taosc-llm-run`, `taosc-llm-no-llm`, `taosc-llm-setup`,
 `taosc-llm-evaluate`, and `taosc-llm-fixture`. Source allowlists and the wheel
 exclude real `.env` files, credentials, workdirs, node_modules and caches. The
 wheel ships Python, `runtime.c`, prompts and adapter, not the SDK/native closure.

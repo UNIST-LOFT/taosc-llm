@@ -4,7 +4,6 @@
              (gnu packages compression)
              (gnu packages base)
              (gnu packages commencement)
-             (gnu packages linux)
              (gnu packages patchutils)
              (gnu packages python-build)
              (guix build-system pyproject)
@@ -85,7 +84,7 @@ This package supplies SDK imports, not npm CLI executable shims.")
   (let ((relative (if (string=? file package-directory)
                       ""
                       (string-drop file (+ 1 (string-length package-directory))))))
-    (or (member relative '("" "pyproject.toml" "README.md" "LICENSE" "uv.lock" "run.sh"
+    (or (member relative '("" "pyproject.toml" "README.md" "LICENSE" "uv.lock"
                            "src" "src/taosc_llm" "tests"
                            "src/taosc_llm/pi" "src/taosc_llm/prompts"
                            "src/taosc_llm/no_llm"))
@@ -191,12 +190,12 @@ This package supplies SDK imports, not npm CLI executable shims.")
                       `("TAOSC_LLM_NODE" = (,(string-append #$analysis-node "/bin/node")))
                       `("TAOSC_LLM_PI_SDK_ROOT" =
                         (,(string-append #$output "/share/taosc-llm/pi-sdk")))))
-                  '("taosc-llm" "taosc-llm-no-llm" "taosc-llm-setup" "taosc-llm-evaluate"
+                  '("taosc-llm" "taosc-llm-run" "taosc-llm-no-llm" "taosc-llm-setup" "taosc-llm-evaluate"
                     "taosc-llm-fixture")))))))
   (inputs (list analysis-node pi-sdk rea-runtime ghidra-runtime
                 `(,openjdk21 "jdk") gcc-toolchain binutils e9patch
                 coreutils bash-minimal))
-  (native-inputs (list python-setuptools python-pytest gcc-toolchain e9patch util-linux))
+  (native-inputs (list python-setuptools python-pytest gcc-toolchain e9patch))
   (propagated-inputs (list local-binradar))
   (supported-systems '("x86_64-linux"))
   (home-page "https://github.com/UNIST-LOFT/binradar")
