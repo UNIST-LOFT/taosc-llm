@@ -12,6 +12,95 @@ from binradar.binradar_verifier import CONCRETE_ORACLE
 
 _OUTCOMES = ('target_crash', 'normal', 'other_crash', 'unknown')
 _ACTIVATIONS = ('fired', 'not_fired', 'zero_hits', 'trapped', 'unknown')
+POC_SUMMARY_BYTES = 65536
+POC_LOG_BYTES = 1048576
+
+
+def poc_log(dataset, *, limit=POC_LOG_BYTES):
+    """Read only the frozen diagnostic artifact, never a model-supplied path.
+
+    The manifest authenticates bytes, not the execution that produced this log.
+    Keep the raw artifact unchanged; only the model-facing copy loses paths.
+    """
+    artifacts = dataset.manifest['artifacts']
+    record = artifacts.get('trace/qasan.log')
+    result = {'status': 'missing', 'source': {
+        'kind': 'frozen-workdir-qasan-trace',
+        'log_sha256': record['sha256'] if record else None,
+        'poc_sha256': artifacts.get('poc', {}).get('sha256'),
+        'binary_sha256': artifacts[dataset.binary + '.orig']['sha256'],
+        'execution_binding': 'not-recorded'},
+        'source_bytes': 0, 'read_bytes': 0, 'source_limit_bytes': limit,
+        'source_truncated': False, 'text': ''}
+    if record is None:
+        return result
+    path = dataset.artifact('trace/qasan.log')
+    with path.open('rb') as stream:
+        raw = stream.read(limit + 1)
+    clipped = len(raw) > limit
+    raw = raw[:limit]
+    if clipped:
+        # Do not expose a partially redacted path or partial UTF-8 sequence.
+        end = raw.rfind(b'\n')
+        raw = raw[:end + 1] if end >= 0 else b''
+    text = raw.decode('utf-8', errors='replace')
+    text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', text)
+    text = ''.join(char for char in text if char in '\n\t' or ord(char) >= 32 and ord(char) != 127)
+    text = re.sub(r'''(?<![\w])/(?:[^\s()<>\[\]"']+)''',
+                  lambda match: '<path>/' + match.group().rsplit('/', 1)[-1], text)
+    source_bytes = path.stat().st_size
+    result.update(status='present' if source_bytes else 'empty',
+                  source_bytes=source_bytes, read_bytes=len(raw), source_truncated=clipped, text=text)
+    return result
+
+
+def poc_diagnostic(dataset):
+    """Compact first-report summary; this does not define the target oracle."""
+    from .context import canonical, digest
+    log = poc_log(dataset, limit=POC_SUMMARY_BYTES)
+    text = log.pop('text')
+    header = re.search(r'ERROR:\s+(?:QEMU-)?AddressSanitizer:\s*([^\n]+)', text)
+    result = {**log, 'role': 'original-poc-diagnostic', 'summary_scope': 'first-report',
+              'address_domain': 'reported-runtime-addresses', 'error': None, 'error_truncated': False,
+              'reported_address': None, 'reported_pc': None, 'access': None,
+              'fault_stack': [], 'stack_truncated': False,
+              'details': {'tool': 'get_patch_context', 'view': 'poc_log'}}
+    if header is not None:
+        message = header.group(1)
+        result['status'] = 'recognized'
+        error = re.split(r'\s+(?:\(pc\s|at pc\s)', message)[0]
+        result['error'] = error[:512]
+        result['error_truncated'] = len(error) > 512
+        for name, pattern in (('reported_address', r'\bon (?:unknown )?address\s+(0x[0-9a-fA-F]{1,16})\b'),
+                              ('reported_pc', r'\bpc\s+(0x[0-9a-fA-F]{1,16})\b')):
+            match = re.search(pattern, message)
+            if match:
+                result[name] = hex(int(match.group(1), 16))
+        # Stop at the first completed stack block. Allocation/free stacks and
+        # later sanitizer reports must not become frames of the fault stack.
+        started = False
+        for line in text[header.end():].splitlines():
+            access = re.match(r'\s*(READ|WRITE) of size (\d{1,20})\b', line)
+            if access and not started:
+                result['access'] = {'operation': access.group(1), 'size': int(access.group(2))}
+            frame = re.match(r'\s*#(\d+)\s+0x[0-9a-fA-F]+\b', line)
+            if frame:
+                if started and not frame.group(1).strip('0'):
+                    break
+                started = True
+                if len(result['fault_stack']) == 6:
+                    result['stack_truncated'] = True
+                    break
+                frame_text = line.strip()
+                result['fault_stack'].append(frame_text[:512])
+                result['stack_truncated'] |= len(frame_text) > 512
+            elif started or re.search(r'ERROR:|SUMMARY:|freed by|allocated by|previously allocated', line):
+                break
+    elif log['status'] == 'present':
+        result['status'] = 'unrecognized'
+    if log['source']['log_sha256'] is not None:
+        result['evidence_id'] = 'poc:' + digest(canonical([dataset.dataset_id, result]))
+    return result
 
 
 def _label(value):

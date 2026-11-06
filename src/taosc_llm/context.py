@@ -111,7 +111,7 @@ def prepare_context(dataset, *, run_dir: Path | None = None, workers: int = 1,
     from .dataset import PreparedDataset, load_dataset
     from .family import grammar_contract
     from .analysis import analysis_inventory
-    from .evidence import oracle_reference
+    from .evidence import POC_LOG_BYTES, POC_SUMMARY_BYTES, oracle_reference, poc_diagnostic
     if not isinstance(dataset, PreparedDataset):
         dataset = load_dataset(Path(dataset))
     if type(workers) is not int or not 1 <= workers <= 32:
@@ -133,6 +133,7 @@ def prepare_context(dataset, *, run_dir: Path | None = None, workers: int = 1,
                 "address_domain": "elf-va"},
             "grammar_contract": grammar_contract(validated.patch_format),
             "analysis": analysis,
+            "poc_diagnostic": poc_diagnostic(validated),
             "case_counts": {domain: len(validated.cases(domain)) for domain in ("system", "function")},
             "oracles": {domain: oracle_reference(validated, domain) for domain in ("system", "function")},
             "capabilities": {"evaluate_predicate": "offline-only", "test_candidate": {
@@ -144,7 +145,9 @@ def prepare_context(dataset, *, run_dir: Path | None = None, workers: int = 1,
                                       for name in ("context.py", "tools.py", "analysis.py", "evidence.py",
                                                    "cases.py", "prompts/system.txt", "family.py")},
             "limits": {"page_records": 32, "analysis_page_bytes": 8192, "instruction_window_side": 100,
-                       "decompilation_page_lines": 120, "expression_bytes": MAX_EXPRESSION},
+                       "decompilation_page_lines": 120, "expression_bytes": MAX_EXPRESSION,
+                       "poc_summary_source_bytes": POC_SUMMARY_BYTES, "poc_log_source_bytes": POC_LOG_BYTES,
+                       "poc_log_page_bytes": 8192, "poc_log_page_lines": 120},
             "policy": ("Only the supplied domain-specific target fault rejects a candidate. Other crashes "
                        "are reported separately from normal termination; neither proves repair. "
                        "Activation, outcome and capture availability are separate. Offline predictions "
@@ -158,6 +161,8 @@ def prepare_context(dataset, *, run_dir: Path | None = None, workers: int = 1,
     run_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     context = SynthesisContext(dataset, identity, run_dir, workers, canonical(projection),
                                canonical(feedback or []), replay_socket, cache_dir)
+    if projection["poc_diagnostic"].get("evidence_id"):
+        context._evidence_ids.add(projection["poc_diagnostic"]["evidence_id"])
     inventory = projection["analysis"]
     for view in [*inventory.get("windows", []), *inventory.get("references", {}).values()]:
         if view.get("evidence_id"):

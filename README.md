@@ -218,6 +218,12 @@ evaluation of concrete cases and, when the trusted host configured a replay
 bridge, of loaded function cases as well. No shell, arbitrary file access, debugger, built-in tools,
 extensions, MCP, REA invocation or subagents are exposed. REA views were frozen at
 setup. Inline context satisfies context availability; `get_patch_context` is optional.
+The original POC's frozen QASAN diagnostic is summarized inline; deeper frames and
+allocation/free histories are available only through `get_patch_context(view="poc_log")`
+with bounded pages. Diagnostic runtime PCs and memory addresses do not replace the
+configured target oracle, and a saved log hash does not authenticate its originating
+execution. See [diagnostic evidence](../../agent-docs/taosc-llm/PROMPTS_AND_EVIDENCE.md#original-poc-diagnostic-summary)
+for provenance, missing-log behavior and retrieval limits.
 Candidate proposals require evaluation of the exact expression. Results separate
 original/neutral/candidate outcomes, fixed domain oracles, actual activation and
 capture availability. Eight noteworthy cases expose counterexamples, control gaps,

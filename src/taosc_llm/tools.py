@@ -44,7 +44,8 @@ def tool_definitions():
     same_as = obj({"case_id": identifier, "features": {"type": "array", "minItems": 1,
         "maxItems": len(SIMILAR_FEATURES), "uniqueItems": True, "items": choice(SIMILAR_FEATURES)}}, ("case_id", "features"))
     specs = [
-        ("get_patch_context", "Refresh the compact context already supplied inline; not a mandatory first call.", {}, []),
+        ("get_patch_context", "Context and original-POC QASAN summary are already inline. Use view=poc_log only for paged diagnostic details; paths are normalized and this log does not define the target oracle.",
+         {"view": choice(("context", "poc_log")), "cursor": cursor}, []),
         ("get_function_analysis", "Read a frozen procedure facet. Use listed procedure IDs and site windows. References require site=patch or destination bound to that procedure; they are exact-site xrefs, not procedure-wide. Never runs analysis.",
          {"procedure_id": identifier, "view": choice(("function", "instructions", "decompilation", "references")),
           "site": choice(("patch", "destination")), "window": obj({
@@ -290,6 +291,23 @@ def _analysis(context, dataset, args):
     return result
 
 
+def _poc_log(context, dataset, args):
+    from .analysis import _page_text
+    from .evidence import poc_log
+    log = poc_log(dataset)
+    scope = {"view": "poc_log", "projection_version": PROJECTION_VERSION,
+             "log_sha256": log["source"]["log_sha256"]}
+    offset = _offset(context, scope, args.get("cursor"))
+    text, extent, total, next_offset = _page_text(log.pop("text"), offset)
+    log.update(text=text, range=extent, total_bytes=total)
+    if log["source"]["log_sha256"] is not None:
+        log["evidence_id"] = "poc-log:" + digest(canonical([dataset.dataset_id, log]))
+        context._evidence_ids.add(log["evidence_id"])
+    return {"poc_log": log, "query_id": digest(canonical(scope)),
+            "truncated": next_offset is not None or log["source_truncated"],
+            "next_cursor": _cursor(context, scope, next_offset) if next_offset is not None else None}
+
+
 def call_tool(context: SynthesisContext, name, args):
     base = {"context_id": context.context_id, "dataset_id": context.dataset.dataset_id, "truncated": False}
     try:
@@ -303,7 +321,12 @@ def call_tool(context: SynthesisContext, name, args):
         _validate(args, definitions[name]["parameters"])
         with context.dataset.validation() as dataset:
             if name == "get_patch_context":
-                result = {"patch_context": context.projection}
+                if args.get("view", "context") == "poc_log":
+                    result = _poc_log(context, dataset, args)
+                elif "cursor" in args:
+                    raise ToolError("invalid_arguments", "cursor is only valid for view=poc_log")
+                else:
+                    result = {"patch_context": context.projection}
             elif name == "get_function_analysis":
                 result = _analysis(context, dataset, args)
             elif name == "list_cases":
