@@ -49,13 +49,60 @@ printf '%s\\n' "$first" "$RUNS" "$CONCRETE_RUN" "$MUTATION_RUN" "$MUTATION_SOCKE
 ''', target)
     assert result.returncode == 0, result.stderr
     first, second, concrete, mutation, socket_path = map(Path, result.stdout.splitlines())
-    assert first != second
+    assert [first.name, second.name] == ['run-debug-00000', 'run-debug-00001']
     assert first.parent == second.parent == target
     assert first.is_dir() and second.is_dir()
+    assert first.stat().st_mode & 0o777 == second.stat().st_mode & 0o777 == 0o700
     assert list(first.iterdir()) == []
     assert concrete == target / "br-gen-con"
     assert mutation == target / "br-gen-bin"
     assert socket_path == mutation / "replay.sock"
+
+
+@pytest.mark.parametrize('last_number', [8, 99999, 100000])
+def test_diagnostic_numbering_skips_gaps_and_preserves_existing_results(tmp_path, last_number):
+    base = tmp_path / 'out'
+    base.mkdir()
+    for name in ('run-debug-00000', f'run-debug-{last_number:05d}', 'runs-debug-legacy'):
+        directory = base / name
+        directory.mkdir()
+        (directory / 'result').write_bytes(b'keep existing result')
+    # Even a non-directory entry reserves its number; never overwrite it.
+    occupied = base / f'run-debug-{last_number + 1:05d}'
+    occupied.write_bytes(b'keep existing file')
+    result = shell('allocate_runs "$1"; printf "%s\\n" "$RUNS"', base)
+    assert result.returncode == 0, result.stderr
+    created = Path(result.stdout.strip())
+    assert created == base / f'run-debug-{last_number + 2:05d}'
+    assert created.is_dir()
+    assert occupied.read_bytes() == b'keep existing file'
+    for name in ('run-debug-00000', f'run-debug-{last_number:05d}', 'runs-debug-legacy'):
+        assert (base / name / 'result').read_bytes() == b'keep existing result'
+
+
+def test_concurrent_diagnostic_allocators_reserve_distinct_numbers(tmp_path):
+    base, start = tmp_path / 'out', tmp_path / 'start'
+    code = ('source "$1"; while [[ ! -e "$3" ]]; do sleep 0.01; done; '
+            'allocate_runs "$2"; printf "%s\\n" "$RUNS"')
+    processes = []
+    try:
+        for _ in range(8):
+            processes.append(subprocess.Popen(
+                [BASH, '-c', code, 'allocator-test', str(RUNNER), str(base), str(start)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+        start.touch()
+        paths = []
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=15)
+            assert process.returncode == 0, stderr
+            paths.append(Path(stdout.strip()))
+        assert {path.name for path in paths} == {f'run-debug-{number:05d}' for number in range(8)}
+        assert all(path.is_dir() and path.parent == base for path in paths)
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=5)
 
 
 @pytest.mark.parametrize("ending,status", [("exit 0", 0), ("exit 7", 7),
@@ -322,7 +369,7 @@ def test_preparation_preserves_failure_status_and_physical_output_base(tmp_path,
     lines = stdout.splitlines()
     assert f"  concrete     {base / 'br-gen-con'}" in lines
     assert f"  mutation     {base / 'br-gen-bin'}" in lines
-    roots = list(base.glob("runs-debug-*"))
+    roots = list(base.glob("run-debug-*"))
     assert len(roots) == 1
     assert f"artifact root: {roots[0]}" in lines
     assert (roots[0] / "logs").is_dir()

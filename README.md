@@ -124,7 +124,7 @@ uv run --project utils/taosc-llm taosc-llm-evaluate \
   --cache-dir workdir/out/taosc-llm-cache --workers 4
 uv run --project utils/taosc-llm taosc-llm \
   --dataset /path/to/new-dataset --provider-env /abs/provider.env \
-  --output /path/to/model-runs --execution-workers 4 \
+  --output /path/to/model-result --execution-workers 4 \
   --replay-socket workdir/out/br-gen-bin/replay.sock \
   --cache-dir workdir/out/taosc-llm-cache
 ```
@@ -182,11 +182,11 @@ literal-destination relocation is unproven, so that path explicitly reports
 ```sh
 uv run --project utils/taosc-llm taosc-llm \
   --dataset /path/to/new-dataset --predicate 'rax <= 0' \
-  --output /path/to/manual-runs --execution-workers 4
+  --output /path/to/manual-result --execution-workers 4
 uv run --project utils/taosc-llm taosc-llm \
   --dataset /path/to/new-dataset --provider-env /absolute/path/to/provider.env \
   --pi-sdk-root utils/taosc-llm/thirdparty/pi \
-  --output /path/to/model-runs --execution-workers 4 --max-rounds 4
+  --output /path/to/model-result --execution-workers 4 --max-rounds 4
 ```
 
 `python -m taosc_llm` is the synthesis CLI. Manual mode loads no provider and
@@ -263,7 +263,7 @@ Add `--session-feedback` to provider synthesis (or `run.sh`):
 uv run --project utils/taosc-llm taosc-llm \
   --dataset /path/to/new-dataset --provider-env /absolute/path/to/provider.env \
   --pi-sdk-root utils/taosc-llm/thirdparty/pi \
-  --output /path/to/model-runs --session-feedback
+  --output /path/to/model-result --session-feedback
 ```
 
 After the final host result is persisted, the **same live Pi SDK session** receives
@@ -306,12 +306,36 @@ model projection or a tool result, and it is not a patch field.
 `unavailable` is not evidence of improvement. Synthesis results retain
 `verified=false` and `binradar_verification=not_run` even when a build exists.
 
-Synthesis uses a private context/run root (temporary by default, or `--output`).
-Model runs contain `run.json` (including private `context_provenance`), `context.json`,
-private preflight `poc.json`, `trials/<round>/` journals/final text, and
+`--output` is the exact private result directory, not a parent for UUID directories.
+Without it, synthesis allocates one temporary directory. Model results go directly
+into `run.json` (including private `context_provenance`), `context.json`, private
+preflight `poc.json`, `trials/<round>/` journals/final text, and
 `candidates/<round>/build-workdir/`, `build-result.json`, `evaluation.json`.
-Manual runs place `build-workdir/` and `run.json` in their own unique run directory.
-Source workdir candidate outputs are not overwritten.
+Optional review writes `session-feedback.md` in that same root. Manual results use
+`build-workdir/`, `build.log`, `context.json` and `run.json` directly under `--output`.
+Protocol `run_id` remains metadata; use returned `run_directory`, never append
+`run_id` to locate files.
+
+Choose an unused output directory for every invocation. New/empty directories are
+accepted, as is a directory containing only a real `cache/` initialized by context
+preparation. Existing results, unrelated content and legacy UUID subdirectories
+are rejected before context preparation can change caches. Atomic exclusive
+`run.json` creation admits only one concurrent owner; failed/interrupted runs are
+not automatically resumed. The root is private mode 0700. Keep reusable caches
+outside the result via `--cache-dir`, or use the default `<output>/cache`.
+Previous outputs and source workdir candidate artifacts are not overwritten.
+
+For `run.sh`, model output is now:
+
+```text
+run-debug-00000/taosc-llm-result/
+  run.json
+  context.json
+  poc.json
+  session-feedback.md          # only with successful --session-feedback
+  trials/
+  candidates/
+```
 
 | Built artifact | Meaning |
 |---|---|
@@ -461,12 +485,19 @@ paths are made absolute before changing cwd, without expanding user-provided sym
 workdir/out/
   br-gen-con/                  # replaced unless --skip-concrete
   br-gen-bin/                  # replaced unless --only-concrete
-  runs-debug-<random>/         # fresh logs; dataset/result/cache in resident modes
+  run-debug-00000/             # fresh logs; dataset/result/cache in resident modes
+  run-debug-00001/             # subsequent invocation; largest number is newest allocation
 ```
 
 `--outdir DIR` overrides this base directory. Each producer receives its own
 exact `binradar --output` leaf; neither `--run-prefix` nor a numeric suffix is
-used. Diagnostic roots still use `mktemp -d` so old logs/datasets remain separate.
+used for producer leaves. Diagnostic roots use `run-debug-00000`, `run-debug-00001`,
+etc.: the next index exceeds every existing numbered entry under the selected base.
+Indices are decimal with at least five digits; gaps are not filled. Atomic mode-0700
+`mkdir` reserves each root, retrying a competing allocation without sharing or
+replacing its contents. Old `runs-debug-<random>` roots are left untouched and do not
+participate in numbering. The largest number identifies the newest allocation,
+not necessarily the last completed or successful run.
 BinRadar, not this script, creates the actual socket under
 `/tmp/binradar-replay-<random>/` and publishes `br-gen-bin/replay.sock` as a
 symlink. The script always passes the requested producer paths; there is no

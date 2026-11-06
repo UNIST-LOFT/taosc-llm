@@ -6,9 +6,24 @@ set -euo pipefail
 # Preserve the user's lexical paths, including symlinked directories.
 absolute_path() { realpath --canonicalize-missing --no-symlinks -- "$1"; }
 allocate_runs() {
-  local out=$1
+  local out=$1 path suffix number next=0
   mkdir -p -- "$out"
-  RUNS=$(mktemp -d -- "$out/runs-debug-XXXXXXXXXX")
+  for path in "$out"/run-debug-*; do
+    suffix=${path##*/run-debug-}
+    [[ "$suffix" =~ ^[0-9]{5,}$ ]] || continue
+    number=$((10#$suffix))
+    if ((number >= next)); then next=$((number + 1)); fi
+  done
+  while :; do
+    printf -v RUNS '%s/run-debug-%05d' "$out" "$next"
+    # mkdir is the reservation: concurrent allocators cannot share a root.
+    if mkdir -m 700 -- "$RUNS" 2>/dev/null; then break; fi
+    if [[ ! -e "$RUNS" && ! -L "$RUNS" ]]; then
+      echo "cannot create diagnostic directory: $RUNS" >&2
+      return 1
+    fi
+    next=$((next + 1))
+  done
   LOG=$RUNS/logs
   CONCRETE_RUN=$out/br-gen-con
   MUTATION_RUN=$out/br-gen-bin

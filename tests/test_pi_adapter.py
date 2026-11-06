@@ -650,7 +650,8 @@ print(json.dumps(result))
                 process.wait()
     assert len(list(rendezvous.iterdir())) == 2
     assert len({result["run_id"] for result in results}) == 2
-    for result in results:
+    for index, result in enumerate(results):
+        assert Path(result["run_directory"]) == tmp_path / f"independent-run-{index}"
         assert result["status"] == "abstained"
         assert result["verified"] is False
         assert result["binradar_verification"] == "not_run"

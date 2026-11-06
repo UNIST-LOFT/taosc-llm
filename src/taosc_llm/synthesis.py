@@ -20,6 +20,30 @@ def write_record(path: Path, value: object) -> None:
     _write_private(path, canonical(value))
 
 
+def _check_output(output: Path | None) -> None:
+    if output is None:
+        return
+    run_dir = Path(output).resolve()
+    if not run_dir.exists():
+        return
+    # Context preparation may already have populated its private evidence cache.
+    if any(path.name != "cache" or not path.is_dir() or path.is_symlink()
+           for path in run_dir.iterdir()):
+        raise FileExistsError(f"synthesis output is already in use; choose a new directory: {run_dir}")
+
+
+def _start_run(context: SynthesisContext, result: dict) -> None:
+    """Reserve the exact output once, before execution or provider work."""
+    run_dir = context.run_dir
+    _check_output(run_dir)
+    # Exclusive creation closes the race between concurrent empty-directory checks.
+    # Keep the reservation on failure; neither failed nor completed runs are resumed.
+    fd = os.open(run_dir / "run.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(fd)
+    run_dir.chmod(0o700)
+    write_record(run_dir / "run.json", result)
+
+
 def _write_private(path: Path, data: bytes) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with NamedTemporaryFile(mode="wb", dir=path.parent, delete=False) as temporary:
@@ -160,13 +184,13 @@ async def synthesize_context(context: SynthesisContext, provider: ProviderConfig
     command = adapter_command(sdk_root)
     context.verify_artifacts()
     run_id = uuid.uuid4().hex
-    run_dir = context.run_dir / run_id
-    run_dir.mkdir(mode=0o700, parents=True)
+    run_dir = context.run_dir
     result = {"schema_version": 2, "run_id": run_id, "context_id": context.context_id,
               "dataset_id": context.dataset.dataset_id, "run_directory": str(run_dir),
               "context_provenance": context.audit,
               "status": "prepared", "verified": False, "provider": provider.public_dict(),
               "binradar_verification": "not_run", "attempts": [], "rounds": []}
+    _start_run(context, result)
     feedback = []
     prior_results = {}
     prior_evidence = set(context._evidence_ids)
@@ -285,12 +309,12 @@ async def synthesize_context(context: SynthesisContext, provider: ProviderConfig
 def generate_manual(dataset: Path, predicate: str, *, execution_workers=1, output: Path | None = None,
                     replay_socket: Path | None = None, cache_dir: Path | None = None) -> dict:
     """Build and evaluate a host-provided family predicate without any model call."""
+    _check_output(output)
     from .family import parse_candidate
     context = prepare_context(dataset, run_dir=output, workers=execution_workers,
                               replay_socket=replay_socket, cache_dir=cache_dir)
     parsed = parse_candidate(context.dataset.patch_format, predicate)
-    run_dir = context.run_dir / uuid.uuid4().hex
-    run_dir.mkdir(mode=0o700)
+    run_dir = context.run_dir
 
     async def generate():
         from .evaluation import evaluate_dataset
@@ -299,8 +323,8 @@ def generate_manual(dataset: Path, predicate: str, *, execution_workers=1, outpu
                   "predicate": parsed.expression,
                   "run_directory": str(run_dir), "status": "prepared", "verified": False,
                   "binradar_verification": "not_run"}
+        _start_run(context, result)
         write_record(run_dir / "context.json", context.projection)
-        write_record(run_dir / "run.json", result)
         try:
             result["build"] = await _build(context, {"predicate": parsed.expression}, run_dir / "build-workdir")
             result["evaluation"] = await _blocking(evaluate_dataset, context.dataset, parsed.expression,
@@ -323,6 +347,7 @@ def generate_with_pi(dataset: Path, provider_file: Path, *, sdk_root=None, base_
                      max_rounds=4, output: Path | None = None,
                      replay_socket: Path | None = None,
                      cache_dir: Path | None = None, session_feedback: bool = False) -> dict:
+    _check_output(output)
     provider = load_provider(provider_file, base_url=base_url, model=model)
     context = prepare_context(dataset, run_dir=output, workers=execution_workers,
                               replay_socket=replay_socket, cache_dir=cache_dir)

@@ -60,7 +60,7 @@ def test_exact_candidate_must_have_been_evaluated(tmp_path, monkeypatch):
     assert result["status"] == "refinement_exhausted"
     assert result["rounds"][0]["status"] == "parse_rejected"
     assert "exact predicate" in result["rounds"][0]["reason"]
-    assert not (tmp_path / "runs" / result["run_id"] / "candidates").exists()
+    assert not (tmp_path / "runs" / "candidates").exists()
     assert result["verified"] is False
 
 
@@ -100,13 +100,82 @@ def test_manual_failure_retains_unverified_run_record(tmp_path, monkeypatch, err
     monkeypatch.setattr(synthesis, "_build", abort_build)
     with pytest.raises(type(error)):
         synthesis.generate_manual(dataset, "0", output=tmp_path / "runs")
-    records = list((tmp_path / "runs").glob("*/run.json"))
-    assert len(records) == 1
-    result = json.loads(records[0].read_text())
+    record = tmp_path / "runs" / "run.json"
+    result = json.loads(record.read_text())
+    before = record.read_bytes()
+    with pytest.raises(FileExistsError):
+        synthesis.generate_manual(dataset, "0", output=tmp_path / "runs")
+    assert record.read_bytes() == before
+    assert result["run_directory"] == str(tmp_path / "runs")
     assert result["status"] == status and result["error_type"] == type(error).__name__
     assert result["verified"] is False and result["binradar_verification"] == "not_run"
     assert "build" not in result and "evaluation" not in result
-    assert json.loads(records[0].with_name("context.json").read_text())["context_id"] == result["context_id"]
+    assert json.loads(record.with_name("context.json").read_text())["context_id"] == result["context_id"]
+
+
+@pytest.mark.parametrize('mode', ['manual', 'provider', 'provider_entry'])
+@pytest.mark.parametrize('occupied', ['run.json', 'context.json', 'legacy/run.json', 'symlink'])
+def test_existing_output_is_rejected_without_execution_or_overwrite(tmp_path, monkeypatch, mode, occupied):
+    dataset = make_dataset(tmp_path / 'dataset')
+    output = tmp_path / 'result'
+    output.mkdir()
+    if occupied == 'symlink':
+        original = tmp_path / 'original.json'
+        original.write_bytes(b'preserve original result')
+        marker = output / 'run.json'
+        marker.symlink_to(original)
+    else:
+        marker = output / occupied
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_bytes(b'preserve original result')
+    context = prepare_context(dataset, run_dir=output)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail('occupied output must fail before execution or provider work')
+
+    monkeypatch.setattr(synthesis, 'adapter_command', lambda _: ['not-executed'])
+    monkeypatch.setattr(synthesis, '_build', forbidden)
+    monkeypatch.setattr(synthesis, '_model_round', forbidden)
+    monkeypatch.setattr(synthesis, 'poc_observation', forbidden)
+    monkeypatch.setattr(synthesis, 'prepare_context', forbidden)
+    monkeypatch.setattr(synthesis, 'load_provider', forbidden)
+    with pytest.raises(FileExistsError):
+        if mode == 'manual':
+            synthesis.generate_manual(dataset, '0', output=output)
+        elif mode == 'provider_entry':
+            synthesis.generate_with_pi(dataset, tmp_path / 'provider.env', output=output)
+        else:
+            provider = ProviderConfig(api_key='offline-only', base_url='https://example.invalid/v1', model='offline')
+            asyncio.run(synthesis.synthesize_context(context, provider))
+    assert marker.read_bytes() == b'preserve original result'
+    assert not (output / 'trials').exists() and not (output / 'build-workdir').exists()
+
+
+def test_concurrent_output_claim_has_one_owner_and_preserves_cache(tmp_path):
+    context = prepare_context(make_dataset(tmp_path / 'dataset'), run_dir=tmp_path / 'result')
+    context.run_dir.chmod(0o755)
+    cache = context.run_dir / 'cache'
+    cache.mkdir()
+    (cache / 'observation').write_bytes(b'preserve cached evidence')
+
+    def claim(owner):
+        try:
+            synthesis._start_run(context, {'owner': owner})
+        except FileExistsError:
+            return None
+        return owner
+
+    async def race():
+        return await asyncio.gather(*(asyncio.to_thread(claim, owner) for owner in range(16)))
+
+    winners = [owner for owner in asyncio.run(race()) if owner is not None]
+    assert len(winners) == 1
+    record = context.run_dir / 'run.json'
+    assert json.loads(record.read_text())['owner'] == winners[0]
+    assert context.run_dir.stat().st_mode & 0o777 == 0o700
+    assert record.stat().st_mode & 0o777 == 0o600
+    assert (cache / 'observation').read_bytes() == b'preserve cached evidence'
+    assert {entry.name for entry in context.run_dir.iterdir()} == {'run.json', 'cache'}
 
 
 def test_cli_stdout_is_one_json_after_native_and_child_diagnostics(tmp_path):
@@ -208,7 +277,7 @@ def test_feedback_follows_final_host_outcome_only(tmp_path, monkeypatch, outcome
     result = asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=2, session_feedback=True))
     assert result["status"] == outcome and result["verified"] is False
     assert prompts[0] is None and prompts[1] is not None
-    path = context.run_dir / result["run_id"] / "session-feedback.md"
+    path = context.run_dir / "session-feedback.md"
     assert path.read_text() == "# Review\nBounded evidence."
     assert path.stat().st_mode & 0o777 == 0o600
     assert "final_text" not in result["session_feedback"]
@@ -254,7 +323,7 @@ def test_feedback_failure_is_separate_from_abstention(tmp_path, monkeypatch):
     result = asyncio.run(synthesis.synthesize_context(context, provider, session_feedback=True))
     assert result["status"] == "abstained"
     assert result["session_feedback"]["error_code"] == "timeout"
-    assert not (context.run_dir / result["run_id"] / "session-feedback.md").exists()
+    assert not (context.run_dir / "session-feedback.md").exists()
 
 
 def test_review_preparation_failure_preserves_frozen_verdict(tmp_path, monkeypatch):
@@ -275,9 +344,9 @@ def test_review_preparation_failure_preserves_frozen_verdict(tmp_path, monkeypat
     result = asyncio.run(synthesis.synthesize_context(context, provider, session_feedback=True))
     assert result["status"] == "abstained" and result["verified"] is False
     assert result["session_feedback"]["error_code"] == "feedback_preparation_error"
-    record = json.loads((context.run_dir / result["run_id"] / "run.json").read_text())
+    record = json.loads((context.run_dir / "run.json").read_text())
     assert record["status"] == "abstained"
-    assert not (context.run_dir / result["run_id"] / "session-feedback.md").exists()
+    assert not (context.run_dir / "session-feedback.md").exists()
 
 
 def test_manual_cli_rejects_session_feedback_before_preparing(tmp_path):
@@ -320,10 +389,16 @@ def test_provider_preflight_precedes_prompt_and_survives_refinement(tmp_path, mo
     result = asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=2))
     assert result["status"] == "abstained" and len(rounds) == 2
     assert preflights[0][1] == context.run_dir / "cache"
-    run = context.run_dir / result["run_id"]
+    run = context.run_dir
     assert json.loads((run / "poc.json").read_text()) == rounds[0]._poc
     assert json.loads((run / "context.json").read_text())["context_id"] == result["context_id"]
     assert result["context_provenance"] == context.audit
+    assert result["run_directory"] == str(run)
+    before = (run / 'run.json').read_bytes()
+    with pytest.raises(FileExistsError):
+        asyncio.run(synthesis.synthesize_context(context, provider))
+    assert (run / 'run.json').read_bytes() == before
+    assert len(preflights) == 1
 
 
 def test_manual_mode_does_not_run_provider_preflight(tmp_path, monkeypatch):

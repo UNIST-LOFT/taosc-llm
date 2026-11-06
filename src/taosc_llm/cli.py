@@ -59,7 +59,7 @@ def main(argv: list[str] | None = None) -> int:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--predicate", help="manual family-specific predicate, evaluated before building")
     mode.add_argument("--provider-env", type=Path, help="explicit provider file; enables isolated Pi refinement")
-    parser.add_argument("--output", type=Path, help="private synthesis run root")
+    parser.add_argument("--output", type=Path, help="exact private result directory; existing results are refused (no UUID subdirectory)")
     parser.add_argument("--execution-workers", type=_positive, default=1, help="concrete evaluation workers")
     parser.add_argument("--max-rounds", type=_positive, help="maximum proposal/build/refinement rounds (provider mode; default: 4)")
     parser.add_argument("--pi-sdk-root", type=Path, help="pinned SDK project; Guix supplies its own default")
