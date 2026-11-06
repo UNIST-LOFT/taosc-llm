@@ -5,7 +5,6 @@ import json
 import os
 import re
 import shutil
-import signal
 import sys
 import uuid
 from importlib.resources import files
@@ -13,7 +12,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from .context import SynthesisContext, strict_json
-from .provider import ProviderConfig, native_environment
+from .provider import ProviderConfig
+from .native import kill_process, native_environment
 
 MAX_FRAME = 4 * 1024 * 1024
 
@@ -40,15 +40,6 @@ def adapter_command(sdk_root: Path | None = None) -> list[str]:
         raise AdapterError("Node >=22.19 is required")
     return [node, str(files("taosc_llm").joinpath("pi/adapter.mjs")),
             "--sdk-root", str(root)]
-
-
-async def _kill(process) -> None:
-    if process.returncode is None:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    await process.wait()
 
 
 async def run_adapter(context: SynthesisContext, provider: ProviderConfig,
@@ -273,4 +264,4 @@ async def run_adapter(context: SynthesisContext, provider: ProviderConfig,
             if write_fd >= 0:
                 os.close(write_fd)
             if process is not None:
-                await _kill(process)
+                await kill_process(process)

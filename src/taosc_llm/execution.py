@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+from threading import Lock
 from importlib.resources import files
 
 from binradar import paths
@@ -15,8 +16,10 @@ from binradar import binradar_verifier as verifier
 from binradar.binradar_feedback_capture import concrete_result
 from binradar.binradar_taosc_predicates import parse_cached_snapshots
 
-from .native import _SYSTEM_READ
-from .provider import native_environment
+from .native import _SYSTEM_READ, native_environment
+
+
+_METADATA_OUTPUT = Lock()
 
 
 def sha256(path: Path) -> str:
@@ -43,7 +46,8 @@ class _PrivateRunner(verifier.BinRadarQemuRunner):
         return [*argv, '--', *command]
 
 
-def _execute(dataset, case: dict, descriptor: str, directory: Path, *, original=False) -> dict:
+def _execute(dataset, case: dict, descriptor: str, directory: Path, *, original=False,
+             built=None, artifact='selectable', patch_id=1) -> dict:
     """Run the original or an explicit descriptor, never manifest selection.
 
     Every call owns a copied artifact tree, input, environment, cwd and runner.
@@ -75,6 +79,34 @@ def _execute(dataset, case: dict, descriptor: str, directory: Path, *, original=
             copied = work / relative
             if not copied.is_file() or sha256(copied) != record['sha256']:
                 raise ExecutionUnavailable('copied-artifact-mismatch')
+        if built is not None:
+            # Authenticate the source and every private copy. Do not reuse the
+            # cached artifact's E9 map/ranges for this newly linked candidate.
+            for name, value in built['artifacts'].items():
+                source_artifact = Path(value)
+                if sha256(source_artifact) != built['artifact_hashes'][name]:
+                    raise ValueError('build artifact identity mismatch')
+                destination = work / name
+                if destination.is_symlink():
+                    raise ValueError('built artifact copy is a symlink')
+                shutil.copyfile(source_artifact, destination)
+                if sha256(destination) != built['artifact_hashes'][name]:
+                    raise ValueError('built artifact copy mismatch')
+                destination.chmod(0o500 if name in (dataset.binary + '.patched', dataset.binary + '.brpatched') else 0o600)
+            selected_name = dataset.binary + ('.patched' if artifact == 'fixed' else '.brpatched')
+            # The canonical verifier recognizes .brpatched/.brcached, not the
+            # fixed-runtime suffix. Give the exact fixed bytes and their own
+            # sidecars a private .brpatched alias; never borrow selectable maps.
+            if artifact == 'fixed':
+                for extension in ('', '.json', '.e9map.json'):
+                    alias = work / (dataset.binary + '.brpatched' + extension)
+                    alias.unlink()
+                    shutil.copyfile(work / (selected_name + extension), alias)
+                    if sha256(alias) != built['artifact_hashes'][selected_name + extension]:
+                        raise ValueError('built fixed artifact copy mismatch')
+                    alias.chmod(0o500 if not extension else 0o600)
+            binary = work / (dataset.binary + '.brpatched')
+            artifact_hash = sha256(binary)
         # Existing cached PIE builds have not established descriptor relocation
         # parity. p0 cannot take a repair destination; candidate repair must not
         # be inferred from that baseline or silently executed with wrong VAs.
@@ -82,7 +114,7 @@ def _execute(dataset, case: dict, descriptor: str, directory: Path, *, original=
             header = stream.read(20)
         if (len(header) >= 18 and header[:4] == b'\x7fELF'
                 and int.from_bytes(header[16:18], 'little' if header[5] == 1 else 'big') == 3
-                and descriptor != 'p0'):
+                and descriptor != 'p0' and built is None):
             raise ExecutionUnavailable('pie-descriptor-relocation-capability-unavailable')
         source = (dataset.root / case['input_path']).resolve(strict=True)
         if sha256(source) != case['input_sha256']:
@@ -91,7 +123,20 @@ def _execute(dataset, case: dict, descriptor: str, directory: Path, *, original=
         shutil.copyfile(source, input_file)
         if sha256(input_file) != case['input_sha256']:
             raise ExecutionUnavailable('copied-input-mismatch')
-        settings = dataset.execution_environment()
+        settings = dict(dataset.execution_environment())
+        if built is not None:
+            from contextlib import redirect_stdout
+            from binradar import binradar_setup, binradar_utils
+            with _METADATA_OUTPUT, redirect_stdout(sys.stderr):
+                metadata = binradar_setup.extract_e9_runtime_metadata(
+                    binary, Path(str(binary) + '.json'), original_binary,
+                    int(built['patch_location'], 0))
+            # Extraction must agree with the exact map returned by the builder.
+            map_name = selected_name + '.e9map.json'
+            if sha256(Path(str(binary) + '.e9map.json')) != built['artifact_hashes'][map_name]:
+                raise ValueError('built exact E9 map mismatch')
+            binradar_utils.set_e9_metadata(settings, 'brpatched',
+                                          metadata.exclude_ranges_str(), metadata.relocated_calls_str())
         configured = verifier.BinRadarQemuRunner.from_env(str(work), settings)
         runner = _PrivateRunner(
             configured.dir, configured.binary, configured.test_cmd, configured.patch_loc,
@@ -99,9 +144,10 @@ def _execute(dataset, case: dict, descriptor: str, directory: Path, *, original=
             configured.exec_timeout)
         if not original:
             runner.load_instruction_map(str(binary))
+        patch_id = str(patch_id) if built is not None else '0'
         environment = native_environment()
         environment.update(HOME=str(work), TMPDIR=str(work), LC_ALL='C',
-                           AFL_USE_QASAN='1', PATCH_ID='0', TAOSC_PRED=descriptor,
+                           AFL_USE_QASAN='1', PATCH_ID=patch_id, TAOSC_PRED=descriptor,
                            BRCACHE_STACK_SIZE=str(runner.brcache_stack_size))
         ranges, _ = runner.e9_metadata_for_binary(str(binary))
         if ranges:
@@ -111,20 +157,29 @@ def _execute(dataset, case: dict, descriptor: str, directory: Path, *, original=
             if key in settings:
                 environment[key] = settings[key]
         probe, text, raw = runner._test_with_capture(
-            str(binary), '0', str(input_file), capture_cached=not original, base_env=environment)
+            str(binary), patch_id, str(input_file),
+            capture_cached=not original and built is None, base_env=environment)
         execution = runner.run_results
         if (execution is None or not execution.success or execution.timed_out
                 or probe is None or probe.exit_info not in ('ok', 'crash')):
             raise ExecutionUnavailable('execution-unavailable')
         if original:
-            return {'artifact_sha256': artifact_hash, 'outcome': concrete_result(probe)}
+            return {'artifact_sha256': artifact_hash, 'outcome': concrete_result(probe),
+                    'patch_hits': getattr(probe, 'patch_hit_cnt', None)}
         patch = verifier.BinRadarPatchResult.from_log(text.decode(errors='replace')) if text else None
         if probe.patch_hit_cnt == 0 and not text:
             branches = []
-        elif patch is None or patch.patch_id != 0 or len(patch.br_selection) != probe.patch_hit_cnt:
+        elif (patch is None or patch.patch_id != (1 if built is not None and artifact == 'fixed' else int(patch_id))
+              or len(patch.br_selection) != probe.patch_hit_cnt):
             raise ExecutionUnavailable('branch-capture-mismatch')
         else:
             branches = patch.br_selection
+        if built is not None:
+            if any(type(branch) is not int or branch not in (0, 1, 2) for branch in branches):
+                raise ExecutionUnavailable('built-branch-vector-invalid')
+            return {'artifact_sha256': artifact_hash, 'branches': branches,
+                    'patch_id': 1 if artifact == 'fixed' else int(patch_id),
+                    'artifact': artifact, 'outcome': concrete_result(probe)}
         snapshots, error = parse_cached_snapshots(raw) if raw is not None else ([], 'missing-brch')
         complete = error is None and len(snapshots) == len(branches) and [s.branch for s in snapshots] == branches
         expected_cwe = dataset.patch_format == 'ERM CWE-805'
@@ -160,6 +215,20 @@ def execute_capture(dataset, case: dict, descriptor: str, directory: Path) -> di
 def execute_original(dataset, case: dict, directory: Path) -> dict:
     """Observe the real .orig artifact; never substitute neutral .brcached states."""
     return _execute(dataset, case, 'p0', directory, original=True)
+
+
+def execute_built(dataset, case: dict, build: dict, directory: Path, *,
+                  artifact='selectable', patch_id=1) -> dict:
+    """Replay exact built bytes, never a cached descriptor.
+
+    The publication boundary authenticates build inventory and scoped cases;
+    this worker rechecks copied bytes before any native target execution.
+    Fixed mode ignores the external selector, just as the published runtime does.
+    """
+    if artifact not in ('selectable', 'fixed') or type(patch_id) is not int or patch_id not in (0, 1):
+        raise ValueError('invalid built artifact activation')
+    return _execute(dataset, case, build['descriptor'], directory, built=build,
+                    artifact=artifact, patch_id=patch_id)
 
 
 def execution_identity() -> dict:

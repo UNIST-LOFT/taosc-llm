@@ -144,7 +144,7 @@ default_rea() {
 main() {
   REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd) # binradar repo
   TAOSC_LLM=$REPO/utils/taosc-llm # taosc-llm repo
-  SUBJECT=$REPO/benchmarks/loftix/binutils/CVE-2017-14745 # subject directory with config.env
+  SUBJECT=$(pwd) # subject directory with config.env (/home/binradar/code/binradar-dev/benchmarks/loftix/binutils/CVE-2017-14745)
   WORKDIR_NAME=workdir-0.1.24
   OUTDIR= TIMEOUT=7200 READY_TIMEOUT=0 PROVIDER_ENV=$TAOSC_LLM/.env PREDICATE= NO_LLM=0 REA=
   SKIP_CONCRETE=0 ONLY_CONCRETE=0 SESSION_FEEDBACK=0

@@ -3,8 +3,6 @@ import asyncio
 import hashlib
 import json
 import os
-import shutil
-import sys
 import uuid
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -13,7 +11,8 @@ from .bridge import adapter_command, run_adapter
 from .context import SynthesisContext, canonical, prepare_context
 from .poc import poc_observation
 from .presentation import feedback as predicate_feedback
-from .provider import ProviderConfig, load_provider, native_environment
+from .provider import ProviderConfig, load_provider
+from .publication import build_candidate
 
 
 def write_record(path: Path, value: object) -> None:
@@ -76,60 +75,7 @@ async def _blocking(function, *args, **kwargs):
         raise
 
 
-async def _build(context: SynthesisContext, proposal: dict, candidate: Path) -> dict:
-    import binradar
-    from binradar import paths
-    context.verify_artifacts()
-    candidate.mkdir(mode=0o700, parents=True)
-    dataset = context.dataset
-    # Resolve only frozen metadata. No source run or arbitrary environment is copied.
-    for name in (dataset.binary + ".orig", "patch-location", "patch-destination", "patch-format"):
-        shutil.copyfile(dataset.artifact(name), candidate / name)
-    if dataset.patch_format == "ERM CWE-805":
-        shutil.copyfile(dataset.artifact("stack-size"), candidate / "stack-size")
-        trace = candidate / "trace"
-        trace.mkdir()
-        for allocator in ("malloc", "calloc", "realloc"):
-            for suffix in ("calls", "returns"):
-                name = f"trace/{allocator}.{suffix}"
-                if name in dataset.manifest["artifacts"]:
-                    shutil.copyfile(dataset.artifact(name), candidate / name)
-    original = candidate / (dataset.binary + ".orig")
-    original.chmod(0o500)
-    expected = hashlib.sha256(context.original_path.read_bytes()).hexdigest()
-    config = candidate / "config.env"
-    config.write_text(f"BINARY={dataset.binary}\n")
-    environment = native_environment()
-    environment.update(E9TOOL=paths.e9tool(), E9COMPILE=paths.e9compile())
-    roots = list(dict.fromkeys([str(Path(__file__).resolve().parent.parent),
-                              str(Path(binradar.__file__).resolve().parent.parent),
-                              *(str(Path(p).resolve()) for p in sys.path if p and Path(p).is_absolute())]))
-    bootstrap = ("import json,sys;from pathlib import Path;sys.path[:0]=json.loads(sys.argv[1]);"
-                 "from taosc_llm.builder import generate_patch;from taosc_llm.native import build_command;"
-                 "print(json.dumps(generate_patch(Path(sys.argv[2]),Path(sys.argv[3]),sys.argv[4],native_runner=build_command)))")
-    process = await asyncio.create_subprocess_exec(sys.executable, "-I", "-c", bootstrap, json.dumps(roots),
-        str(config), str(candidate), proposal["predicate"], cwd=candidate, env=environment,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, start_new_session=True)
-    try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=1800)
-    except BaseException:
-        from .bridge import _kill
-        await _kill(process)
-        raise
-    (candidate.parent / "build.log").write_bytes(stderr[:65536])
-    if process.returncode or len(stdout) > 1024 * 1024:
-        raise RuntimeError("isolated candidate build failed; see private build.log")
-    result = json.loads(stdout)
-    if result.get("status") != "built" or result.get("verified") is not False:
-        raise RuntimeError("unexpected native build result")
-    context.verify_artifacts()
-    if hashlib.sha256(original.read_bytes()).hexdigest() != expected:
-        raise ValueError("build changed frozen original copy")
-    result["original_sha256"] = expected
-    result["artifact_hashes"] = {name: hashlib.sha256(Path(path).read_bytes()).hexdigest()
-                                 for name, path in result["artifacts"].items()}
-    result["native_isolation"] = "linux-landlock-seccomp"
-    return result
+
 
 
 async def _model_round(context, provider, command, run_id, trials, attempts, on_complete=None):
@@ -232,7 +178,7 @@ async def synthesize_context(context: SynthesisContext, provider: ProviderConfig
                     else:
                         candidate = run_dir / "candidates" / str(index + 1) / "build-workdir"
                         try:
-                            build = await _build(current, proposal, candidate)
+                            build = await build_candidate(current.dataset, proposal['predicate'], candidate)
                         except (ValueError, RuntimeError, OSError) as error:
                             round_result.update(status="build_rejected", reason=str(error))
                         else:
@@ -326,7 +272,7 @@ def generate_manual(dataset: Path, predicate: str, *, execution_workers=1, outpu
         _start_run(context, result)
         write_record(run_dir / "context.json", context.projection)
         try:
-            result["build"] = await _build(context, {"predicate": parsed.expression}, run_dir / "build-workdir")
+            result["build"] = await build_candidate(context.dataset, parsed.expression, run_dir / "build-workdir")
             result["evaluation"] = await _blocking(evaluate_dataset, context.dataset, parsed.expression,
                 workers=context.workers, execute=True,
                 cache_dir=context.cache_dir or context.run_dir / "cache",

@@ -177,6 +177,103 @@ A supplied PIE `.brcached` cannot currently execute a nonneutral descriptor:
 literal-destination relocation is unproven, so that path explicitly reports
 `unavailable`. This is distinct from the fixed/selectable builder's PIE support.
 
+## Non-LLM branch-selection synthesis
+
+```sh
+uv run --project utils/taosc-llm taosc-llm-no-llm \
+  --dataset DATASET --output NEW_RESULT --execution-workers 4
+# Optional existing, dataset-bound mutation server:
+uv run --project utils/taosc-llm taosc-llm-no-llm \
+  --dataset DATASET --output NEW_RESULT --replay-socket RUN/replay.sock
+# Repeat the original limits/execution policy when resuming:
+uv run --project utils/taosc-llm taosc-llm-no-llm \
+  --dataset DATASET --output EXISTING_RESULT --execution-workers 4 --resume
+```
+
+`python -m taosc_llm.no_llm` is equivalent. This host-only path imports no
+provider, model context or Pi loop; it accepts no provider/model/session-review
+options. It consumes the same prepared dataset, canonical family parser,
+full-vector evaluator, optional explicit replay bridge and isolated builder.
+It neither prepares a dataset nor invokes REA, starts a replay server or runs
+BinRadar FINAL. The wheel/Guix closure still includes the existing Pi tools.
+The reusable library entry is `taosc_llm.no_llm.run.synthesize(dataset,
+output=..., limits=SearchLimits(...), execution_workers=..., cache_dir=...,
+replay_socket=..., resume=...)`; `SearchEngine` accepts the host execution backend,
+not CLI arguments or a model session.
+
+The objective is **case-level branch selection**, separate from existing model
+feedback. A reached normal case selecting repair is a regression even if it
+exits normally. A target case is covered only with a compatible target-crashing
+neutral control, an actual normal candidate outcome and a complete vector with
+repair selected. Other-location crashes, traps, unknown/missing observations and
+normal-without-repair supply no coverage. Original/neutral outcome or reachability
+disagreement remains a baseline gap, not an excluded target. A POC absent from
+the producer inventory receives separate original and neutral observations.
+Known baseline no-hit cases are excluded; missing captures are never zero hits.
+Concrete and mutation domains retain their distinct oracles and counts.
+
+Search uses ordered generic repair DNF; CWE-805 uses its ordered dual safe CNF
+against one same clamp. No new runtime grammar or independently reduced clamp
+OR is introduced. Bounded atom/beam exploration shortlists candidates using
+captured values; only actual execution or equal complete-vector reuse establishes
+coverage. Each introduced clause keeps its immutable marginal owner cases,
+prefix revision, expression and decisive-hit evidence. Refinement must preserve
+both that local obligation without later clauses and the current global owners;
+hiding normal cases behind unavailable evidence is not an improvement.
+
+| Search option | Finite default | Bound |
+|---|---:|---|
+| `--timeout` | 3600 seconds | Positive finite admission budget |
+| `--max-evaluations` | 256 | Positive; includes baseline admission |
+| `--max-executions` | 10000 | Positive conservative target-execution reservations |
+| `--max-atoms` | 512 | 1–65536 |
+| `--beam-width` | 12 | 1–256 |
+| `--max-clauses` | 12 | 1–128 |
+| `--max-factors` | 6 | 1–128 |
+| `--operand-depth` | 2 | 1–4; generic leaves have depth 1 |
+
+Canonical source/descriptor/depth and stack bounds override search bounds.
+Reservations are charged before an operation and persist even if cached or
+interrupted; they are not measured subprocess counts. In-flight evaluation drains
+under existing per-execution limits. Finalization is separate from the search
+call cap, reserves up to three executions per concrete case, and does not reset
+budgets. Search stop reasons distinguish goals, budgets, bounded exhaustion,
+interruption and evidence gaps; no global optimum or out-of-corpus repair is
+claimed. `coverage=complete` means complete observations, not all targets repaired.
+
+The output is a private, single-writer schema-1 session: immutable `identity.json`,
+`segments/*.jsonl`, content-addressed `payloads/`, private `cache/`, and new
+`candidates/` directories. Stdout is one JSON result; diagnostics go to stderr.
+`result_record` names the immutable summary payload; journal events are the source
+of truth. Resume never overwrites old segments/payloads or interprets manual/Pi
+`run.json`. Checksums, chains and transitive evidence references are checked;
+a torn final record remains on disk, while complete corruption is fatal.
+Directory/file locks, restrictive permissions, symlink rejection and fsync ordering
+protect publication. The frontier, capture revision, atom order, incumbent,
+owners and spent budgets are restored. Different dataset/artifact/oracle,
+implementation, limits, workers or replay policy refuses resume. SIGINT/TERM
+stop admission and drain registered children. SIGKILL cannot report its stop time:
+the interval since the last durable budget timestamp, including downtime, is
+conservatively charged; cleanly closed sessions do not charge downtime.
+
+A missing old replay server allows offline/concrete continuation; an endpoint
+replacement cannot rebind old mutation IDs. BRCH is not a process checkpoint.
+An interrupted build is retried in a new candidate directory. Only a completed
+`publication` event authenticates fully checked artifacts; incomplete attempts
+are recorded separately. Final verification compares fixed and selectable id1
+against candidate outcomes/full vectors and selectable id0 against neutral controls.
+The fixed artifact honors `PATCH_FD` for logging but never lets `PATCH_ID` or SHM
+disable its guard. `publication_status=matched` is local artifact parity only;
+function mutations cannot be transferred to newly built artifacts and leave
+publication partial. Every result retains `verified=false` and
+`binradar_verification=not_run`.
+
+Exit status: **0** observed goals met (or no admitted target cases), **2** search
+stopped/incomplete goals, **3** incomplete evidence/publication, **130** interrupted,
+**1** input/storage/engine failure. Read the result, not exit status alone.
+Acceptance and remaining representative-corpus/live-replay gates are recorded in
+the [implementation record](../../agent-docs/taosc-llm/memo/patch-synthesizer/README.md).
+
 ## Manual and Pi synthesis
 
 ```sh
@@ -616,7 +713,7 @@ are preserved. This is not a published Loftix release. The integration reference
 records actual package-build and installed-smoke results separately from live
 provider acceptance and final BinRadar verification.
 
-Four installed wrappers are `taosc-llm`, `taosc-llm-setup`,
+Five installed wrappers are `taosc-llm`, `taosc-llm-no-llm`, `taosc-llm-setup`,
 `taosc-llm-evaluate`, and `taosc-llm-fixture`. Source allowlists and the wheel
 exclude real `.env` files, credentials, workdirs, node_modules and caches. The
 wheel ships Python, `runtime.c`, prompts and adapter, not the SDK/native closure.

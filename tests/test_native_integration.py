@@ -11,10 +11,11 @@ from pathlib import Path
 import pytest
 from elftools.elf.elffile import ELFFile
 from taosc_llm.builder import generate_patch
-from taosc_llm.context import prepare_context
+from taosc_llm.dataset import load_dataset
 from taosc_llm.fixture import prepare_fixture
 from taosc_llm.native import run_native
-from taosc_llm.synthesis import _build
+from taosc_llm.publication import build_candidate, verify_built_candidate
+from taosc_llm.evaluation import evaluate_dataset
 
 ASSEMBLY = """\
 .text
@@ -245,8 +246,10 @@ def test_real_fixed_and_selected_traps_follow_original(tmp_path, predicate):
 def test_fresh_build_worker_preserves_runtime_dependency_closure(tmp_path):
     require_native_tools()
     prepared = prepare_fixture(tmp_path / "caller")
-    context = prepare_context(prepared["dataset"])
-    built = asyncio.run(_build(context, {"predicate": "rax <= 0"}, tmp_path / "candidate"))
+    dataset = load_dataset(prepared["dataset"])
+    original = dataset.artifact('fixture.orig')
+    original_bytes = original.read_bytes()
+    built = asyncio.run(build_candidate(dataset, "rax <= 0", tmp_path / "candidate"))
     scratch = tmp_path / "execution"
     scratch.mkdir()
     fixed = built["artifacts"]["fixture.patched"]
@@ -255,3 +258,12 @@ def test_fresh_build_worker_preserves_runtime_dependency_closure(tmp_path):
     for value, expected in (("-1", 23), ("1", 17)):
         result = run_native([fixed, value], scratch, timeout=5, check=False)
         assert result.returncode == expected
+    evaluation = evaluate_dataset(dataset, 'rax <= 0',
+                                  cache_dir=tmp_path / 'evaluation-cache', workers=2)
+    replay = verify_built_candidate(dataset, built, evaluation, workers=2)
+    assert replay['status'] == 'matched'
+    assert replay['summary']['matched'] == len(evaluation['cases']) > 0
+    assert all(set(case['observations']) == {'fixed', 'selectable_id0', 'selectable_id1'}
+               for case in replay['cases'])
+    assert original.read_bytes() == original_bytes
+    assert replay['verified'] is False and replay['binradar_verification'] == 'not_run'

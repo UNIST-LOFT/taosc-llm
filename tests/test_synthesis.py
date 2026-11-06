@@ -97,7 +97,7 @@ def test_manual_failure_retains_unverified_run_record(tmp_path, monkeypatch, err
     dataset = make_dataset(tmp_path / "dataset")
     async def abort_build(*args):
         raise error
-    monkeypatch.setattr(synthesis, "_build", abort_build)
+    monkeypatch.setattr(synthesis, "build_candidate", abort_build)
     with pytest.raises(type(error)):
         synthesis.generate_manual(dataset, "0", output=tmp_path / "runs")
     record = tmp_path / "runs" / "run.json"
@@ -134,7 +134,7 @@ def test_existing_output_is_rejected_without_execution_or_overwrite(tmp_path, mo
         pytest.fail('occupied output must fail before execution or provider work')
 
     monkeypatch.setattr(synthesis, 'adapter_command', lambda _: ['not-executed'])
-    monkeypatch.setattr(synthesis, '_build', forbidden)
+    monkeypatch.setattr(synthesis, 'build_candidate', forbidden)
     monkeypatch.setattr(synthesis, '_model_round', forbidden)
     monkeypatch.setattr(synthesis, 'poc_observation', forbidden)
     monkeypatch.setattr(synthesis, 'prepare_context', forbidden)
@@ -271,7 +271,7 @@ def test_feedback_follows_final_host_outcome_only(tmp_path, monkeypatch, outcome
                                "candidate": {"outcome": "unknown"}}}]}
 
     monkeypatch.setattr(synthesis, "run_adapter", model)
-    monkeypatch.setattr(synthesis, "_build", build)
+    monkeypatch.setattr(synthesis, "build_candidate", build)
     from taosc_llm import evaluation
     monkeypatch.setattr(evaluation, "evaluate_dataset", evaluate)
     result = asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=2, session_feedback=True))
@@ -411,7 +411,7 @@ def test_manual_mode_does_not_run_provider_preflight(tmp_path, monkeypatch):
         raise RuntimeError("stop before native build")
 
     monkeypatch.setattr(synthesis, "poc_observation", forbidden)
-    monkeypatch.setattr(synthesis, "_build", stop)
+    monkeypatch.setattr(synthesis, "build_candidate", stop)
     with pytest.raises(RuntimeError, match="stop before native build"):
         synthesis.generate_manual(dataset, "0", output=tmp_path / "runs")
 
@@ -451,7 +451,7 @@ def test_refinement_uses_same_minimal_feedback_as_review(tmp_path, monkeypatch):
 
     from taosc_llm import evaluation
     monkeypatch.setattr(synthesis, "_model_round", model)
-    monkeypatch.setattr(synthesis, "_build", build)
+    monkeypatch.setattr(synthesis, "build_candidate", build)
     monkeypatch.setattr(evaluation, "evaluate_dataset", lambda *args, **kwargs: evaluated)
     result = asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=2))
     assert result["status"] == "abstained" and len(calls) == 2

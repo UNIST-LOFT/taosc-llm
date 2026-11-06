@@ -9,9 +9,25 @@ from importlib.resources import files
 from pathlib import Path
 from tempfile import TemporaryDirectory, TemporaryFile
 
-from .provider import native_environment
-
 _SYSTEM_READ = ("/usr", "/bin", "/lib", "/lib64", "/gnu/store", "/etc/ld.so.cache")
+
+
+def native_environment() -> dict[str, str]:
+    """Do not inherit credentials, HOME, preload hooks, or SDK discovery state."""
+    allowed = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "LC_COLLATE", "LC_MESSAGES",
+               "LC_NUMERIC", "LC_TIME", "E9TOOL", "E9COMPILE",
+               "C_INCLUDE_PATH", "LIBRARY_PATH")
+    return {name: os.environ[name] for name in allowed if name in os.environ}
+
+
+async def kill_process(process) -> None:
+    """Reap an owned process session before propagating cancellation."""
+    if process.returncode is None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    await process.wait()
 
 
 def run_native(command: list[str], scratch: Path, *, timeout: int = 300,

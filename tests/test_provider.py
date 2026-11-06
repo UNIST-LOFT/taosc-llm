@@ -8,8 +8,8 @@ from taosc_llm.provider import (
     ProviderConfig,
     ProviderConfigError,
     load_provider,
-    native_environment,
 )
+from taosc_llm.native import native_environment
 
 SECRET = "offline-test-secret-never-real"
 

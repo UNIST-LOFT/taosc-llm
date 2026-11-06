@@ -1,6 +1,5 @@
 """Explicit, data-only provider configuration and nonsecret child environments."""
 
-import os
 import re
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -149,10 +148,3 @@ def load_provider(path: Path, *, base_url=None, model=None) -> ProviderConfig:
         raise ProviderConfigError("unsupported base_url")
     return config
 
-
-def native_environment() -> dict[str, str]:
-    """Do not inherit credentials, HOME, preload hooks, or SDK discovery state."""
-    allowed = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "LC_COLLATE", "LC_MESSAGES",
-               "LC_NUMERIC", "LC_TIME", "E9TOOL", "E9COMPILE",
-               "C_INCLUDE_PATH", "LIBRARY_PATH")
-    return {name: os.environ[name] for name in allowed if name in os.environ}

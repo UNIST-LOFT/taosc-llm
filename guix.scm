@@ -87,7 +87,8 @@ This package supplies SDK imports, not npm CLI executable shims.")
                       (string-drop file (+ 1 (string-length package-directory))))))
     (or (member relative '("" "pyproject.toml" "README.md" "LICENSE" "uv.lock" "run.sh"
                            "src" "src/taosc_llm" "tests"
-                           "src/taosc_llm/pi" "src/taosc_llm/prompts"))
+                           "src/taosc_llm/pi" "src/taosc_llm/prompts"
+                           "src/taosc_llm/no_llm"))
         (member relative '("src/taosc_llm/runtime.c"
                            "src/taosc_llm/pi/adapter.mjs"
                            "src/taosc_llm/prompts/system.txt"))
@@ -190,7 +191,7 @@ This package supplies SDK imports, not npm CLI executable shims.")
                       `("TAOSC_LLM_NODE" = (,(string-append #$analysis-node "/bin/node")))
                       `("TAOSC_LLM_PI_SDK_ROOT" =
                         (,(string-append #$output "/share/taosc-llm/pi-sdk")))))
-                  '("taosc-llm" "taosc-llm-setup" "taosc-llm-evaluate"
+                  '("taosc-llm" "taosc-llm-no-llm" "taosc-llm-setup" "taosc-llm-evaluate"
                     "taosc-llm-fixture")))))))
   (inputs (list analysis-node pi-sdk rea-runtime ghidra-runtime
                 `(,openjdk21 "jdk") gcc-toolchain binutils e9patch
