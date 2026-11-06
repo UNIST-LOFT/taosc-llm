@@ -265,6 +265,7 @@ def prepare_analysis(root: Path, binary: Path, addresses: dict[str, int], *,
 
 
 _VIEWS = ("function", "instructions", "decompilation", "references")
+FUNCTION_FACETS = ("callees", "callers", "cfg", "strings", "references", "native_api", "value_flow")
 _PAGE_BYTES = 8192
 _PAGE_RECORDS = 120
 
@@ -325,17 +326,15 @@ def _public_procedure(procedure_id, procedure):
     result = {"procedure_id": procedure_id, "entry": hex(procedure["entry"]),
               "body_ranges": [{"start": hex(item["start"]), "end": hex(item["end"])}
                               for item in procedure["extent"]["ranges"]],
-              "range_end": "exclusive", "decompilation_address_mapping": "unavailable",
-              "instruction_window_semantics": "decoded instructions within one body range; not a CFG or reaching-definition proof",
+              "range_end": "exclusive",
               "available_views": [view for view in _VIEWS
                   if (any(not item["reason"] for item in procedure["references"].values()) if view == "references"
                       else view in views and not views[view]["reason"])],
-              "facets": function.get("facets", {}),
-              "limitations": function.get("limitations", []),
-              "unavailable_views": {view: item["reason"][:512] for view, item in views.items() if item["reason"]}}
-    for key in ("name", "signature"):
-        if isinstance(identity.get(key), str):
-            result[key] = identity[key][:1024]
+              "available_facets": _available_facets(value)}
+    if isinstance(identity.get("name"), str):
+        result["name"] = identity["name"][:256]
+    if function.get("limitations") or any(item["reason"] for item in views.values()):
+        result["note"] = "Some frozen static evidence is missing or partial; available views and facets remain usable."
     return result
 
 
@@ -451,9 +450,9 @@ def _window(procedure, sites, site, window):
 def _page_records(records, offset):
     if offset > len(records) or offset == len(records) and offset:
         raise ValueError("offset outside static view")
-    end, size = offset, 0
+    end, size = offset, 2  # Include the JSON array delimiters and separators.
     while end < len(records) and end - offset < _PAGE_RECORDS:
-        count = len(canonical(records[end]))
+        count = len(canonical(records[end])) + (1 if end > offset else 0)
         if size + count > _PAGE_BYTES:
             break
         size += count
@@ -498,35 +497,233 @@ def _compact_reference(item):
     return result
 
 
-def _function_records(value):
-    """Project individual facts once; never page serialized REA dossiers."""
-    records = []
-    availability = value.get("facet_availability", {})
-    owners = {"basic_blocks": "cfg", "referenced_names": "strings_names", "referenced_strings": "strings_names",
-              "unresolved_calls": "callees", "incoming_references": "references", "outgoing_references": "references"}
-    for facet in ("callees", "callers", "basic_blocks", "comments", "referenced_names", "referenced_strings", "unresolved_calls",
-                  "incoming_references", "outgoing_references"):
-        if availability.get(owners.get(facet, facet), {}).get("available") is False:
+_FACET_FIELDS = {
+    "callees": ("callees", "unresolved_calls"), "callers": ("callers",),
+    "cfg": ("basic_blocks",), "strings": ("referenced_names", "referenced_strings"),
+    "references": ("incoming_references", "outgoing_references"),
+}
+
+
+def _facet_status(value, facet):
+    owner = "strings_names" if facet == "strings" else facet
+    availability = value.get("facet_availability", {}).get(owner, {})
+    if availability.get("available") is False:
+        return False, str(availability.get("reason") or "requested frozen facet unavailable")[:256]
+    if facet in ("native_api", "value_flow"):
+        native = value.get("native_api" if facet == "native_api" else "native_value_flow")
+        if not isinstance(native, dict) or native.get("available") is not True:
+            return False, "requested native facet was not saved or is unavailable"
+    elif not any(isinstance(value.get(key), list) for key in _FACET_FIELDS[facet]):
+        return availability.get("available") is True, "requested facet was not saved"
+    return True, None
+
+
+def _available_facets(value):
+    return [facet for facet in FUNCTION_FACETS if _facet_status(value, facet)[0]]
+
+
+def _bounded_fact(value, depth=0):
+    """Bound individual saved facts as well as pages; never copy a raw dossier."""
+    if isinstance(value, str):
+        return value.encode("utf-8")[:256].decode("utf-8", errors="ignore")
+    if value is None or type(value) in (int, bool, float):
+        return value
+    if depth >= 4:
+        return {"truncated": True}
+    if isinstance(value, list):
+        return [_bounded_fact(item, depth + 1) for item in value[:16]]
+    if isinstance(value, dict):
+        result = {key: _bounded_fact(item, depth + 1) for key, item in value.items()
+                  if isinstance(key, str) and not isinstance(item, (dict, list))}
+        for key, item in value.items():
+            if isinstance(key, str) and isinstance(item, (dict, list)):
+                result[key] = _bounded_fact(item, depth + 1)
+                if isinstance(item, list) and len(item) > 16:
+                    result[key + "_truncated"] = True
+            elif isinstance(item, str) and len(item.encode("utf-8")) > 256:
+                result["labels_truncated"] = True
+        return result
+    return None
+
+
+def _local_address(procedure, sites, site, address):
+    if address is None:
+        role = site or ("patch" if "patch" in procedure["roles"] else procedure["roles"][0])
+        address = sites[role]["address"]
+    if not isinstance(address, str) or not re.fullmatch(r"(?:0x[0-9a-fA-F]+|[0-9]+)", address):
+        raise ValueError("address must be a hexadecimal or decimal address string")
+    number = int(address, 16 if address.startswith("0x") else 10)
+    if not any(item["start"] <= number < item["end"] for item in procedure["extent"]["ranges"]):
+        raise ValueError("address must be inside the frozen procedure body")
+    return hex(number)
+
+
+def _address_number(value):
+    try:
+        return int(value, 16 if value.startswith("0x") else 10) if isinstance(value, str) else None
+    except ValueError:
+        return None
+
+
+def _block_extent(block, procedure):
+    if not isinstance(block, dict):
+        return None
+    start, end = _address_number(block.get("start")), _address_number(block.get("end"))
+    if start is None or end is None or start >= end:
+        return None
+    if not any(item["start"] <= start < end <= item["end"] for item in procedure["extent"]["ranges"]):
+        return None
+    return start, end
+
+
+def _cfg_records(value, procedure, address):
+    blocks = [(block, extent) for block in value.get("basic_blocks", [])
+              if (extent := _block_extent(block, procedure)) is not None]
+    number = int(address, 16)
+    local = [(block, extent) for block, extent in blocks if extent[0] <= number < extent[1]]
+    if len(local) != 1:
+        return [], "No unique saved basic block contains this address."
+    block, extent = local[0]
+    records = [{"relation": "block", "start": hex(extent[0]), "end": hex(extent[1])}]
+    for predecessor, bounds in blocks:
+        if any(_address_number(target) == extent[0] for target in predecessor.get("successors", [])):
+            records.append({"relation": "predecessor", "start": hex(bounds[0]), "end": hex(bounds[1])})
+    for target in block.get("successors", []):
+        destination = _address_number(target)
+        if destination is None:
             continue
-        for item in value.get(facet, []):
-            if facet in ("incoming_references", "outgoing_references"):
+        record = {"relation": "successor", "address": hex(destination)}
+        target_blocks = [bounds for _item, bounds in blocks if bounds[0] == destination]
+        if len(target_blocks) == 1:
+            record.update(start=hex(target_blocks[0][0]), end=hex(target_blocks[0][1]))
+        else:
+            record["saved_block"] = False
+        records.append(record)
+    note = None
+    if len(blocks) != len(value.get("basic_blocks", [])):
+        note = "Some saved blocks have missing or out-of-body bounds; only body-confined blocks are shown."
+    return records, note
+
+
+def _flow_records(value, address):
+    flow = value["native_value_flow"]
+    operations = [item for item in flow.get("operations", []) if isinstance(item, dict)
+                  and _address_number(item.get("address")) == int(address, 16) and isinstance(item.get("id"), str)]
+    ids = {item["id"] for item in operations}
+    records = []
+
+    def operand(item):
+        if not isinstance(item, dict):
+            return None
+        result = {key: item[key] for key in ("kind", "location", "size_bytes", "constant_hex") if key in item}
+        for key, text in result.copy().items():
+            if isinstance(text, str) and len(text.encode("utf-8")) > 64:
+                result[key] = text.encode("utf-8")[:64].decode("utf-8", errors="ignore")
+                result["labels_truncated"] = True
+        return result
+
+    for item in operations:
+        record = {key: item[key] for key in ("id", "address", "sequence", "opcode", "is_dead", "block_membership") if key in item}
+        if isinstance(item.get("inputs"), list):
+            record["inputs"] = [operand(node) for node in item["inputs"][:16]]
+            if len(item["inputs"]) > 16:
+                record["inputs_truncated"] = True
+        if "output" in item:
+            record["output"] = operand(item["output"])
+        records.append({"kind": "operation", **_bounded_fact(record)})
+    for key, match in (("def_use", lambda item: item.get("definition") in ids or item.get("use") in ids),
+                       ("effects", lambda item: item.get("operation") in ids),
+                       ("parameter_uses", lambda item: item.get("use") in ids)):
+        fields = {"def_use": ("definition", "use", "input_index"),
+                  "effects": ("kind", "operation", "operand_input", "value_input"),
+                  "parameter_uses": ("use", "ordinal", "input_index")}[key]
+        for item in flow.get(key, []):
+            if isinstance(item, dict) and match(item):
+                record = _bounded_fact({field: item[field] for field in fields if field in item})
+                # Effect kind describes the native effect, not the enclosing record type.
+                if key == "effects" and "kind" in record:
+                    record["effect"] = record.pop("kind")
+                records.append({"kind": key, **record})
+    note = ("Address-local decompiler-derived high p-code and incident def-use only; incomplete data-flow evidence, "
+            "not runtime behavior or a reaching-definition proof. is_dead is the saved AST flag; block_membership is separate.")
+    if flow.get("truncated") or any(flow.get(key, 0) for key in
+            ("known_omitted_edges", "known_omitted_inputs", "omitted_operations_lower_bound")):
+        note += " The saved source also reports omissions."
+    if not operations:
+        note += " No operations were saved at this address."
+    return records, note
+
+
+def _native_api_records(value):
+    api = value["native_api"]
+    signature = {key: api[key] for key in ("calling_convention", "signature_source") if key in api}
+    if api.get("signature_source") == "default":
+        signature["confidence"] = "low"
+    records = [{"kind": "signature", **_bounded_fact(signature)}] if signature else []
+    for key in ("parameters", "return_type"):
+        source = api.get(key, []) if key == "parameters" else [api.get(key)]
+        for item in source:
+            if isinstance(item, dict):
+                records.append({"kind": "parameter" if key == "parameters" else "return_type",
+                    **_bounded_fact({field: item[field] for field in
+                    ("name", "ordinal", "data_type", "size_bytes", "storage", "confidence") if field in item})})
+    return records, ("Recovered decompiler API observations, not authoritative ABI or source declarations; "
+                     "a default signature source (including saved __stdcall) is low-confidence.")
+
+
+def _function_records(value, facet, procedure, address):
+    """Select one saved facet, never page unrelated dossier sections."""
+    if facet == "cfg":
+        return _cfg_records(value, procedure, address)
+    if facet == "value_flow":
+        return _flow_records(value, address)
+    if facet == "native_api":
+        return _native_api_records(value)
+    if facet in ("callees", "callers") and address is not None:
+        outgoing = facet == "callees"
+        field = "outgoing_references" if outgoing else "incoming_references"
+        coordinate = "source_address" if outgoing else "target_address"
+        if not isinstance(value.get(field), list) or value.get("facet_availability", {}).get("references", {}).get("available") is False:
+            return [], "Address-local calls require saved reference evidence, which is missing."
+        records = []
+        for item in value[field]:
+            if (isinstance(item, dict) and isinstance(item.get("kind"), dict) and item["kind"].get("call") is True
+                    and _address_number(item.get(coordinate)) == int(address, 16)):
                 reference = _compact_reference(item)
                 if reference is not None:
-                    records.append({"facet": facet, **reference})
-                continue
-            if isinstance(item, str):
-                record = {"facet": facet, "text": item}
+                    records.append(_bounded_fact(reference))
+        return records, None
+    records = []
+    partial = False
+    for field in _FACET_FIELDS[facet]:
+        source = value.get(field, [])
+        partial |= any(_unavailable(item) or isinstance(item, dict) and
+                       _unavailable(item.get("relationship_coverage")) for item in source)
+        for item in source:
+            if address is not None:
+                coordinates = (("source_address", "from") if field == "outgoing_references" else
+                               ("target_address", "to") if field == "incoming_references" else
+                               ("source_address", "address"))
+                if not isinstance(item, dict) or not any(
+                        _address_number(item.get(key)) == int(address, 16) for key in coordinates):
+                    continue
+            if facet == "references":
+                reference = _compact_reference(item)
+                if reference is not None:
+                    records.append({"direction": "incoming" if field == "incoming_references" else "outgoing",
+                                    **_bounded_fact(reference)})
+            elif isinstance(item, str):
+                records.append(_bounded_fact({"text": item}))
             elif isinstance(item, dict):
-                record = {"facet": facet, **{key: item[key] for key in
-                    ("address", "source_address", "target_address", "name", "signature", "start", "end", "successors", "value", "text", "comment", "reason")
-                    if key in item and isinstance(item[key], (str, int, list))}}
-            else:
-                continue
-            records.append(record)
-    return records
+                record = _bounded_fact({key: item[key] for key in
+                    ("address", "source_address", "target_address", "name", "value", "text", "reason") if key in item})
+                if field == "unresolved_calls":
+                    record["unresolved"] = True
+                records.append(record)
+    return records, "Selected relationships are partial; unresolved edges may be missing." if partial else None
 
 
-def _view(dataset, procedures, sites, procedure_id, view, site, window, offset):
+def _view(dataset, procedures, sites, procedure_id, view, site, window, offset, facet=None, address=None):
     if not isinstance(procedure_id, str) or procedure_id not in procedures:
         raise ValueError("unknown procedure_id; valid choices: " + (", ".join(list(procedures)[:8]) or "none"))
     if view not in _VIEWS:
@@ -538,18 +735,42 @@ def _view(dataset, procedures, sites, procedure_id, view, site, window, offset):
         raise ValueError("site must belong to procedure; valid sites: " + ", ".join(procedure["roles"]))
     if window is not None and view != "instructions":
         raise ValueError("window is only supported for instructions")
+    if (facet is not None or address is not None) and view != "function":
+        raise ValueError("facet/address are only supported for function; use window.address for instructions")
+    if facet is not None and facet not in FUNCTION_FACETS:
+        raise ValueError("facet must be one of: " + ", ".join(FUNCTION_FACETS))
+    if address is not None and facet is None:
+        raise ValueError("address requires a function facet")
+    if facet == "native_api" and address is not None:
+        raise ValueError("native_api is procedure-wide and does not accept address")
+    if address is not None or facet in ("cfg", "value_flow"):
+        address = _local_address(procedure, sites, site, address)
     if view == "references" and site is None:
         raise ValueError("references requires site; valid sites: " + ", ".join(procedure["roles"]))
     observation = (procedure["references"].get(site) if view == "references" else procedure["views"].get(view)) or {
         "reason": "frozen view unavailable", "complete": False, "limitations": []}
-    result = {"procedure_id": procedure_id, "view": view, "availability": "unavailable" if observation["reason"] else "available",
-              "complete": observation["complete"], "limitations": observation["limitations"]}
+    reason = observation["reason"]
+    partial_source = None
+    if not reason and facet is not None:
+        available, facet_reason = _facet_status(observation["value"], facet)
+        if not available:
+            reason = facet_reason
+        else:
+            partial_source = _unavailable(observation["value"])
+    result = {"procedure_id": procedure_id, "view": view, "availability": "unavailable" if reason else "available",
+              "complete": observation["complete"] if facet is None else not bool(reason)}
     if site is not None:
         result["site"] = site
-    if observation["reason"]:
+    if facet is not None:
+        result["facet"] = facet
+    if address is not None:
+        result["address"] = address
+    if not reason and view in ("instructions", "references") and observation["limitations"]:
+        result["note"] = "Saved static evidence is partial; missing records are not proof of absence."
+    if reason:
         if offset:
             raise ValueError("unavailable view has no continuation")
-        result.update(reason=observation["reason"][:512], range={"start": 0, "end": 0, "unit": "records"}, total=0, next_offset=None)
+        result.update(note=str(reason)[:256], range={"start": 0, "end": 0, "unit": "records"}, total=0, next_offset=None)
     elif view == "decompilation":
         text = observation["value"]["pseudocode"]
         result["text"], result["range"], result["total"], result["next_offset"] = _page_text(text, offset)
@@ -560,29 +781,44 @@ def _view(dataset, procedures, sites, procedure_id, view, site, window, offset):
             rows, start, end, normalized_window = _window(procedure, sites, site, window)
             result["window"] = normalized_window
             result["instruction_range"] = {"start": start, "end": end, "total": len(rows)}
-            records, key = rows[start:end], "instructions"
+            body = procedure["extent"]["ranges"][rows[start]["body_range"]]
+            result["body_range"] = {"start": hex(body["start"]), "end": hex(body["end"]), "range_end": "exclusive"}
+            records = [{key: value for key, value in row.items() if key != "body_range"} for row in rows[start:end]]
+            key = "instructions"
         elif view == "references":
             value = observation["value"]
             source = value if isinstance(value, list) else value.get("references", [])
             records, key = [row for item in source if (row := _compact_reference(item)) is not None], "references"
             result["address"] = sites[site]["address"]
-        else:
+        elif facet is None:
             result["procedure"] = _public_procedure(procedure_id, procedure)
-            result["facets"] = observation["facets"]
-            records, key = _function_records(observation["value"]), "records"
+            records, key = [], "records"
+        else:
+            records, note = _function_records(observation["value"], facet, procedure, address)
+            key = "records"
+            if facet == "cfg":
+                result["range_end"] = "exclusive"
+            if partial_source:
+                note = (note + " " if note else "") + "Saved dossier is partial; selected facts may omit records."
+            if note:
+                result["note"] = note
+                if facet != "native_api" or partial_source or _unavailable(observation["value"].get("native_api")):
+                    result["complete"] = False
         result[key], result["range"], result["total"], result["next_offset"] = _page_records(records, offset)
     result["truncated"] = result["next_offset"] is not None
     scope = {"dataset_id": dataset.dataset_id, "procedure_id": procedure_id, "view": view,
              "site": site, "window": result.get("window"), "range": result["range"]}
+    if facet is not None:
+        scope.update(facet=facet, address=address)
     result["evidence_id"] = "analysis:" + hashlib.sha256(canonical(scope)).hexdigest()
     return result
 
 
-def analysis_view(dataset, procedure_id, view, *, site=None, window=None, offset=0):
-    """Read bounded, authenticated static facts; offset is host cursor state only."""
+def analysis_view(dataset, procedure_id, view, *, site=None, window=None, offset=0, facet=None, address=None):
+    """Read bounded, authenticated frozen facts; no backend execution or pseudocode address inference."""
     with dataset.validation() as validated:
         procedures, sites = _frozen(validated)
-        return _view(validated, procedures, sites, procedure_id, view, site, window, offset)
+        return _view(validated, procedures, sites, procedure_id, view, site, window, offset, facet, address)
 
 
 def analysis_inventory(dataset):

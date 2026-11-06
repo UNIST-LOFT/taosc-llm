@@ -1,16 +1,11 @@
-"""Bounded prepared-evidence tools; execution and rejection remain host-owned."""
+"""Compact model tools over complete, authenticated host evidence."""
 from __future__ import annotations
 
-import base64
-import hashlib
-import hmac
-import json
+import secrets
 
 from .context import MAX_EXPRESSION, SynthesisContext, canonical, digest, keys, strict_json
 
-PAGE_SIZE = 32
-RESULT_PAGE_SIZE = 8
-PROJECTION_VERSION = 1
+STATE_PAGE_SIZE = 3
 
 
 class ToolError(ValueError):
@@ -21,7 +16,8 @@ class ToolError(ValueError):
 
 def tool_definitions():
     from binradar.binradar_taosc_predicates import REGISTER_TO_VAR
-    from .cases import ACTIVATIONS, COMPARISONS, OUTCOMES, SIMILAR_FEATURES
+    from .analysis import FUNCTION_FACETS
+    from .cases import COMPARISONS, SIMILAR_FEATURES
 
     def obj(properties, required=()):
         return {"type": "object", "properties": properties, "required": list(required), "additionalProperties": False}
@@ -30,43 +26,44 @@ def tool_definitions():
         return {"type": "string", "enum": list(values)}
 
     identifier = {"type": "string", "minLength": 1, "maxLength": 160}
-    cursor = {"type": "string", "minLength": 1, "maxLength": 4096}
+    cursor = {"type": "string", "minLength": 1, "maxLength": 64}
     predicate = {"type": "string", "minLength": 1, "maxLength": MAX_EXPRESSION}
     register_filter = obj({"register": choice(REGISTER_TO_VAR), "op": choice(COMPARISONS),
         "value": {"type": "string", "minLength": 1, "maxLength": 20},
         "hit": choice(("first", "any", "all", "first_divergence"))}, ("register", "op", "value", "hit"))
     mutation_filter = obj({"kind": identifier, "size": {"type": "integer", "minimum": 1, "maximum": 1048576},
         "value": identifier, "target_extent": {"type": "integer", "minimum": 0, "maximum": 1048576}})
-    filters = obj({"candidate_outcome": choice(OUTCOMES), "baseline_outcome": choice(OUTCOMES),
-        "activation": choice(ACTIVATIONS), "reason": identifier, "warning": identifier,
-        "transition": choice([a + "->" + b for a in OUTCOMES for b in OUTCOMES]),
+    outcomes = ("target_crash", "normal")
+    filters = obj({"candidate_outcome": choice(outcomes), "baseline_outcome": choice(outcomes),
+        "activation": choice(("fired", "not_fired", "zero_hits", "trapped")),
         "register": register_filter, "mutation": mutation_filter})
     same_as = obj({"case_id": identifier, "features": {"type": "array", "minItems": 1,
         "maxItems": len(SIMILAR_FEATURES), "uniqueItems": True, "items": choice(SIMILAR_FEATURES)}}, ("case_id", "features"))
     specs = [
-        ("get_patch_context", "Context and original-POC QASAN summary are already inline. Use view=poc_log only for paged diagnostic details; paths are normalized and this log does not define the target oracle.",
+        ("get_patch_context", "Context is already inline. Request poc_log only for detailed POC diagnostics.",
          {"view": choice(("context", "poc_log")), "cursor": cursor}, []),
-        ("get_function_analysis", "Read a frozen procedure facet. Use listed procedure IDs and site windows. References require site=patch or destination bound to that procedure; they are exact-site xrefs, not procedure-wide. Never runs analysis.",
+        ("get_function_analysis", "Read a frozen procedure. Use facet/address for local CFG or dataflow; instruction windows count instructions. References require a site.",
          {"procedure_id": identifier, "view": choice(("function", "instructions", "decompilation", "references")),
+          "facet": choice(FUNCTION_FACETS), "address": {"type": "string", "minLength": 1, "maxLength": 20},
           "site": choice(("patch", "destination")), "window": obj({
               "address": {"type": "string", "minLength": 1, "maxLength": 20},
               "before": {"type": "integer", "minimum": 0, "maximum": 100},
               "after": {"type": "integer", "minimum": 0, "maximum": 100}}, ("address",)),
           "cursor": cursor}, ["procedure_id", "view"]),
-        ("list_cases", "Search only the prepared/result population. Default order highlights counterexamples, control gaps and rare outcomes; same_as matches explicit known features.",
-         {"domain": choice(("system", "function", "all")), "result_id": identifier, "filters": filters,
-          "same_as": same_as, "order": choice(("noteworthy", "case_id")), "cursor": cursor}, ["domain"]),
-        ("get_case", "Inspect separate baselines/candidate and ordered states. Missing candidate capture does not erase a known outcome.",
+        ("list_cases", "Up to three target-crash and three normal examples. Optional filters find comparable cases; this is not an exhaustive listing.",
+         {"domain": choice(("system", "function", "all")), "result_id": identifier,
+          "filters": filters, "same_as": same_as}, []),
+        ("get_case", "Inspect one case and its captured registers; state_id reads captured stack bytes.",
          {"case_id": identifier, "result_id": identifier, "state_id": identifier, "cursor": cursor}, ["case_id"]),
-        ("evaluate_predicate", "Offline capture inference only. Inspect predicted divergence separately from actual activation; no target or replay execution.",
+        ("evaluate_predicate", "Check existing captures only; return missed target crashes and regressions. Does not execute.",
          {"predicate": predicate}, ["predicate"]),
-        ("test_candidate", "Host evaluation and matched neutral controls. May execute concrete inputs and configured retained replay; never proof of repair.",
+        ("test_candidate", "Host evaluation, including execution when needed; return missed target crashes and regressions.",
          {"predicate": predicate}, ["predicate"]),
-        ("get_candidate_result", "Read outcome/control/activity summary and prioritized case pages from this session's result.",
-         {"result_id": identifier, "cursor": cursor}, ["result_id"]),
+        ("get_candidate_result", "Retrieve concise failure feedback for a returned result.",
+         {"result_id": identifier}, ["result_id"]),
     ]
     return [{"name": name, "description": description, "parameters": obj({
-        "context_id": {"type": "string", "minLength": 64, "maxLength": 64}, **props}, ["context_id", *required])}
+        "context_id": {"type": "string", "minLength": 1, "maxLength": 64}, **props}, ["context_id", *required])}
         for name, description, props, required in specs]
 
 
@@ -96,41 +93,31 @@ def _validate(value, schema):
 
 
 def _cursor(context, scope, offset):
-    payload = canonical([context.context_id, scope, offset])
-    return base64.urlsafe_b64encode(payload + hmac.new(context._cursor_key, payload, hashlib.sha256).digest()).decode()
-
-
-def _scope_description(scope):
-    return canonical(scope).decode()[:768]
+    token = "p-" + secrets.token_urlsafe(12)
+    context._cursors[token] = (canonical(scope), offset)
+    return token
 
 
 def _offset(context, scope, cursor):
     if cursor is None:
         return 0
-    try:
-        data = base64.b64decode(cursor, altchars=b"-_", validate=True)
-        payload, signature = data[:-32], data[-32:]
-        if not hmac.compare_digest(signature, hmac.new(context._cursor_key, payload, hashlib.sha256).digest()):
-            raise ValueError()
-        identity, actual, offset = json.loads(payload)
-        if identity != context.context_id or type(offset) is not int or offset < 0:
-            raise ValueError()
-    except (ValueError, TypeError, UnicodeError):
-        raise ToolError("invalid_cursor", "malformed cursor or cursor from another context") from None
-    if actual != scope:
-        raise ToolError("invalid_cursor", "cursor belongs to query " + _scope_description(actual)
-                        + "; requested query " + _scope_description(scope))
-    return offset
+    record = context._cursors.get(cursor)
+    if record is None:
+        raise ToolError("invalid_cursor", "cursor was not issued in this context")
+    if record[0] != canonical(scope):
+        raise ToolError("invalid_cursor", "cursor belongs to another query")
+    return record[1]
 
 
-def _page(context, scope, records, cursor, *, size=PAGE_SIZE):
+def _page(context, scope, records, cursor):
     offset = _offset(context, scope, cursor)
     if offset >= len(records) and offset:
         raise ToolError("invalid_cursor", "cursor outside result")
-    end = min(offset + size, len(records))
-    return {"items": records[offset:end], "offset": offset, "total": len(records),
-            "query_id": digest(canonical(scope)), "truncated": end < len(records),
-            "next_cursor": _cursor(context, scope, end) if end < len(records) else None}
+    end = min(offset + STATE_PAGE_SIZE, len(records))
+    result = {"items": records[offset:end], "offset": offset, "total": len(records)}
+    if end < len(records):
+        result["next_cursor"] = _cursor(context, scope, end)
+    return result
 
 
 def _candidate(dataset, expression):
@@ -145,171 +132,150 @@ def _candidate(dataset, expression):
 
 def _known_result(context, result_id):
     if result_id not in context._results:
-        raise ToolError("out_of_scope", "unknown candidate result; use a returned result_id")
+        raise ToolError("out_of_scope", "use a returned result_id")
     return context._results[result_id]
 
 
-def _case_page(context, dataset, args, *, size=PAGE_SIZE):
-    from .cases import case_records, public_cases, relevant_registers, select_cases
+def _case_examples(context, dataset, args):
+    from .cases import case_records, select_cases
+    from .presentation import sample_cases
     evaluation = _known_result(context, args["result_id"]) if args.get("result_id") else None
-    scope = {"view": "cases", "projection_version": PROJECTION_VERSION,
-             "domain": args.get("domain", "all"), "result_id": args.get("result_id"),
-             "filters": args.get("filters", {}), "same_as": args.get("same_as"),
-             "order": args.get("order", "noteworthy")}
-    # Authenticate scope before loading or searching any state pages.
-    _offset(context, scope, args.get("cursor"))
-    records = case_records(dataset, evaluation)
     try:
-        selected = select_cases(dataset, records, scope["domain"], scope["filters"], scope["same_as"])
+        records = select_cases(dataset, case_records(dataset, evaluation), args.get("domain", "all"),
+                               args.get("filters", {}), args.get("same_as"))
     except KeyError as error:
         raise ToolError("out_of_scope", str(error)) from None
     except ValueError as error:
         raise ToolError("invalid_arguments", str(error)) from None
-    result = _page(context, scope, public_cases(selected, scope["order"]), args.get("cursor"), size=size)
-    result["query"] = {"domain": scope["domain"], "order": scope["order"], "filters": scope["filters"]}
-    if scope["result_id"]:
-        result["query"]["result_id"] = scope["result_id"]
-    if scope["same_as"]:
-        result["query"]["same_as"] = scope["same_as"]
-    if scope["filters"].get("register"):
-        result["register_evidence"] = ("offline_reference_not_candidate_execution"
-            if scope["filters"]["register"]["hit"] == "first_divergence"
-            else "candidate_capture" if evaluation is not None else "prepared_capture")
-    if evaluation is not None:
-        lookup = {record["report"]["case_id"]: record for record in selected}
-        result["items"] = [dict(item) for item in result["items"]]
-        for item in result["items"]:
-            registers = relevant_registers(dataset, lookup[item["case_id"]], evaluation.get("predicate"))
-            if registers is not None:
-                item["relevant_registers"] = registers
+    result = sample_cases(dataset, records, predicate=(evaluation or {}).get("predicate"))
+    for examples in result.values():
+        for example in examples:
+            context._evidence_ids.add(example["case_id"])
     return result
 
 
-def _result(context, dataset, result_id, cursor=None):
-    from .cases import case_records
-    from .evidence import summarize_reports
+def _result(context, dataset, result_id):
+    from .presentation import feedback
     result = _known_result(context, result_id)
-    summary = result.get("report_summary")
-    if summary is None:
-        summary = summarize_reports([item["report"] for item in case_records(dataset, result)])
-    status = {"reject_same_crash": "rejects_target", "not_rejected": "observed", "unavailable": "unknown"}.get(result.get("status"), "unknown")
-    return {"result_id": result_id, "predicate": result.get("predicate"), "status": status,
-            "verified": False, "evaluation_mode": result.get("evaluation_mode", "historical"),
-            "summary": summary, "cases": _case_page(context, dataset,
-                {"result_id": result_id, "domain": "all", "order": "noteworthy", "cursor": cursor}, size=RESULT_PAGE_SIZE)}
+    return {"result_id": result_id, "predicate": result.get("predicate"),
+            "mode": result.get("evaluation_mode", "recorded"), **feedback(dataset, result)}
+
+
+def _resolve_case(dataset, case_id):
+    from .cases import resolve_case
+    try:
+        return resolve_case(dataset, case_id)
+    except ValueError:
+        raise ToolError("out_of_scope", "use a returned case_id") from None
 
 
 def _case_detail(context, dataset, args):
     from binradar import binradar_taosc_predicates as predicates
     from .evaluation import _snapshots
     from .evidence import project_case
-    try:
-        case = dataset.case(args["case_id"])
-    except ValueError:
-        raise ToolError("out_of_scope", "unknown case_id; select a returned case") from None
+    from .presentation import compact_case
+    case = _resolve_case(dataset, args["case_id"])
     result_id = args.get("result_id")
+    evaluation = _known_result(context, result_id) if result_id else {}
     evaluated = None
-    evaluation = _known_result(context, result_id) if result_id is not None else {}
-    if result_id is not None:
-        evaluated = next((item for item in evaluation.get("cases", [])
-                          if item["case_id"] == case["id"]), None)
+    if result_id:
+        evaluated = next((item for item in evaluation.get("cases", []) if item["case_id"] == case["id"]), None)
         if evaluated is None:
-            raise ToolError("out_of_scope", "case not present in candidate result")
-    result = {"case": evaluated.get("report") if evaluated and evaluated.get("report") is not None
-              else project_case(dataset, case, evaluated, descriptor=evaluation.get("descriptor"),
-                                predicate=evaluation.get("predicate")), "result_id": result_id}
+            raise ToolError("out_of_scope", "case is not in that result")
+    elif context._poc and case["id"] == (context._poc.get("case") or {}).get("id"):
+        case = {**case, "capture": (context._poc.get("neutral") or {}).get("capture"),
+                "observation": context._poc.get("original", {}).get("outcome") or case.get("observation", {})}
+    report = (evaluated.get("report") if evaluated else None) or project_case(
+        dataset, case, evaluated, descriptor=evaluation.get("descriptor"), predicate=evaluation.get("predicate"))
+    result = {"case": compact_case(dataset, report, predicate=evaluation.get("predicate"))}
     capture = (evaluated if evaluated is not None else case).get("capture")
-    scope = case["id"] + ":" + (result_id or "prepared")
+    scope = case["id"] + ":" + (result_id or "neutral")
     state_id = args.get("state_id")
-    candidate_unverified = result_id is not None and result["case"]["activation"]["status"] == "unknown"
-    if capture is None or capture.get("complete") is not True or candidate_unverified:
+    if capture is None or capture.get("complete") is not True or (result_id and report["activation"]["status"] == "unknown"):
         if state_id is not None:
-            raise ToolError("out_of_scope", "state does not belong to an available capture")
+            raise ToolError("out_of_scope", "state is not captured for this observation")
         if args.get("cursor") is not None:
             _offset(context, "states:" + scope, args["cursor"])
-            raise ToolError("invalid_cursor", "cursor outside unavailable capture")
-        result["state_capture"] = {"status": "unavailable", "basis": "candidate" if result_id else "prepared",
-                                   "reason": "candidate-capture-unverified" if candidate_unverified
-                                             else "no-complete-capture"}
+            raise ToolError("invalid_cursor", "no state continuation")
+        result["note"] = "No captured registers for this observation."
         return result
     try:
         states = _snapshots(dataset, capture)
     except (ValueError, OSError, KeyError, TypeError):
-        raise ToolError("not_available", "capture failed identity/completeness validation") from None
-    result["state_capture"] = {"status": "complete", "basis": "candidate" if result_id else "prepared",
-                               "total_hits": len(states), "descriptor": capture["descriptor"]}
+        raise ToolError("not_available", "capture failed validation") from None
+    result["basis"] = "candidate_capture" if result_id else "neutral_capture"
 
     def project(index):
         state = states[index]
         eid = scope + ":hit:" + str(index)
         context._evidence_ids.add(eid)
-        return {"state_id": eid, "hit_index": index, "branch": state.branch,
-                "registers": {name: str(predicates.wrap64(state.registers[position]))
-                              for name, position in predicates.REGISTER_TO_VAR.items()},
-                "clamps": [[str(begin), str(end)] for begin, end in state.clamps],
-                "stack_bytes": len(state.stack), "stack_sha256": digest(state.stack)}
+        value = {"state_id": eid, "hit_index": index, "branch": state.branch,
+                 "registers": {name: str(predicates.wrap64(state.registers[position]))
+                               for name, position in predicates.REGISTER_TO_VAR.items()}}
+        if state.clamps:
+            value["clamps"] = [[str(begin), str(end)] for begin, end in state.clamps]
+        if state.stack:
+            value["stack_bytes"] = len(state.stack)
+        return value
 
     if state_id is None:
         page = _page(context, "states:" + scope, range(len(states)), args.get("cursor"))
         page["items"] = [project(index) for index in page["items"]]
         result["states"] = page
-        result["zero_hits"] = not states
         return result
     prefix = scope + ":hit:"
     if not state_id.startswith(prefix) or not state_id[len(prefix):].isdecimal():
-        raise ToolError("out_of_scope", "state does not belong to case/result")
+        raise ToolError("out_of_scope", "state does not belong to this observation")
     index = int(state_id[len(prefix):])
     if index >= len(states) or state_id != prefix + str(index):
-        raise ToolError("out_of_scope", "state does not belong to case/result")
+        raise ToolError("out_of_scope", "state does not belong to this observation")
     state = states[index]
     offset = _offset(context, "stack:" + state_id, args.get("cursor"))
     if offset >= len(state.stack) and offset:
         raise ToolError("invalid_cursor", "cursor outside captured stack")
     end = min(offset + 4096, len(state.stack))
     result["state"] = project(index)
-    result["stack"] = {"hex": state.stack[offset:end].hex(), "byte_offset": offset,
-        "total_bytes": len(state.stack), "truncated": end < len(state.stack),
-        "next_cursor": _cursor(context, "stack:" + state_id, end) if end < len(state.stack) else None}
+    result["stack"] = {"hex": state.stack[offset:end].hex(), "byte_offset": offset, "total_bytes": len(state.stack)}
+    if end < len(state.stack):
+        result["stack"]["next_cursor"] = _cursor(context, "stack:" + state_id, end)
     return result
 
 
 def _analysis(context, dataset, args):
     from .analysis import analysis_view
-    scope = {"query": "analysis", "projection_version": PROJECTION_VERSION,
-             **{key: args.get(key) for key in ("procedure_id", "view", "site", "window")}}
+    scope = {key: args.get(key) for key in ("procedure_id", "view", "site", "window", "facet", "address")}
     offset = _offset(context, scope, args.get("cursor"))
     try:
         result = analysis_view(dataset, args["procedure_id"], args["view"], site=args.get("site"),
-                               window=args.get("window"), offset=offset)
+                               window=args.get("window"), facet=args.get("facet"), address=args.get("address"), offset=offset)
     except ValueError as error:
         raise ToolError("out_of_scope", str(error)) from None
     next_offset = result.pop("next_offset", None)
-    result["next_cursor"] = _cursor(context, scope, next_offset) if next_offset is not None else None
-    result["query_id"] = digest(canonical(scope))
-    if result.get("evidence_id"):
-        context._evidence_ids.add(result["evidence_id"])
-    return result
+    if next_offset is not None:
+        result["next_cursor"] = _cursor(context, scope, next_offset)
+    return context.expose_evidence(result)
 
 
 def _poc_log(context, dataset, args):
     from .analysis import _page_text
     from .evidence import poc_log
     log = poc_log(dataset)
-    scope = {"view": "poc_log", "projection_version": PROJECTION_VERSION,
-             "log_sha256": log["source"]["log_sha256"]}
+    scope = {"view": "poc_log"}
     offset = _offset(context, scope, args.get("cursor"))
-    text, extent, total, next_offset = _page_text(log.pop("text"), offset)
-    log.update(text=text, range=extent, total_bytes=total)
-    if log["source"]["log_sha256"] is not None:
-        log["evidence_id"] = "poc-log:" + digest(canonical([dataset.dataset_id, log]))
-        context._evidence_ids.add(log["evidence_id"])
-    return {"poc_log": log, "query_id": digest(canonical(scope)),
-            "truncated": next_offset is not None or log["source_truncated"],
-            "next_cursor": _cursor(context, scope, next_offset) if next_offset is not None else None}
+    text, extent, total, next_offset = _page_text(log["text"], offset)
+    if not text:
+        return {"note": "No saved POC log text." if not log["source_truncated"] else "POC log exceeds the bounded excerpt."}
+    result = {"text": text, "range": extent, "total_bytes": total,
+              "evidence_id": context.reference("poc-log:" + digest(canonical([log["source"], extent, text])))}
+    if next_offset is not None:
+        result["next_cursor"] = _cursor(context, scope, next_offset)
+    if log["source_truncated"]:
+        result["note"] = "Source excerpt limited to 1 MiB; remaining source is omitted."
+    return result
 
 
 def call_tool(context: SynthesisContext, name, args):
-    base = {"context_id": context.context_id, "dataset_id": context.dataset.dataset_id, "truncated": False}
+    base = {"context_id": context.context_id}
     try:
         definitions = {item["name"]: item for item in tool_definitions()}
         if name not in definitions:
@@ -330,21 +296,20 @@ def call_tool(context: SynthesisContext, name, args):
             elif name == "get_function_analysis":
                 result = _analysis(context, dataset, args)
             elif name == "list_cases":
-                result = _case_page(context, dataset, args)
+                result = _case_examples(context, dataset, args)
             elif name == "get_case":
                 result = _case_detail(context, dataset, args)
             elif name == "get_candidate_result":
-                result = _result(context, dataset, args["result_id"], args.get("cursor"))
+                result = _result(context, dataset, args["result_id"])
             else:
                 from .evaluation import evaluate_dataset
                 candidate = _candidate(dataset, args["predicate"])
                 evaluation = evaluate_dataset(dataset, candidate.expression, workers=context.workers,
                     execute=name == "test_candidate", cache_dir=context.cache_dir or context.run_dir / "cache",
                     replay_socket=context.replay_socket if name == "test_candidate" else None)
-                result_id = digest(canonical(evaluation))
+                result_id = context.reference(digest(canonical(evaluation)), kind="r")
                 context._results[result_id] = evaluation
-                result = {"valid_syntax": True, "checked_predicate": args["predicate"],
-                          **_result(context, dataset, result_id)}
+                result = _result(context, dataset, result_id)
         return {**base, "ok": True, **result}
     except ToolError as error:
         return {**base, "ok": False, "error": {"code": error.code, "message": str(error)}}

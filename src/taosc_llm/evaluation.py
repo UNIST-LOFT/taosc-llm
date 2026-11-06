@@ -351,7 +351,7 @@ def _replay_evaluate(dataset, candidate, *, case_ids, socket_path):
 
 
 def _evaluate(dataset, candidate, descriptor, *, case_ids, workers, execute, cache_dir,
-              replay_socket=None):
+              replay_socket=None, include_poc=True):
     """Evaluate one candidate inside the caller's active validation scope.
 
     ``replay_socket`` selects the trusted live host bridge for **function**
@@ -367,9 +367,24 @@ def _evaluate(dataset, candidate, descriptor, *, case_ids, workers, execute, cac
     if type(workers) is not int or not 1 <= workers <= 32:
         raise ValueError('workers must be in 1..32')
     # Public entry points hold a validation scope until all worker threads settle.
-    cases = dataset.cases() if case_ids is None else [dataset.case(case_id) for case_id in case_ids]
+    from .poc import poc_case
+    original_poc = poc_case(dataset) if include_poc else None
+    prepared = dataset.cases()
+    by_id = {case['id']: case for case in prepared}
+    if original_poc is not None:
+        by_id.setdefault(original_poc['id'], original_poc)
+    if case_ids is None:
+        cases = list(by_id.values())
+    else:
+        if any(case_id not in by_id for case_id in case_ids):
+            raise ValueError('unknown scoped case id')
+        cases = [by_id[case_id] for case_id in case_ids]
     if len({c['id'] for c in cases}) != len(cases):
         raise ValueError('duplicate case ids')
+    if (original_poc is not None
+            and not any(case.get('input_sha256') == original_poc['input_sha256']
+                        for case in cases if case['domain'] == 'system')):
+        cases.append(original_poc)
     # Offline is an API guarantee, even if a trusted context has an endpoint.
     if not execute:
         replay_socket = None
@@ -448,10 +463,13 @@ def _evaluate(dataset, candidate, descriptor, *, case_ids, workers, execute, cac
 
 def evaluate_dataset(dataset, predicate: str, *, case_ids: list[str] | None = None,
                      workers: int = 1, execute: bool = True, cache_dir: Path | None = None,
-                     replay_socket=None) -> dict:
+                     replay_socket=None, include_poc: bool = True) -> dict:
     """Evaluate a family predicate; ``replay_socket`` is trusted host input.
 
     It is never serialized into a model tool argument or a public patch entry.
+    The frozen original POC participates by default, even when absent from the
+    prepared system population or an explicit selection. ``include_poc`` is a
+    trusted host-only control; no caller-defined cases or inputs are accepted.
     """
     if isinstance(dataset, (str, Path)):
         dataset = load_dataset(Path(dataset))
@@ -459,7 +477,7 @@ def evaluate_dataset(dataset, predicate: str, *, case_ids: list[str] | None = No
         candidate = parse_candidate(validated.patch_format, predicate)
         return _evaluate(validated, candidate, candidate.descriptor, case_ids=case_ids,
                          workers=workers, execute=execute, cache_dir=cache_dir,
-                         replay_socket=replay_socket)
+                         replay_socket=replay_socket, include_poc=include_poc)
 
 
 def warm_dataset(dataset, *, workers: int = 1, cache_dir: Path | None = None) -> dict:

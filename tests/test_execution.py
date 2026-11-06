@@ -74,6 +74,42 @@ def test_each_execution_owns_runner_cwd_env_input_and_capture_channels(tmp_path,
     assert all(not Path(item[1]).exists() for item in observed)
 
 
+def test_original_observation_runs_orig_without_neutral_state_channel(tmp_path, monkeypatch):
+    dataset = FixtureDataset(tmp_path)
+    case = {'input_path': 'input', 'input_sha256': execution.sha256(tmp_path / 'input')}
+    observed = []
+    class Runner:
+        def __init__(self, directory, binary, test_cmd, patch_loc, metadata, kind, stack, timeout):
+            self.dir = directory
+            self.brcache_stack_size = stack
+            self.run_results = None
+        def load_instruction_map(self, binary):
+            pytest.fail('original observation must not load a cached instruction map')
+        def e9_metadata_for_binary(self, binary):
+            return '', []
+        def _test_with_capture(self, binary, patch_id, input_file, *, capture_cached, base_env):
+            assert Path(binary).name == 'fixture.orig'
+            assert not capture_cached
+            assert Path(binary).read_bytes() == dataset.artifact('fixture.orig').read_bytes()
+            assert Path(input_file).read_bytes() == b'input'
+            assert 'TEST_PROVIDER_SECRET' not in base_env
+            observed.append(self.dir)
+            self.run_results = SimpleNamespace(success=True, timed_out=False)
+            return SimpleNamespace(exit_info='crash', concrete_fault_addr=33,
+                                   concrete_oracle='qasan-main-v2'), None, None
+    monkeypatch.setattr(execution.verifier.BinRadarQemuRunner, 'from_env',
+                        lambda directory, environment: SimpleNamespace(
+                            dir=directory, binary='fixture', test_cmd='@@', patch_loc='0x10',
+                            e9_metadata={}, patch_kind='generic-erm', brcache_stack_size=0, exec_timeout=5))
+    monkeypatch.setattr(execution, '_PrivateRunner', Runner)
+    monkeypatch.setenv('TEST_PROVIDER_SECRET', 'must-not-reach-target')
+    result = execution.execute_original(dataset, case, tmp_path / 'owned')
+    assert result['artifact_sha256'] == execution.sha256(dataset.artifact('fixture.orig'))
+    assert result['outcome']['outcome'] == 'crash'
+    assert 'path' not in result and 'branches' not in result
+    assert observed and not Path(observed[0]).exists()
+
+
 def test_relative_cache_directory_resolves_before_launch(tmp_path, monkeypatch):
     """The launcher cwd is the scratch dir; a relative --scratch used to double."""
     dataset = FixtureDataset(tmp_path)

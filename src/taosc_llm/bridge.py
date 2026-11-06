@@ -161,7 +161,8 @@ async def run_adapter(context: SynthesisContext, provider: ProviderConfig,
                     await task
                     raise
                 if result.get("ok"):
-                    if frame["tool"] in ("evaluate_predicate", "test_candidate") and result.get("valid_syntax"):
+                    if (frame["tool"] in ("evaluate_predicate", "test_candidate")
+                            and result.get("predicate") == frame["arguments"]["predicate"]):
                         checked.add(frame["arguments"]["predicate"])
                     elif frame["tool"] not in ("evaluate_predicate", "test_candidate", "get_candidate_result"):
                         inspected = True

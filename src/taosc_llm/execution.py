@@ -43,8 +43,8 @@ class _PrivateRunner(verifier.BinRadarQemuRunner):
         return [*argv, '--', *command]
 
 
-def execute_capture(dataset, case: dict, descriptor: str, directory: Path) -> dict:
-    """Run an explicit descriptor (including neutral p0), never manifest selection.
+def _execute(dataset, case: dict, descriptor: str, directory: Path, *, original=False) -> dict:
+    """Run the original or an explicit descriptor, never manifest selection.
 
     Every call owns a copied artifact tree, input, environment, cwd and runner.
     The ordinary collector's empty-manifest fallback is deliberately not used.
@@ -60,9 +60,11 @@ def execute_capture(dataset, case: dict, descriptor: str, directory: Path) -> di
         shutil.copytree(dataset.workdir, work, symlinks=False)
         # Only frozen artifacts may enter a worker. Dataset validation binds them.
         binary = work / (dataset.binary + '.brcached')
-        original = work / (dataset.binary + '.orig')
-        if not binary.is_file() or not original.is_file():
+        original_binary = work / (dataset.binary + '.orig')
+        if not binary.is_file() or not original_binary.is_file():
             raise ExecutionUnavailable('cached-artifact-unavailable')
+        if original:
+            binary = original_binary
         artifact_hash = sha256(binary)
         for name, record in dataset.manifest['artifacts'].items():
             try:
@@ -95,7 +97,8 @@ def execute_capture(dataset, case: dict, descriptor: str, directory: Path) -> di
             configured.dir, configured.binary, configured.test_cmd, configured.patch_loc,
             configured.e9_metadata, configured.patch_kind, configured.brcache_stack_size,
             configured.exec_timeout)
-        runner.load_instruction_map(str(binary))
+        if not original:
+            runner.load_instruction_map(str(binary))
         environment = native_environment()
         environment.update(HOME=str(work), TMPDIR=str(work), LC_ALL='C',
                            AFL_USE_QASAN='1', PATCH_ID='0', TAOSC_PRED=descriptor,
@@ -108,11 +111,13 @@ def execute_capture(dataset, case: dict, descriptor: str, directory: Path) -> di
             if key in settings:
                 environment[key] = settings[key]
         probe, text, raw = runner._test_with_capture(
-            str(binary), '0', str(input_file), capture_cached=True, base_env=environment)
+            str(binary), '0', str(input_file), capture_cached=not original, base_env=environment)
         execution = runner.run_results
         if (execution is None or not execution.success or execution.timed_out
                 or probe is None or probe.exit_info not in ('ok', 'crash')):
             raise ExecutionUnavailable('execution-unavailable')
+        if original:
+            return {'artifact_sha256': artifact_hash, 'outcome': concrete_result(probe)}
         patch = verifier.BinRadarPatchResult.from_log(text.decode(errors='replace')) if text else None
         if probe.patch_hit_cnt == 0 and not text:
             branches = []
@@ -145,6 +150,16 @@ def execute_capture(dataset, case: dict, descriptor: str, directory: Path) -> di
                 'branches': branches, 'descriptor': descriptor, 'complete': complete,
                 'reason': error or ('none' if complete else 'capture-hit-mismatch'),
                 'outcome': concrete_result(probe)}
+
+
+def execute_capture(dataset, case: dict, descriptor: str, directory: Path) -> dict:
+    """Collect explicit-descriptor cached states in an isolated owned worker."""
+    return _execute(dataset, case, descriptor, directory)
+
+
+def execute_original(dataset, case: dict, directory: Path) -> dict:
+    """Observe the real .orig artifact; never substitute neutral .brcached states."""
+    return _execute(dataset, case, 'p0', directory, original=True)
 
 
 def execution_identity() -> dict:

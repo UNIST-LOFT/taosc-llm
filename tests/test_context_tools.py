@@ -100,7 +100,11 @@ def proposal(context, **changes):
 
 
 def test_dataset_identity_and_private_projection(context):
-    assert context.context_id == prepare_context(context.dataset).context_id
+    other = prepare_context(context.dataset)
+    assert other.context_id != context.context_id
+    assert other.call_tool("get_patch_context", {"context_id": context.context_id})["error"]["code"] == "stale_context"
+    assert all(record["sha256"] not in context.initial_prompt()
+               for record in context.dataset.manifest["artifacts"].values())
     assert "/private/source-run" not in context.initial_prompt()
     original = context.projection
     original["patch"]["location"] = 0
@@ -159,7 +163,7 @@ def test_parallel_tool_evaluation_does_not_share_validation_scope(context, monke
             release.set()
         first = running.result(timeout=10)
     assert first['ok'] is True
-    assert first['cases']['items'][0]['activation']['status'] == 'not_fired'
+    assert context._results[first["result_id"]]["cases"][0]["report"]["activation"]["status"] == "not_fired"
     assert context.dataset is original
 
 
@@ -175,10 +179,13 @@ def test_scoped_authority(context):
 
 def test_real_offline_evaluation_and_result_reference(context):
     result = query(context, "evaluate_predicate", predicate="rax < 0")
-    assert result["ok"] and result["valid_syntax"] and result["verified"] is False
-    assert result["cases"]["total"] == 2
+    assert result["ok"] and result["mode"] == "offline"
+    assert result["missed_target_crashes"]["count"] == 0
+    assert result["regressions"]["count"] == 0
+    assert "warning" in result
+    assert "cases" not in result and "summary" not in result
     referenced = query(context, "get_candidate_result", result_id=result["result_id"])
-    assert referenced["cases"] == result["cases"]
+    assert referenced == result
     assert query(context, "get_candidate_result", result_id="foreign")["error"]["code"] == "out_of_scope"
 
 
@@ -197,7 +204,7 @@ def test_unavailable_result_capture_rejects_state_and_cursor(context):
     context._results["unavailable-result"] = {"cases": [{"case_id": "function:0", "capture": None}]}
     args = {"case_id": "function:0", "result_id": "unavailable-result"}
     unavailable = query(context, "get_case", **args)
-    assert unavailable["ok"] and unavailable["state_capture"]["status"] == "unavailable"
+    assert unavailable["ok"] and "states" not in unavailable and "note" in unavailable
     assert "zero_hits" not in unavailable
     prepared = query(context, "get_case", case_id="function:0")
     state_id = prepared["states"]["items"][0]["state_id"]
@@ -212,23 +219,15 @@ def test_analysis_pagination_and_cursor_scope(context):
     assert len(first["text"].encode()) <= 8192 and first["truncated"]
     pages = [first["text"]]
     current = first
-    while current["next_cursor"]:
+    while current.get("next_cursor"):
         current = query(context, "get_function_analysis", procedure_id="procedure:0x1000",
                         view="decompilation", cursor=current["next_cursor"])
         assert current["ok"]
         pages.append(current["text"])
     assert "".join(pages) == "\n".join("  /* é */ step_" + str(i) + "();" for i in range(500))
-    wrong = query(context, "list_cases", domain="all", cursor=first["next_cursor"])
+    wrong = query(context, "get_function_analysis", procedure_id="procedure:0x1000",
+                  view="instructions", cursor=first["next_cursor"])
     assert wrong["error"]["code"] == "invalid_cursor"
-    assert "decompilation" in wrong["error"]["message"] and "cases" in wrong["error"]["message"]
-
-
-def test_large_dataset_pages_not_global_cap(tmp_path):
-    context = prepare_context(make_dataset(tmp_path / "large", count=1100))
-    first = query(context, "list_cases", domain="all")
-    assert first["total"] == 1100 and len(first["items"]) == 32
-    second = query(context, "list_cases", domain="all", cursor=first["next_cursor"])
-    assert second["items"][0]["case_id"] == "function:32"
 
 
 @pytest.mark.parametrize("expression", ["", "rax &&", "rax; return 1", "rip == 0", "0xff"])

@@ -5,7 +5,7 @@ import pytest
 
 from taosc_llm.context import digest, prepare_context
 from taosc_llm.dataset import canonical, load_dataset
-from taosc_llm.evidence import POC_LOG_BYTES, POC_SUMMARY_BYTES
+from taosc_llm.evidence import POC_LOG_BYTES, POC_SUMMARY_BYTES, poc_diagnostic, poc_log
 from test_context_tools import make_dataset, proposal, query
 
 
@@ -37,9 +37,14 @@ def context_for(tmp_path, payload):
     return prepare_context(dataset, run_dir=tmp_path / "run")
 
 
+def private_diagnostic(context):
+    with context.dataset.validation() as dataset:
+        return poc_diagnostic(dataset)
+
+
 def test_summary_separates_reported_memory_pc_and_oracle(tmp_path):
     context = context_for(tmp_path, SEGV)
-    diagnostic = context.projection["poc_diagnostic"]
+    diagnostic = private_diagnostic(context)
     assert diagnostic["status"] == "recognized"
     assert diagnostic["error"] == "SEGV on unknown address 0x0000000000759000"
     assert diagnostic["reported_address"] == "0x759000"
@@ -52,9 +57,12 @@ def test_summary_separates_reported_memory_pc_and_oracle(tmp_path):
     assert "/private/" not in context.initial_prompt()
     assert "SUMMARY: QEMU" not in context.initial_prompt()
     # A runtime library PC must not become a target reference when none exists.
-    assert context.projection["oracles"]["system"]["target"] is None
+    assert "system" not in context.projection["targets"]
+    public = context.projection["original_poc"]["diagnostic"]
+    assert public["basis"] == "saved_log"
+    assert "source" not in public and digest(SEGV.encode()) not in context.initial_prompt()
     context.validate_proposal(proposal(context, decision="abstain", predicate=None,
-                                      evidence_ids=[diagnostic["evidence_id"]]))
+                                      evidence_ids=[public["evidence_id"]]))
     assert context.dataset.artifact("trace/qasan.log").read_text() == SEGV
 
 
@@ -72,20 +80,20 @@ previously allocated by thread T0 here:
     #0 0xffff in second_report (/secret/build/test+0x78)
 """
     context = context_for(tmp_path, log)
-    diagnostic = context.projection["poc_diagnostic"]
+    diagnostic = private_diagnostic(context)
     assert diagnostic["access"] == {"operation": "READ", "size": 8}
     assert diagnostic["reported_pc"] == "0xabcd"
     assert len(diagnostic["fault_stack"]) == 1
     assert "deallocator" not in context.initial_prompt()
     assert "second_report" not in context.initial_prompt()
     page = query(context, "get_patch_context", view="poc_log")
-    assert page["ok"] and not page["truncated"]
-    assert "deallocator" in page["poc_log"]["text"]
-    assert "allocator" in page["poc_log"]["text"]
-    assert "second_report" in page["poc_log"]["text"]
+    assert page["ok"] and "next_cursor" not in page
+    assert "deallocator" in page["text"]
+    assert "allocator" in page["text"]
+    assert "second_report" in page["text"]
     assert "/secret/" not in json.dumps(page)
     context.validate_proposal(proposal(context, decision="abstain", predicate=None,
-                                      evidence_ids=[page["poc_log"]["evidence_id"]]))
+                                      evidence_ids=[page["evidence_id"]]))
     with pytest.raises(ValueError):
         context.validate_proposal(proposal(context, evidence_ids=["poc-log:" + "0" * 64]))
 
@@ -94,24 +102,25 @@ previously allocated by thread T0 here:
                                            (b"qemu: interrupted\xff\n", "unrecognized")])
 def test_missing_or_incomplete_diagnostic_does_not_invent_a_crash(tmp_path, payload, status):
     context = context_for(tmp_path, payload)
-    diagnostic = context.projection["poc_diagnostic"]
+    diagnostic = private_diagnostic(context)
     assert diagnostic["status"] == status
     assert diagnostic["error"] is None and diagnostic["reported_pc"] is None
     assert diagnostic["fault_stack"] == []
     page = query(context, "get_patch_context", view="poc_log")
-    assert page["ok"] and page["next_cursor"] is None
-    assert page["poc_log"]["source_truncated"] is False
+    assert page["ok"] and "next_cursor" not in page
+    assert "diagnostic" not in context.projection["original_poc"]
     if payload:
-        assert "interrupted" in page["poc_log"]["text"]
+        assert "interrupted" in page["text"]
 
 
 def test_utf8_pages_preserve_log_and_cursors_stay_scoped(tmp_path):
     log = "".join(f"{i:04d}: 디버그 é " + "x" * 150 + "\n" for i in range(250))
     context = context_for(tmp_path, log)
     first = query(context, "get_patch_context", view="poc_log")
-    assert first["truncated"] and first["next_cursor"]
+    assert first["next_cursor"]
     assert not query(context, "get_patch_context", cursor=first["next_cursor"])["ok"]
-    mismatched = query(context, "list_cases", domain="all", cursor=first["next_cursor"])
+    mismatched = query(context, "get_function_analysis", procedure_id="procedure:0x1000",
+                       view="instructions", cursor=first["next_cursor"])
     assert mismatched["error"]["code"] == "invalid_cursor"
     other = prepare_context(context.dataset, run_dir=tmp_path / "other")
     assert query(other, "get_patch_context", view="poc_log", cursor=first["next_cursor"])["error"]["code"] == "invalid_cursor"
@@ -120,7 +129,7 @@ def test_utf8_pages_preserve_log_and_cursors_stay_scoped(tmp_path):
     offset = 0
     while True:
         assert page["ok"]
-        detail = page["poc_log"]
+        detail = page
         assert detail["range"]["start"] == offset
         assert len(detail["text"].encode()) <= 8192
         assert len(detail["text"].splitlines()) <= 120
@@ -129,12 +138,11 @@ def test_utf8_pages_preserve_log_and_cursors_stay_scoped(tmp_path):
         assert detail["evidence_id"] not in evidence
         evidence.add(detail["evidence_id"])
         chunks.append(detail["text"])
-        if page["next_cursor"] is None:
-            assert not page["truncated"]
+        if "next_cursor" not in page:
             break
         page = query(context, "get_patch_context", view="poc_log", cursor=page["next_cursor"])
     assert "".join(chunks) == log
-    assert offset == first["poc_log"]["total_bytes"]
+    assert offset == first["total_bytes"]
 
 
 @pytest.mark.parametrize("long_line", [False, True])
@@ -142,16 +150,17 @@ def test_source_limit_is_explicit_and_never_leaks_partial_paths(tmp_path, long_l
     payload = (b"/private/" + b"x" * (POC_LOG_BYTES + 100) if long_line
                else SEGV.encode() + b"diagnostic line\n" * (POC_LOG_BYTES // 10))
     context = context_for(tmp_path, payload)
-    summary = context.projection["poc_diagnostic"]
+    summary = private_diagnostic(context)
     assert summary["source_truncated"] and summary["read_bytes"] <= POC_SUMMARY_BYTES
     page = query(context, "get_patch_context", view="poc_log")
-    detail = page["poc_log"]
-    assert page["ok"] and page["truncated"]
+    with context.dataset.validation() as dataset:
+        detail = poc_log(dataset)
+    assert page["ok"] and "note" in page
     assert detail["source_truncated"] and detail["read_bytes"] <= POC_LOG_BYTES
     assert detail["source_bytes"] == len(payload)
     assert "/private/" not in json.dumps(page)
     if long_line:
-        assert detail["text"] == "" and page["next_cursor"] is None
+        assert "text" not in page and "next_cursor" not in page
 
 
 def test_diagnostic_queries_reject_changed_frozen_log(tmp_path):
@@ -166,18 +175,18 @@ def test_oversized_report_fields_remain_bounded_without_partial_addresses(tmp_pa
            + " (pc 0x" + "2" * 1000 + ")\n"
            + "    #0 0x1234 in " + "symbol" * 200 + "\n")
     context = context_for(tmp_path, log)
-    diagnostic = context.projection["poc_diagnostic"]
+    diagnostic = private_diagnostic(context)
     assert diagnostic["reported_address"] is None and diagnostic["reported_pc"] is None
     assert len(diagnostic["error"]) == 512 and diagnostic["error_truncated"]
     assert len(diagnostic["fault_stack"][0]) == 512 and diagnostic["stack_truncated"]
-    assert query(context, "get_patch_context", view="poc_log")["poc_log"]["text"] == log
+    assert query(context, "get_patch_context", view="poc_log")["text"] == log
 
 
 def test_fault_stack_bound_does_not_expose_all_frames_inline(tmp_path):
     log = SEGV.split("    #0")[0] + "".join(
         f"    #{i} 0x{1000+i:x} in frame_{i} (/secret/bin/objdump+0x{i:x})\n" for i in range(12))
     context = context_for(tmp_path, log)
-    diagnostic = context.projection["poc_diagnostic"]
+    diagnostic = private_diagnostic(context)
     assert len(diagnostic["fault_stack"]) == 6 and diagnostic["stack_truncated"]
     assert "frame_11" not in context.initial_prompt()
-    assert "frame_11" in query(context, "get_patch_context", view="poc_log")["poc_log"]["text"]
+    assert "frame_11" in query(context, "get_patch_context", view="poc_log")["text"]

@@ -218,17 +218,24 @@ evaluation of concrete cases and, when the trusted host configured a replay
 bridge, of loaded function cases as well. No shell, arbitrary file access, debugger, built-in tools,
 extensions, MCP, REA invocation or subagents are exposed. REA views were frozen at
 setup. Inline context satisfies context availability; `get_patch_context` is optional.
-The original POC's frozen QASAN diagnostic is summarized inline; deeper frames and
-allocation/free histories are available only through `get_patch_context(view="poc_log")`
-with bounded pages. Diagnostic runtime PCs and memory addresses do not replace the
-configured target oracle, and a saved log hash does not authenticate its originating
-execution. See [diagnostic evidence](../../agent-docs/taosc-llm/PROMPTS_AND_EVIDENCE.md#original-poc-diagnostic-summary)
-for provenance, missing-log behavior and retrieval limits.
-Candidate proposals require evaluation of the exact expression. Results separate
-original/neutral/candidate outcomes, fixed domain oracles, actual activation and
-capture availability. Eight noteworthy cases expose counterexamples, control gaps,
-transitions and distinct unknown reasons; `list_cases` supports structured filters
-and explicit-feature similarity without new execution authority. Strict response parsing, native builds and actual evaluation feedback
+Initial context includes the original POC's sanitized invocation, input size,
+observed outcome and neutral patch-site register example. Before the first provider
+prompt, the host reuses authenticated evidence or actually collects missing original
+and neutral observations. A POC absent from prepared cases is still included in
+candidate evaluation. No values are invented; neutral registers are labeled separately
+from the original artifact. Saved QASAN diagnostics are summarized inline; deeper
+frames/allocation/free histories require bounded `get_patch_context(view="poc_log")`
+pages. Neither saved-log addresses nor site values replace the configured target
+oracle. See [POC evidence](../../agent-docs/taosc-llm/PROMPTS_AND_EVIDENCE.md#original-poc-diagnostic-summary).
+Candidate proposals require evaluation of the exact expression. Context and
+`list_cases` show at most three crash/three normal examples. Evaluation feedback
+contains only missed target crashes and compatible normal→target regressions,
+with counts and at most three examples each. Other-location crashes are omitted.
+One concise coverage/control warning replaces unknown/unavailable lists; empty
+feedback is not repair proof. Optional register/mutation filters and similarity
+select more small examples, never an exhaustive case page. Hashes/audit metadata
+stay private; model IDs are short scoped handles. Static `function` views default
+to available facets; select a facet/address for local CFG/value-flow evidence. Strict response parsing, native builds and actual evaluation feedback
 feed bounded refinement rounds (`--max-rounds` 1–16, default 4, provider-only);
 manual mode rejects provider options instead of ignoring them. Abstention stops
 without a candidate. No final BinRadar verification is run.
@@ -288,10 +295,11 @@ Stdout contains one JSON result; diagnostics go to stderr. Common CLI exits:
 `warmed` status. Rejection takes precedence over unavailable cases; absent any
 rejection, any unavailable case (or no cases) makes the aggregate unavailable.
 `not_rejected` only means admitted observations did not reject this candidate.
-These are host/CLI statuses. Model tools instead expose direct case outcomes and
-aggregate `rejects_target|observed|unknown`; `report_summary` separates actual firing,
-neutral transitions, capture gaps and oracle warnings. Offline predictions are not
-actual activity, and other-crash is not normal termination.
+These are host/CLI statuses. Model tools expose only bounded target-miss/regression
+feedback and a material evidence warning. Full private `report_summary` retains
+actual firing, paired transitions, capture gaps and oracle warnings. Offline
+predictions are not actual activity; omitted other-location crashes are not normal
+termination.
 With `--replay-socket`, a result also carries a `replay` block (endpoint,
 coverage, mutation count, unavailable count). The endpoint never enters the
 model projection or a tool result, and it is not a patch field.
@@ -299,8 +307,9 @@ model projection or a tool result, and it is not a patch field.
 `verified=false` and `binradar_verification=not_run` even when a build exists.
 
 Synthesis uses a private context/run root (temporary by default, or `--output`).
-Model runs contain `run.json`, `context.json`, `trials/<round>/` journals/final text,
-and `candidates/<round>/build-workdir/`, `build-result.json`, `evaluation.json`.
+Model runs contain `run.json` (including private `context_provenance`), `context.json`,
+private preflight `poc.json`, `trials/<round>/` journals/final text, and
+`candidates/<round>/build-workdir/`, `build-result.json`, `evaluation.json`.
 Manual runs place `build-workdir/` and `run.json` in their own unique run directory.
 Source workdir candidate outputs are not overwritten.
 

@@ -572,8 +572,11 @@ def test_tool_exposes_replay_only_through_host_context(run_dir, dataset):
             "context_id": context.context_id, "predicate": "1"})
     finally:
         server.close()
-    assert result["ok"] is True and result["verified"] is False
-    assert result["cases"]["total"] == 2
+    assert result["ok"] is True
+    private = context._results[result["result_id"]]
+    assert private["verified"] is False
+    assert len(private["cases"]) == 2
+    assert "cases" not in result
     # A tool caller cannot pass an endpoint, execute flag or path.
     for args in ({"context_id": context.context_id, "predicate": "1",
                   "replay_socket": str(run_dir / replay.SOCKET_NAME)},
@@ -594,7 +597,8 @@ def test_model_tool_shares_live_bridge_and_never_sees_the_endpoint(run_dir, data
     finally:
         server.close()
     assert result["ok"] is True
-    assert result["verified"] is False
+    assert context._results[result["result_id"]]["verified"] is False
+    assert "cases" not in result
     assert evaluate_requests(server)[0]["patches"] == [
         {"id": 1, "predicate": "(rax <= 0) == 0"}]
     # Projection, prompt, and the tool result carry no endpoint or cache path.
@@ -617,7 +621,8 @@ def test_offline_evaluation_never_contacts_configured_bridge(
         result = context.call_tool("evaluate_predicate", {
             "context_id": context.context_id, "predicate": "1"})
         assert result["ok"] is True
-        assert result["cases"]["total"] == 2
+        assert len(context._results[result["result_id"]]["cases"]) == 2
+        assert "cases" not in result
     else:
         result = evaluation.evaluate_dataset(
             dataset, "1", execute=False, cache_dir=tmp_path / "cache",

@@ -491,11 +491,13 @@ def test_partial_callee_does_not_hide_independent_static_facets(tmp_path, monkey
     inventory = analysis.analysis_inventory(dataset)
     procedure = inventory["procedures"][0]
     assert "function" in procedure["available_views"]
-    assert procedure["facets"]["pseudocode"]["available"] is True
-    assert any("indirect target unresolved" in reason for reason in procedure["limitations"])
-    function = analysis.analysis_view(dataset, procedure["procedure_id"], "function")
+    assert "decompilation" in procedure["available_views"]
+    assert "callees" in procedure["available_facets"]
+    function = analysis.analysis_view(dataset, procedure["procedure_id"], "function", facet="callees")
     assert function["availability"] == "available" and not function["complete"]
-    assert function["records"] == [{"facet": "callees", "address": "0x42", "name": "known_call"}]
+    assert function["records"] == [{"address": "0x42", "name": "known_call"}]
+    assert function["note"]
+    assert "limitations" not in function and "facets" not in function
     decompilation = analysis.analysis_view(dataset, procedure["procedure_id"], "decompilation")
     assert decompilation["text"] == "void fixture(void) { return; }"
 
@@ -563,7 +565,8 @@ def test_instruction_windows_stop_at_body_gaps_and_reject_noninstructions(tmp_pa
     view = analysis.analysis_view(dataset, procedure_id, "instructions",
                                   window={"address": hex(patch + 8), "before": 100, "after": 100})
     assert [row["address"] for row in view["instructions"]] == [hex(patch + index) for index in range(8, 16)]
-    assert {row["body_range"] for row in view["instructions"]} == {1}
+    assert view["body_range"] == {"start": hex(patch + 8), "end": hex(patch + 16), "range_end": "exclusive"}
+    assert all("body_range" not in row for row in view["instructions"])
     for address in (patch + 4, patch - 1, patch + 16):
         with pytest.raises(ValueError, match="exact frozen instruction"):
             analysis.analysis_view(dataset, procedure_id, "instructions", window={"address": hex(address)})
@@ -577,6 +580,13 @@ def test_instruction_windows_stop_at_body_gaps_and_reject_noninstructions(tmp_pa
     ("canonical", "references", {}, "requires site"),
     ("canonical", "references", {"site": "unrelated"}, "valid sites"),
     ("canonical", "function", {"window": {}}, "only supported"),
+    ("canonical", "instructions", {"facet": "cfg"}, "only supported"),
+    ("canonical", "decompilation", {"address": "0x1"}, "only supported"),
+    ("canonical", "function", {"facet": "unknown"}, "facet must"),
+    ("canonical", "function", {"address": "0x1"}, "requires a function facet"),
+    ("canonical", "function", {"facet": "cfg", "address": 1}, "address string"),
+    ("canonical", "function", {"facet": "cfg", "address": "0x1"}, "inside the frozen procedure body"),
+    ("canonical", "function", {"facet": "native_api", "address": "0x1"}, "procedure-wide"),
     ("canonical", "instructions", {"window": {"before": 101}}, "0..100"),
     ("canonical", "instructions", {"window": {"after": True}}, "0..100"),
     ("canonical", "instructions", {"window": {"address": 1}}, "address string"),
@@ -678,3 +688,240 @@ def test_instruction_calls_expose_compact_resolved_target_without_name_facet(tmp
                    for target in call["call_targets"][1:])
     assert all("body" not in target for target in call["call_targets"])
     assert "referenced_names" not in call
+
+
+@pytest.fixture
+def selective_static(tmp_path, monkeypatch):
+    config, work, run = preparation_inputs(tmp_path)
+    patch = int((work / "patch-location").read_text(), 16)
+    ids = [f"{hex(patch + offset)}#{index}" for index, offset in enumerate((4, 4, 8, 12))]
+
+    def enrich(payload):
+        if payload["data"]["operation"] != "analyze_function":
+            return payload
+        value = payload["data"]["normalized_result"]
+        value["facet_availability"].update({key: {"available": True} for key in
+            ("callees", "callers", "cfg", "strings_names", "references")})
+        value["callees"] = [{"address": "0x42", "name": "selected_call", "body": {"private": "not model data"}}]
+        value["callers"] = [{"address": "0x52", "name": "saved_caller"}]
+        value["basic_blocks"] = [
+            {"start": hex(patch), "end": hex(patch + 4), "successors": [hex(patch + 4), hex(patch + 8)]},
+            {"start": hex(patch + 4), "end": hex(patch + 8), "successors": [hex(patch + 8)]},
+            {"start": hex(patch + 8), "end": hex(patch + 16), "successors": []}]
+        value["referenced_names"] = [{"address": "0x42", "source_address": hex(patch + 4), "value": "selected_call"}]
+        value["referenced_strings"] = [{"address": "0x62", "source_address": hex(patch + 8), "value": "saved string"}]
+        value["outgoing_references"] = [
+            {"source_address": hex(patch + 4), "target_address": "0x42", "kind": {"call": True},
+             "target_procedure": {"address": "0x42", "name": "selected_call", "body": {"private": "not model data"}}},
+            {"source_address": hex(patch + 8), "target_address": "0x62", "kind": {"data": True}}]
+        value["incoming_references"] = [{"source_address": "0x52", "target_address": hex(patch),
+                                         "kind": {"call": True}}]
+        value["native_api"] = {"available": True, "calling_convention": "__stdcall", "signature_source": "default",
+            "parameters": [{"name": "param_1", "ordinal": 0, "data_type": "long", "storage": "RDI:8",
+                            "confidence": "low", "evidence": [{"private": "not model data"}]}],
+            "return_type": {"data_type": "long", "storage": "RAX:8", "confidence": "low"}}
+        value["native_value_flow"] = {"available": True, "truncated": True, "known_omitted_edges": 2,
+            "operations": [
+                {"id": identifier, "address": hex(patch + offset), "opcode": "COPY", "sequence": index,
+                 "is_dead": True, "block_membership": "member",
+                 "inputs": [{"kind": "register", "location": "register:0x0", "size_bytes": 8,
+                             "private_audit": "not model data"}],
+                 "output": {"kind": "register", "location": "register:0x8", "size_bytes": 8}}
+                for index, (identifier, offset) in enumerate(zip(ids, (4, 4, 8, 12)))],
+            "def_use": [{"definition": ids[2], "use": ids[0], "input_index": 0},
+                        {"definition": ids[0], "use": ids[1], "input_index": 0},
+                        {"definition": ids[1], "use": ids[2], "input_index": 0},
+                        {"definition": ids[2], "use": ids[3], "input_index": 0}],
+            "effects": [{"kind": "memory_write", "operation": ids[0], "value_input": 0},
+                        {"kind": "memory_write", "operation": ids[2], "value_input": 0}],
+            "parameter_uses": [{"ordinal": 0, "use": ids[1], "input_index": 0},
+                               {"ordinal": 0, "use": ids[3], "input_index": 0}]}
+        # Useful selected facts must not be hidden behind unrelated dossier pages.
+        value["comments"] = [{"text": "unrelated dossier payload " * 2000} for _ in range(30)]
+        return payload
+
+    calls = static_session(monkeypatch, enrich)
+    dataset = prepare_dataset(config, work, run, None, output=tmp_path / "dataset", rea="/host/rea")
+    return dataset, patch, ids, calls
+
+
+@pytest.mark.parametrize("facet,expected", [("callees", "selected_call"), ("callers", "saved_caller"),
+    ("strings", "saved string"), ("references", "source_address")])
+def test_function_facets_do_not_page_unrelated_dossier_data(selective_static, facet, expected):
+    dataset, patch, _ids, calls = selective_static
+    collected_calls = list(calls)
+    page = analysis.analysis_view(dataset, f"procedure:{hex(patch)}", "function", facet=facet)
+    assert expected in json.dumps(page["records"])
+    assert page["facet"] == facet and page["next_offset"] is None
+    assert page["complete"] is True
+    assert "unrelated dossier payload" not in json.dumps(page)
+    assert "not model data" not in json.dumps(page)
+    assert "facet" not in json.dumps(page["records"])
+    assert len(canonical(page["records"])) <= 8192
+    assert calls == collected_calls
+
+
+def test_function_default_is_compact_facet_inventory(selective_static):
+    dataset, patch, _ids, _calls = selective_static
+    page = analysis.analysis_view(dataset, f"procedure:{hex(patch)}", "function")
+    assert page["records"] == [] and page["total"] == 0
+    assert set(page["procedure"]["available_facets"]) == set(analysis.FUNCTION_FACETS)
+    assert not {"facets", "limitations", "unavailable_views", "signature"} & page["procedure"].keys()
+    assert "native_api" not in page and "native_value_flow" not in page
+    assert len(canonical(page)) < 2048
+
+
+def test_cfg_address_selects_real_local_block_predecessors_and_successors(selective_static):
+    dataset, patch, _ids, calls = selective_static
+    collected_calls = list(calls)
+    procedure_id = f"procedure:{hex(patch)}"
+    page = analysis.analysis_view(dataset, procedure_id, "function", facet="cfg", address=str(patch + 4))
+    assert page["address"] == hex(patch + 4)
+    assert page["range_end"] == "exclusive"
+    assert page["records"] == [
+        {"relation": "block", "start": hex(patch + 4), "end": hex(patch + 8)},
+        {"relation": "predecessor", "start": hex(patch), "end": hex(patch + 4)},
+        {"relation": "successor", "address": hex(patch + 8), "start": hex(patch + 8), "end": hex(patch + 16)}]
+    boundary = analysis.analysis_view(dataset, procedure_id, "function", facet="cfg", address=hex(patch + 8))
+    assert boundary["records"][0]["start"] == hex(patch + 8)
+    assert [row["relation"] for row in boundary["records"]] == ["block", "predecessor", "predecessor"]
+    default = analysis.analysis_view(dataset, procedure_id, "function", facet="cfg", site="destination")
+    assert default["address"] == hex(patch + 1)
+    assert default["records"][0]["start"] == hex(patch)
+    assert page["evidence_id"] != boundary["evidence_id"]
+    continuation = analysis.analysis_view(dataset, procedure_id, "instructions",
+        window={"address": hex(patch + 8), "before": 0, "after": 1})
+    assert continuation["instructions"][0]["address"] == hex(patch + 8)
+    assert calls == collected_calls
+
+
+def test_address_local_relationships_use_matching_saved_reference_coordinates(selective_static):
+    dataset, patch, _ids, _calls = selective_static
+    procedure_id = f"procedure:{hex(patch)}"
+    callees = analysis.analysis_view(dataset, procedure_id, "function", facet="callees", address=hex(patch + 4))
+    assert len(callees["records"]) == 1
+    assert callees["records"][0]["target_procedure"] == {"address": "0x42", "name": "selected_call"}
+    assert callees["records"][0]["source_address"] == hex(patch + 4)
+    absent = analysis.analysis_view(dataset, procedure_id, "function", facet="callees", address=hex(patch + 8))
+    assert absent["records"] == []  # Data references are not invented call relationships.
+    callers = analysis.analysis_view(dataset, procedure_id, "function", facet="callers", address=hex(patch))
+    assert callers["records"][0]["source_address"] == "0x52"
+    strings = analysis.analysis_view(dataset, procedure_id, "function", facet="strings", address=hex(patch + 8))
+    assert [row["value"] for row in strings["records"]] == ["saved string"]
+    references = analysis.analysis_view(dataset, procedure_id, "function", facet="references", address=hex(patch + 4))
+    assert [row["direction"] for row in references["records"]] == ["outgoing"]
+    assert references["records"][0]["source_address"] == hex(patch + 4)
+    assert callees["evidence_id"] != references["evidence_id"]
+
+
+def test_native_api_remains_optional_and_default_signature_low_confidence(selective_static):
+    dataset, patch, _ids, _calls = selective_static
+    procedure_id = f"procedure:{hex(patch)}"
+    inventory = analysis.analysis_inventory(dataset)
+    assert "__stdcall" not in json.dumps(inventory)
+    page = analysis.analysis_view(dataset, procedure_id, "function", facet="native_api")
+    assert page["records"][0] == {"kind": "signature", "calling_convention": "__stdcall",
+                                  "signature_source": "default", "confidence": "low"}
+    assert [row["confidence"] for row in page["records"]] == ["low", "low", "low"]
+    assert page["note"] and "not model data" not in json.dumps(page)
+    assert "address_mapping" not in page
+
+
+def test_value_flow_is_address_local_with_incident_edges_and_saved_flags(selective_static):
+    dataset, patch, ids, calls = selective_static
+    collected_calls = list(calls)
+    page = analysis.analysis_view(dataset, f"procedure:{hex(patch)}", "function", facet="value_flow", address=hex(patch + 4))
+    operations = [row for row in page["records"] if row["kind"] == "operation"]
+    assert {row["id"] for row in operations} == set(ids[:2])
+    assert {row["address"] for row in operations} == {hex(patch + 4)}
+    assert all(row["is_dead"] is True and row["block_membership"] == "member" for row in operations)
+    edges = [row for row in page["records"] if row["kind"] == "def_use"]
+    assert [(row["definition"], row["use"]) for row in edges] == [(ids[2], ids[0]), (ids[0], ids[1]), (ids[1], ids[2])]
+    assert [row["operation"] for row in page["records"] if row["kind"] == "effects"] == [ids[0]]
+    assert [row["use"] for row in page["records"] if row["kind"] == "parameter_uses"] == [ids[1]]
+    assert page["complete"] is False and page["note"]
+    assert "private_audit" not in json.dumps(page)
+    assert "not model data" not in json.dumps(page)
+    assert len(canonical(page["records"])) <= 8192
+    assert calls == collected_calls
+
+
+def test_missing_native_facet_is_concise_not_fabricated(tmp_path, monkeypatch):
+    config, work, run = preparation_inputs(tmp_path)
+    calls = static_session(monkeypatch)
+    dataset = prepare_dataset(config, work, run, None, output=tmp_path / "dataset", rea="/host/rea")
+    collected_calls = list(calls)
+    procedure_id = f"procedure:{hex(dataset.manifest['patch']['location'])}"
+    for facet in ("native_api", "value_flow", "cfg"):
+        page = analysis.analysis_view(dataset, procedure_id, "function", facet=facet)
+        assert page["availability"] == "unavailable" and page["complete"] is False
+        assert page["total"] == 0 and page["next_offset"] is None
+        assert page["note"] and len(page["note"]) < 257
+        assert not {"facets", "limitations", "unavailable_views"} & page.keys()
+    assert calls == collected_calls
+
+
+def test_native_value_flow_pages_only_the_selected_address(tmp_path, monkeypatch):
+    config, work, run = preparation_inputs(tmp_path)
+    patch = int((work / "patch-location").read_text(), 16)
+
+    def large_flow(payload):
+        if payload["data"]["operation"] == "analyze_function":
+            payload["data"]["normalized_result"]["native_value_flow"] = {"available": True, "operations": [
+                {"id": f"{hex(patch + offset)}#{index}", "address": hex(patch + offset), "opcode": "COPY",
+                 "inputs": [{"kind": "constant", "constant_hex": "1", "size_bytes": 8} for _ in range(25)]}
+                for offset in (0, 8) for index in range(250)], "def_use": []}
+        return payload
+
+    calls = static_session(monkeypatch, large_flow)
+    dataset = prepare_dataset(config, work, run, None, output=tmp_path / "dataset", rea="/host/rea")
+    collected_calls = list(calls)
+    records, offset, evidence_ids = [], 0, set()
+    while offset is not None:
+        page = analysis.analysis_view(dataset, f"procedure:{hex(patch)}", "function", facet="value_flow",
+                                      address=hex(patch), offset=offset)
+        assert len(canonical(page["records"])) <= 8192
+        assert page["total"] == 250
+        assert page["evidence_id"] not in evidence_ids
+        evidence_ids.add(page["evidence_id"])
+        records.extend(page["records"])
+        offset = page["next_offset"]
+    assert len(records) == 250
+    assert all(row["address"] == hex(patch) and row["inputs_truncated"] is True for row in records)
+    assert len(evidence_ids) > 1
+    assert calls == collected_calls
+
+
+@pytest.mark.parametrize("address_offset", [2, 8])
+def test_cfg_never_infers_blocks_across_body_gaps(tmp_path, monkeypatch, address_offset):
+    config, work, run = preparation_inputs(tmp_path)
+    patch = int((work / "patch-location").read_text(), 16)
+
+    def gapped(payload):
+        value = payload["data"]["normalized_result"]
+        if isinstance(value, dict) and "procedure" in value:
+            value["procedure"]["body"]["ranges"] = [
+                {"start": hex(patch), "end": hex(patch + 3)},
+                {"start": hex(patch + 8), "end": hex(patch + 15)}]
+        if payload["data"]["operation"] == "read_function_instructions":
+            value["instructions"] = [f"{hex(patch + offset)}: NOP" for offset in (*range(4), *range(8, 16))]
+        if payload["data"]["operation"] == "analyze_function":
+            value["facet_availability"]["cfg"] = {"available": True}
+            value["basic_blocks"] = [
+                {"start": hex(patch), "end": hex(patch + 12), "successors": [hex(patch + 8)]},
+                {"start": hex(patch + 8), "end": hex(patch + 16), "successors": []}]
+        return payload
+
+    calls = static_session(monkeypatch, gapped)
+    dataset = prepare_dataset(config, work, run, None, output=tmp_path / "dataset", rea="/host/rea")
+    collected_calls = list(calls)
+    procedure_id = f"procedure:{hex(patch)}"
+    page = analysis.analysis_view(dataset, procedure_id, "function", facet="cfg", address=hex(patch + address_offset))
+    assert page["complete"] is False and page["note"]
+    if address_offset == 2:
+        assert page["records"] == []
+    else:
+        assert page["records"] == [{"relation": "block", "start": hex(patch + 8), "end": hex(patch + 16)}]
+    with pytest.raises(ValueError, match="inside the frozen procedure body"):
+        analysis.analysis_view(dataset, procedure_id, "function", facet="cfg", address=hex(patch + 4))
+    assert calls == collected_calls

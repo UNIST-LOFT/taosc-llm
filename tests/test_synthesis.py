@@ -73,10 +73,14 @@ def test_parser_and_real_build_failure_are_feedback_then_abstention(tmp_path, mo
         prompts.append(current.initial_prompt())
         if len(prompts) == 1:
             return terminal(current, proposal(current, predicate="rax &&"), [])
+        latest = json.loads(current._feedback)[-1]
         if len(prompts) == 2:
-            assert 'rax &&' in prompts[-1] and 'parse_rejected' in prompts[-1]
+            assert latest['error']['kind'] == 'parse_rejected'
+            assert json.loads(latest['invalid_proposal'])['predicate'] == 'rax &&'
             return terminal(current, proposal(current), ["rax < 0"])
-        assert 'build_rejected' in prompts[-1] and 'rax < 0' in prompts[-1]
+        assert latest['error']['kind'] == 'build_rejected'
+        assert latest['predicate'] == 'rax < 0'
+        assert 'final_text' not in latest and 'invalid_proposal' not in latest
         return terminal(current, proposal(current, decision="abstain", predicate=None), [])
     monkeypatch.setattr(synthesis, "_model_round", model)
     # The real builder rejects the fixture's deliberately non-ELF identity bytes
@@ -211,29 +215,27 @@ def test_feedback_follows_final_host_outcome_only(tmp_path, monkeypatch, outcome
     assert all("session_feedback" not in attempt for attempt in result["attempts"])
 
 
-def test_review_samples_noteworthy_cases_and_identifies_original_tools(tmp_path):
-    import hashlib
+def test_review_uses_only_minimal_target_feedback(tmp_path):
     context = prepare_context(make_dataset(tmp_path / "dataset", count=12), run_dir=tmp_path / "runs")
     provider = ProviderConfig(api_key="offline-only", base_url="https://example.invalid/v1", model="offline")
     cases = [{"case_id": f"function:{index}", "report": {
         "case_id": f"function:{index}", "domain": "function",
-        "candidate": {"outcome": "target_crash" if index == 11 else "unknown"},
-        "activation": {"status": "fired" if index == 11 else "unknown"}}}
+        "candidate": {"outcome": "target_crash" if index == 11 else
+                       "other_crash" if index == 10 else "unknown"},
+        "activation": {"status": "fired" if index == 11 else "unknown"},
+        "oracle_reference": {"sha256": "private-oracle-digest"}}}
         for index in range(12)]
-    evaluated = {"status": "reject_same_crash", "cases": cases, "report_summary": {"domains": {}}}
+    evaluated = {"status": "reject_same_crash", "cases": cases,
+                 "report_summary": {"private-summary": True}, "source": "private-source-path"}
     prompt = synthesis._review_prompt(context, {"status": "refinement_exhausted"},
         {"round": 2, "status": "reject_same_crash", "evaluation": evaluated}, provider)
     payload = json.loads(prompt.split("Final host result:\n", 1)[1])
-    assert payload["reports"][0]["case_id"] == "function:11"
-    assert payload["reports"][0]["why_selected"] == "target_crash:fired"
-    assert len(payload["reports"]) == 8 and payload["reports_omitted"] == 4
+    assert payload["feedback"]["missed_target_crashes"]["count"] == 1
+    assert payload["feedback"]["missed_target_crashes"]["examples"][0]["case_id"] == "function:11"
     assert payload["host_run_status"] == "refinement_exhausted"
-    assert payload["evaluation_engine_status"] == "reject_same_crash"
-    definitions = context.tool_definitions()
-    assert payload["original_synthesis_tools"] == {
-        "names": [tool["name"] for tool in definitions],
-        "schema_sha256": hashlib.sha256(synthesis.canonical(definitions)).hexdigest()}
-    assert synthesis._noteworthy_reports(context, evaluated) == payload["reports"]
+    for private in ("schema_sha256", "report_summary", "private-summary", "private-source-path",
+                    "private-oracle-digest", "function:10", '"reports"'):
+        assert private not in prompt
 
 
 def test_feedback_failure_is_separate_from_abstention(tmp_path, monkeypatch):
@@ -284,5 +286,103 @@ def test_manual_cli_rejects_session_feedback_before_preparing(tmp_path):
     with pytest.raises(SystemExit) as error:
         main(["--dataset", str(tmp_path), "--predicate", "0", "--session-feedback", "--output", str(output)])
     assert error.value.code == 2 and not output.exists()
+
+
+def test_provider_preflight_precedes_prompt_and_survives_refinement(tmp_path, monkeypatch):
+    context = prepare_context(make_dataset(tmp_path / "dataset"), run_dir=tmp_path / "runs")
+    provider = ProviderConfig(api_key="offline-only", base_url="https://example.invalid/v1", model="offline")
+    monkeypatch.setattr(synthesis, "adapter_command", lambda _: ["not-executed"])
+    original_preflight = synthesis.poc_observation
+    preflights = []
+    rounds = []
+    alias = None
+
+    def preflight(dataset, *, cache_dir, execute):
+        assert execute is True and not rounds
+        preflights.append((dataset, cache_dir))
+        # The fixture has no frozen POC: exercise the real unavailable observation,
+        # not invented registers or a fake original/neutral outcome.
+        return original_preflight(dataset, cache_dir=cache_dir, execute=False)
+
+    async def model(current, *args):
+        nonlocal alias
+        assert len(preflights) == 1 and current._poc is not None
+        rounds.append(current)
+        if len(rounds) == 1:
+            alias = current.reference("private-test-evidence")
+            return terminal(current, proposal(current, predicate="rax &&"), [])
+        assert current.reference("private-test-evidence") == alias
+        assert current._poc == rounds[0]._poc
+        return terminal(current, proposal(current, decision="abstain", predicate=None), [])
+
+    monkeypatch.setattr(synthesis, "poc_observation", preflight)
+    monkeypatch.setattr(synthesis, "_model_round", model)
+    result = asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=2))
+    assert result["status"] == "abstained" and len(rounds) == 2
+    assert preflights[0][1] == context.run_dir / "cache"
+    run = context.run_dir / result["run_id"]
+    assert json.loads((run / "poc.json").read_text()) == rounds[0]._poc
+    assert json.loads((run / "context.json").read_text())["context_id"] == result["context_id"]
+    assert result["context_provenance"] == context.audit
+
+
+def test_manual_mode_does_not_run_provider_preflight(tmp_path, monkeypatch):
+    dataset = make_dataset(tmp_path / "dataset")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("manual generation must not run provider POC preflight")
+
+    async def stop(*args):
+        raise RuntimeError("stop before native build")
+
+    monkeypatch.setattr(synthesis, "poc_observation", forbidden)
+    monkeypatch.setattr(synthesis, "_build", stop)
+    with pytest.raises(RuntimeError, match="stop before native build"):
+        synthesis.generate_manual(dataset, "0", output=tmp_path / "runs")
+
+
+def test_refinement_uses_same_minimal_feedback_as_review(tmp_path, monkeypatch):
+    context = prepare_context(make_dataset(tmp_path / "dataset"), run_dir=tmp_path / "runs")
+    provider = ProviderConfig(api_key="offline-only", base_url="https://example.invalid/v1", model="offline")
+    monkeypatch.setattr(synthesis, "adapter_command", lambda _: ["not-executed"])
+    evaluated = {"status": "reject_same_crash", "evaluation_mode": "host",
+                 "report_summary": {"audit_digest": "private-summary-digest"},
+                 "cases": [{"case_id": "function:0", "report": {
+                     "case_id": "function:0", "domain": "function",
+                     "candidate": {"outcome": "target_crash"},
+                     "activation": {"status": "not_fired"}}},
+                    {"case_id": "function:1", "report": {
+                     "case_id": "function:1", "domain": "function",
+                     "candidate": {"outcome": "other_crash"}}}]}
+    calls = []
+
+    async def model(current, *args):
+        calls.append(current)
+        if len(calls) == 1:
+            return terminal(current, proposal(current), ["rax < 0"])
+        feedback = json.loads(current._feedback)[0]
+        assert feedback["feedback"]["missed_target_crashes"]["count"] == 1
+        retrieved = current.call_tool("get_candidate_result", {
+            "context_id": current.context_id, "result_id": feedback["result_id"]})
+        assert retrieved["ok"] and retrieved["missed_target_crashes"]["count"] == 1
+        assert feedback["result_id"].startswith("r") and len(feedback["result_id"]) < 10
+        public = json.dumps(feedback)
+        for forbidden in ("report_summary", "private-summary-digest", "function:1", "case_results"):
+            assert forbidden not in public
+        return terminal(current, proposal(current, decision="abstain", predicate=None), [])
+
+    async def build(*args):
+        return {"status": "built", "verified": False}
+
+    from taosc_llm import evaluation
+    monkeypatch.setattr(synthesis, "_model_round", model)
+    monkeypatch.setattr(synthesis, "_build", build)
+    monkeypatch.setattr(evaluation, "evaluate_dataset", lambda *args, **kwargs: evaluated)
+    result = asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=2))
+    assert result["status"] == "abstained" and len(calls) == 2
+    # Full evaluator evidence remains in the private run, not the next model prompt.
+    assert result["rounds"][0]["evaluation"] == evaluated
+
+
 
 

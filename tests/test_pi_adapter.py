@@ -124,7 +124,10 @@ globalThis.fetch = async (input, init) => {
       setImmediate(() => process.kill(process.pid, 'SIGTERM'));
     }}),{headers:{'content-type':'text/event-stream'}});
   }
-  const context = JSON.stringify(body.messages).match(/context_id=([a-f0-9]{64})/)[1];
+  const context = body.messages.flatMap(message => typeof message.content === 'string'
+    ? [message.content] : (message.content ?? []).map(part => part.text ?? ''))
+    .map(text => text.match(/"context_id"\s*:\s*"(ctx-[A-Za-z0-9_-]+)"/)?.[1]).find(Boolean);
+  if (!context) throw Error('scoped JSON context missing');
   const chunk = (delta, finish=null) => 'data: ' + JSON.stringify({id:'offline',object:'chat.completion.chunk',created:1,
     model:body.model,choices:[{index:0,delta,finish_reason:finish}],
     ...(finish ? {usage:{prompt_tokens:11,completion_tokens:7,total_tokens:18}} : {})}) + '\n\n';
@@ -140,7 +143,7 @@ globalThis.fetch = async (input, init) => {
   } else if (count === 3 && mode === 'results') {
     const tool = body.messages.filter(m => m.role === 'tool').at(-1);
     const result = JSON.parse(typeof tool.content === 'string' ? tool.content : tool.content[0].text);
-    if (!result.ok || !result.result_id) throw Error('missing host result');
+    if (!result.ok || !/^r[1-9][0-9]*$/.test(result.result_id)) throw Error('missing short host result');
     const args = {context_id:context,result_id:result.result_id};
     data = chunk({role:'assistant',tool_calls:[{index:0,id:'result-call',type:'function',function:{name:'get_candidate_result',arguments:JSON.stringify(args)}}]});
     data += chunk({},'tool_calls') + 'data: [DONE]\n\n';
@@ -241,6 +244,25 @@ console.log(JSON.stringify({header:session.getHeader(),entries:session.getEntrie
     return json.loads(completed.stdout)
 
 
+@pytest.mark.parametrize("ok,predicate", [(True, "rax < 0"), (True, None), (False, "rax <= 0")])
+def test_host_checks_only_successful_exact_predicate_response(adapter_context, tmp_path, monkeypatch,
+                                                             ok, predicate):
+    context, _ = adapter_context
+    original = type(context).call_tool
+
+    def call_tool(current, name, arguments):
+        response = original(current, name, arguments)
+        if name == "evaluate_predicate":
+            response = {**response, "ok": ok, "predicate": predicate,
+                        "valid_syntax": True}  # Obsolete marker must confer no authority.
+        return response
+
+    monkeypatch.setattr(type(context), "call_tool", call_tool)
+    result, _ = operation(adapter_context, tmp_path, "tools")
+    assert result["type"] == "turn_complete"
+    assert result["host_checked_predicates"] == []
+
+
 @pytest.mark.parametrize("stream_end", ["eof", "pending"])
 def test_pi_custom_tools_and_settled_final_proposal(adapter_context, tmp_path, stream_end):
     result, context = operation(adapter_context, tmp_path, "tools", stream_end=stream_end)
@@ -306,7 +328,9 @@ def test_pi_continues_after_actual_offline_result_reference(adapter_context, tmp
     host_results = [record["frame"]["result"] for record in native_records(tmp_path / "turn.jsonl")
                     if record["direction"] == "host" and record["frame"]["type"] == "tool_result"]
     assert [json.loads(reply["content"][0]["text"]) for reply in replies] == host_results
-    assert all(result_id in json.dumps(replies) for result_id in context._results)
+    assert {reply["result_id"] for reply in host_results if "result_id" in reply} == set(context._results)
+    private_ids = [key.removeprefix("r:") for key in context._references if key.startswith("r:")]
+    assert all(result_id not in json.dumps(replies) for result_id in private_ids)
     assert messages[-1]["content"] == [{"type": "text", "text": result["final_text"]}]
     for message in messages:
         if message["role"] == "assistant":
