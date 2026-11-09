@@ -103,7 +103,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--graceful-timeout", type=_positive_seconds, default=10.0)
     parser.add_argument("--search-timeout", type=_positive_seconds)
     limits = SearchLimits()
-    search_names = ("max_evaluations", "max_executions", "max_atoms", "beam_width", "max_clauses", "max_factors", "operand_depth")
+    search_names = ("max_evaluations", "max_atoms", "beam_width", "max_clauses", "max_factors", "operand_depth")
     for name in search_names:
         parser.add_argument("--" + name.replace("_", "-"), type=_positive_int)
     args = parser.parse_args(argv)

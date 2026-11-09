@@ -22,11 +22,11 @@ def test_resume_charges_unclosed_interval_but_not_clean_downtime(tmp_path, monke
     clock = {"wall": 100.0, "monotonic": 50.0}
     monkeypatch.setattr(module.time, "time", lambda: clock["wall"])
     monkeypatch.setattr(module.time, "monotonic", lambda: clock["monotonic"])
-    limits = SearchLimits(timeout=20, max_evaluations=2, max_executions=10)
+    limits = SearchLimits(timeout=20, max_evaluations=2)
     output = tmp_path / "search"
     with Journal(output, {"case": "budget"}) as journal:
         backend = Backend(SimpleNamespace(), journal, limits)
-        backend.reserve(7)
+        backend.admit_evaluation()
         clock.update(wall=105.0, monotonic=55.0)
         backend.checkpoint_budget()
         if closed:
@@ -36,10 +36,12 @@ def test_resume_charges_unclosed_interval_but_not_clean_downtime(tmp_path, monke
         resumed = Backend(SimpleNamespace(), journal, limits)
         assert resumed.elapsed == expected
         assert resumed.evaluations == 1
-        assert resumed.executions_reserved == 7
-        with pytest.raises(SearchStopped, match="execution-budget" if closed else "wall-time"):
-            resumed.reserve(4)
-        assert resumed.executions_reserved == 7
+        if closed:
+            resumed.admit_evaluation()
+            clock["monotonic"] += 15.0
+        with pytest.raises(SearchStopped, match="wall-time"):
+            resumed.admit_evaluation()
+        assert resumed.evaluations == (2 if closed else 1)
 
 
 @pytest.fixture
@@ -175,7 +177,7 @@ def test_last_reserved_evaluation_can_finish_preservation(prepared, tmp_path, mo
         assert saved["cases"][0]["capture"]["complete"] is True
         assert backend.evaluations == 1
         with pytest.raises(SearchStopped, match="evaluation-budget"):
-            backend.reserve(0)
+            backend.admit_evaluation()
 
 
 def test_closed_session_restores_evidence_after_finalization_exceeds_search_timeout(prepared, tmp_path, monkeypatch):
@@ -187,7 +189,7 @@ def test_closed_session_restores_evidence_after_finalization_exceeds_search_time
     identity = {"case": "finished-over-budget"}
     with Journal(output, identity) as journal:
         backend = Backend(prepared, journal, limits)
-        backend.reserve(1)
+        backend.admit_evaluation()
         with prepared.validation() as view:
             preserved = backend._preserve(result, view)
         reference = journal.store(preserved)
@@ -205,7 +207,7 @@ def test_closed_session_restores_evidence_after_finalization_exceeds_search_time
             assert resumed.snapshots(preserved)["function:2"][0].branch == 0
             assert resumed.elapsed == 11.0
             with pytest.raises(SearchStopped, match="wall-time"):
-                resumed.reserve(0)
+                resumed.admit_evaluation()
         assert resumed.evaluations == 1
         with pytest.raises(SearchStopped, match="wall-time"):
             resumed.snapshots(preserved)

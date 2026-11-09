@@ -40,7 +40,6 @@ class Backend:
         self.started = time.monotonic()
         self.spent = 0.0
         self.evaluations = 0
-        self.executions_reserved = 0
         self.result_refs = {}
         self.baseline_ref = None
         self.population = None
@@ -52,7 +51,6 @@ class Backend:
             if event["kind"] == "budget":
                 self.spent = max(self.spent, data["elapsed"])
                 self.evaluations = max(self.evaluations, data["evaluations"])
-                self.executions_reserved = max(self.executions_reserved, data["executions_reserved"])
                 unsettled_since = data["wall_time"]
             elif event["kind"] == "session_closed":
                 unsettled_since = None
@@ -96,7 +94,6 @@ class Backend:
 
     def checkpoint_budget(self):
         self.journal.append("budget", {"elapsed": self.elapsed, "evaluations": self.evaluations,
-                                       "executions_reserved": self.executions_reserved,
                                        "wall_time": time.time()})
 
     def check_cancelled(self):
@@ -118,7 +115,7 @@ class Backend:
             self._restoring = previous
 
     def check_operation(self):
-        """Bound admitted work without rejecting the final reserved evaluation."""
+        """Bound admitted work without rejecting the final allowed evaluation."""
         self.check_cancelled()
         if not self._restoring and self.elapsed >= self.limits.timeout:
             raise SearchStopped("wall-time-reached")
@@ -131,13 +128,9 @@ class Backend:
         if self.evaluations >= self.limits.max_evaluations:
             raise SearchStopped("evaluation-budget-reached")
 
-    def reserve(self, maximum_executions: int):
+    def admit_evaluation(self):
         self.check()
-        if self.executions_reserved + maximum_executions > self.limits.max_executions:
-            raise SearchStopped("execution-budget-reached")
         self.evaluations += 1
-        self.executions_reserved += maximum_executions
-        # Charge the whole bounded operation before admitting any target work.
         self.checkpoint_budget()
 
     def _preserve(self, result, dataset):
@@ -228,7 +221,7 @@ class Backend:
                 cases.setdefault(poc["id"], poc)
             missing = [case for case in cases.values()
                        if case["domain"] == "system" and not case.get("observation")]
-            self.reserve(sum(case["domain"] == "system" for case in cases.values()) + len(missing))
+            self.admit_evaluation()
             originals = {}
             for case in missing:
                 self.check_operation()
@@ -267,13 +260,9 @@ class Backend:
         self.check()
         ids = sorted(self.population.active) if self.population is not None else None
         with self.dataset.validation(check=self.check_operation) as dataset:
-            count = len(ids) if ids is not None else len(dataset.cases()) + 1
-            # A bridge evaluates its whole retained function inventory before the
-            # existing API filters rows. Reserve that population as well.
             if self.socket is not None:
                 self._connect_policy()
-                count = max(count, len(dataset.cases()))
-            self.reserve(2 * count)
+            self.admit_evaluation()
             from ..poc import poc_case
             poc = poc_case(dataset)
             include_poc = poc is not None and (ids is None or poc["id"] in ids)

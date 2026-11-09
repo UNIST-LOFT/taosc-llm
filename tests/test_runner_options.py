@@ -98,7 +98,7 @@ def test_normalization_preserves_lexical_symlink_parents(tmp_path, monkeypatch):
     ["--resume", "--output", "result", "--mode", "manual", "--predicate", "1"],
     ["--resume", "--output", "result", "--mode", "provider", "--provider-env", "provider.env"],
     ["--timeout", "1"], ["--no-llm"], ["--skip-concrete"], ["--only-concrete"], ["--outdir", "out"],
-    ["--sub", "subject"],
+    ["--sub", "subject"], ["--max-executions", "10000"],
     ["--binradar-representative-budget", "-1"],
     ["--binradar-representative-budget", "2147483648"],
     ["--binradar-representative-budget", "1", "--dataset", "data"],
@@ -118,7 +118,7 @@ def test_invalid_combinations_do_not_create_output(tmp_path, monkeypatch, argv):
 
 
 @pytest.mark.parametrize("option,default", [
-    ("search-timeout", "3600"), ("max-evaluations", "256"), ("max-executions", "10000"),
+    ("search-timeout", "3600"), ("max-evaluations", "256"),
     ("max-atoms", "512"), ("beam-width", "12"), ("max-clauses", "12"),
     ("max-factors", "6"), ("operand-depth", "2"),
 ])
@@ -137,7 +137,7 @@ def test_explicit_search_defaults_are_rejected_in_other_modes(option, default, m
     ("analysis-timeout", "2147484"), ("analysis-query-timeout", "2147484"),
     ("generation-timeout", "0.5"), ("generation-timeout", "-1"), ("ready-timeout", "nan"), ("stage-timeout", "inf"),
     ("graceful-timeout", "0"), ("graceful-timeout", "-inf"), ("search-timeout", "0"),
-    ("max-evaluations", "0"), ("max-executions", "-1"), ("max-atoms", "65537"),
+    ("max-evaluations", "0"), ("max-atoms", "65537"),
     ("beam-width", "257"), ("max-clauses", "129"), ("max-factors", "129"), ("operand-depth", "5"),
 ])
 def test_invalid_option_bounds(option, value):

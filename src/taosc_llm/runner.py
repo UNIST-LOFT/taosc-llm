@@ -15,7 +15,7 @@ from tempfile import TemporaryDirectory
 from .runner_options import allocate_run, parse_args
 from .runner_process import RunnerInterrupted, RunnerTimeout, Supervisor
 
-_SEARCH_OPTIONS = ("search_timeout", "max_evaluations", "max_executions", "max_atoms",
+_SEARCH_OPTIONS = ("search_timeout", "max_evaluations", "max_atoms",
                    "beam_width", "max_clauses", "max_factors", "operand_depth")
 
 

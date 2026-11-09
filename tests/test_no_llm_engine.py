@@ -22,7 +22,6 @@ class FiniteExecution:
         self.dataset = SimpleNamespace(patch_format="ERM generic", dataset_id="finite-intervals")
         self.baseline_ref = journal.store(self._result("0"))
         self.evaluations = 0
-        self.executions_reserved = 0
         self.elapsed = 0
         self.interrupt_at = interrupt_at
 

@@ -37,7 +37,7 @@ def main(argv=None) -> int:
     parser.add_argument("--replay-socket", type=Path, help="explicit endpoint of the dataset's existing mutation server")
     defaults = SearchLimits()
     parser.add_argument("--timeout", type=float, default=defaults.timeout, help="persistent search-time budget in seconds")
-    for name in ("max_evaluations", "max_executions", "max_atoms", "beam_width", "max_clauses", "max_factors", "operand_depth"):
+    for name in ("max_evaluations", "max_atoms", "beam_width", "max_clauses", "max_factors", "operand_depth"):
         parser.add_argument("--" + name.replace("_", "-"), type=int, default=getattr(defaults, name))
     args = parser.parse_args(argv)
     try:

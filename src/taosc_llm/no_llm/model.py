@@ -9,7 +9,6 @@ import math
 class SearchLimits:
     timeout: float = 3600.0
     max_evaluations: int = 256
-    max_executions: int = 10000
     max_atoms: int = 512
     beam_width: int = 12
     max_clauses: int = 12
@@ -19,7 +18,7 @@ class SearchLimits:
     def __post_init__(self):
         if isinstance(self.timeout, bool) or not isinstance(self.timeout, (int, float)) or not math.isfinite(self.timeout) or self.timeout <= 0:
             raise ValueError("timeout must be positive finite seconds")
-        for name in ("max_evaluations", "max_executions", "max_atoms", "beam_width", "max_clauses", "max_factors", "operand_depth"):
+        for name in ("max_evaluations", "max_atoms", "beam_width", "max_clauses", "max_factors", "operand_depth"):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")

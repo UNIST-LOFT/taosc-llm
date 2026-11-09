@@ -225,7 +225,6 @@ hiding normal cases behind unavailable evidence is not an improvement.
 |---|---:|---|
 | `--timeout` | 3600 seconds | Positive finite admission budget |
 | `--max-evaluations` | 256 | Positive; includes baseline admission |
-| `--max-executions` | 10000 | Positive conservative target-execution reservations |
 | `--max-atoms` | 512 | 1–65536 |
 | `--beam-width` | 12 | 1–256 |
 | `--max-clauses` | 12 | 1–128 |
@@ -233,11 +232,13 @@ hiding normal cases behind unavailable evidence is not an improvement.
 | `--operand-depth` | 2 | 1–4; generic leaves have depth 1 |
 
 Canonical source/descriptor/depth and stack bounds override search bounds.
-Reservations are charged before an operation and persist even if cached or
-interrupted; they are not measured subprocess counts. In-flight evaluation drains
-under existing per-execution limits. Finalization is separate from the search
-call cap, reserves up to three executions per concrete case, and does not reset
-budgets. Search stop reasons distinguish goals, budgets, bounded exhaustion,
+There is no target-execution count limit or corpus-size reservation. Target work
+is bounded by the persistent search timeout and existing native per-child caps.
+The evaluation-count cap still charges baseline/candidate operations before
+admission and persists across interruption. In-flight evaluation drains under
+existing per-execution limits. Finalization is separate from search admission,
+remains cancellable under native limits, and may finish after the search deadline;
+it does not reset spent search time. Search stop reasons distinguish goals, budgets, bounded exhaustion,
 interruption and evidence gaps; no global optimum or out-of-corpus repair is
 claimed. `coverage=complete` means complete observations, not all targets repaired.
 
@@ -255,6 +256,10 @@ implementation, limits, workers or replay policy refuses resume. SIGINT/TERM
 stop admission and drain registered children. SIGKILL cannot report its stop time:
 the interval since the last durable budget timestamp, including downtime, is
 conservatively charged; cleanly closed sessions do not charge downtime.
+The removed `--max-executions` option is rejected by both entrypoints, not silently
+ignored. Older count-reservation sessions are not migrated: implementation and
+limit identity changes require a fresh output, though immutable datasets and
+completed producers can still be reused.
 
 A missing old replay server allows offline/concrete continuation; an endpoint
 replacement cannot rebind old mutation IDs. BRCH is not a process checkpoint.
@@ -598,6 +603,16 @@ can therefore update the workdir's cached artifacts, not the original-only
 producer or its generation metadata. A workdir inode lock remains held through
 cleanup; cooperating runners cannot mutate that workdir concurrently. External
 tools must also respect its ownership.
+
+After a native resident/audit fix, rebuild the tracer and start a fresh numbered
+run. A completed `--concrete-run OLD/concrete` can be reused, but omit
+`--binradar-run`, `--dataset`, `--replay-socket` and `--resume` to regenerate
+mutations and create a new resident/dataset. Old capture files cannot recreate
+the parent or change previously recorded replay eligibility. An already-running
+resident keeps the old executable; a rebuild does not update it. Wait for its
+owner to finish or stop it through that owner's normal cleanup before reusing
+the workdir. Neither runner resume nor GNU Parallel `--resume-failed` refreshes
+frozen evidence when the command still selects old mutation/dataset inputs.
 
 `--stop-after generation|dataset|warm|synthesis` defaults to synthesis.
 `--concrete-only --stop-after generation` collects concrete inputs without REA

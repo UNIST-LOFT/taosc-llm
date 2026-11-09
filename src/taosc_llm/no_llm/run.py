@@ -88,12 +88,6 @@ def synthesize(dataset, *, output: Path, limits: SearchLimits | None = None,
                 publication = _existing_publication(journal, result["predicate"])
                 if publication is None:
                     from ..publication import build_candidate, verify_built_candidate
-                    count = 3 * sum(item["domain"] == "system" for item in engine.current["cases"])
-                    # Finalization is separate from the candidate search-call cap,
-                    # but must fit the persistent target-execution reservation.
-                    if backend.executions_reserved + count > limits.max_executions:
-                        raise SearchStopped("publication-execution-budget-reached")
-                    backend.executions_reserved += count
                     backend.checkpoint_budget()
                     parent = journal.directory / "candidates" / f"candidate-{len(journal.events):08d}"
                     descriptor = _directory(parent, create=True)
@@ -128,8 +122,7 @@ def synthesize(dataset, *, output: Path, limits: SearchLimits | None = None,
                 raise error from journal_error
             raise
         backend.checkpoint_budget()
-        result["budgets"] = {"elapsed": backend.elapsed, "evaluations": backend.evaluations,
-                             "executions_reserved": backend.executions_reserved}
+        result["budgets"] = {"elapsed": backend.elapsed, "evaluations": backend.evaluations}
         result["limits"] = limits.to_dict()
         result["coverage"] = result.get("score", {}).get("coverage", "partial")
         reference = journal.store(result)

@@ -385,6 +385,5 @@ class SearchEngine:
                 "predicate": compose(self.family, clauses) if clauses else None,
                 "clauses": copy.deepcopy(self.state["clauses"]), "population": self.population.to_dict(),
                 "evaluation": self.state["evaluation"], "score": self.score.summary(self.population),
-                "budgets": {"elapsed": self.backend.elapsed, "evaluations": self.backend.evaluations,
-                            "executions_reserved": self.backend.executions_reserved},
+                "budgets": {"elapsed": self.backend.elapsed, "evaluations": self.backend.evaluations},
                 "limits": self.limits.to_dict()}

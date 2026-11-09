@@ -406,6 +406,7 @@ def _case_result(dataset, row: dict, candidate) -> dict:
     return {
         "case_id": f"function:{mutation}",
         "domain": "function",
+        "descriptor": candidate.descriptor,
         "source": row["source"],
         "status": status,
         "reason": reason,

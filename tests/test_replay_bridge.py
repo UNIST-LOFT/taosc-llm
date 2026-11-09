@@ -10,6 +10,9 @@ import pytest
 
 from taosc_llm import evaluation, replay
 from taosc_llm.family import parse_candidate
+from taosc_llm.no_llm.backend import Backend
+from taosc_llm.no_llm.journal import Journal
+from taosc_llm.no_llm.model import SearchLimits
 
 from test_context_tools import make_dataset
 
@@ -756,6 +759,12 @@ def test_complete_replay_capture_is_available_to_standard_state_reader(
     states = evaluation._snapshots(dataset, result["capture"])
     assert len(states) == 2 and all(state.patch_id == 1 for state in states)
     assert result["reuse"] == reuse
+    with Journal(tmp_path / "search", {"dataset": dataset.dataset_id}) as journal:
+        backend = Backend(dataset, journal, SearchLimits())
+        with dataset.validation() as view:
+            saved = backend._preserve({"cases": [result]}, view)
+        restored = backend.load(journal.store(saved))
+        assert [state.branch for state in backend.snapshots(restored)["function:2"]] == [1, 1]
 
 
 @pytest.mark.parametrize("patch_format", ["ERM generic", "ERM CWE-805"])
@@ -770,6 +779,14 @@ def test_vector_reuse_keeps_neutral_descriptor_and_original_selector(tmp_path, r
     assert result["capture"]["patch_id"] == 0
     assert result["branches"] == [0, 0]
     assert all(state.patch_id == 0 for state in evaluation._snapshots(dataset, result["capture"]))
+    with Journal(tmp_path / "search", {"dataset": dataset.dataset_id}) as journal:
+        backend = Backend(dataset, journal, SearchLimits())
+        with dataset.validation() as view:
+            saved = backend._preserve({"cases": [result]}, view)
+        restored = backend.load(journal.store(saved))
+        record = restored["cases"][0]
+        assert record["descriptor"] == candidate.descriptor != record["capture"]["descriptor"]
+        assert [state.patch_id for state in backend.snapshots(restored)["function:2"]] == [0, 0]
 
 
 @pytest.mark.parametrize("failure", ["mutation", "selector", "hash", "path", "symlink", "descriptor", "trap", "candidate"])
