@@ -250,8 +250,8 @@ def test_host_checks_only_successful_exact_predicate_response(adapter_context, t
     context, _ = adapter_context
     original = type(context).call_tool
 
-    def call_tool(current, name, arguments):
-        response = original(current, name, arguments)
+    def call_tool(current, name, arguments, *, operation_check=None):
+        response = original(current, name, arguments, operation_check=operation_check)
         if name == "evaluate_predicate":
             response = {**response, "ok": ok, "predicate": predicate,
                         "valid_syntax": True}  # Obsolete marker must confer no authority.
@@ -762,3 +762,76 @@ def test_callback_failure_cancels_and_disposes_live_session(adapter_context, tmp
     assert any(frame["type"] == "cancel" for frame in frames)
     assert frames[-1]["type"] == "turn_failed" and frames[-1]["error_code"] == "cancelled"
     assert frames[-1]["remote_settled"] is True
+
+
+def test_provider_deadline_does_not_admit_or_mark_expired_evaluation(adapter_context, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from taosc_llm import bridge
+
+    clock = {"now": 0.0}
+    monkeypatch.setattr(bridge, "time", SimpleNamespace(monotonic=lambda: clock["now"]))
+    context, _ = adapter_context
+    original = type(context).call_tool
+
+    def expire(current, name, arguments, *, operation_check=None):
+        if name == "evaluate_predicate":
+            clock["now"] = 31.0
+        return original(current, name, arguments, operation_check=operation_check)
+
+    monkeypatch.setattr(type(context), "call_tool", expire)
+    result, _ = operation(adapter_context, tmp_path, "tools", timeout_seconds=30)
+    assert result["host_checked_predicates"] == []
+    assert context._results == {}
+
+
+def test_host_cancellation_stops_tool_work_before_adapter_disposal(adapter_context, tmp_path, monkeypatch):
+    from threading import Event
+
+    context, root = adapter_context
+    entered, stopped, release = Event(), Event(), Event()
+    original = type(context).call_tool
+
+    def host_work(current, name, arguments, *, operation_check=None):
+        if name != "evaluate_predicate":
+            return original(current, name, arguments, operation_check=operation_check)
+        entered.set()
+        try:
+            while not release.wait(0.01):
+                operation_check()
+        except TimeoutError:
+            stopped.set()
+            return {"context_id": current.context_id, "ok": False,
+                    "error": {"code": "backend_error", "message": "stopped"}}
+        raise AssertionError("host work was released without observing cancellation")
+
+    monkeypatch.setattr(type(context), "call_tool", host_work)
+    journal = tmp_path / "turn.jsonl"
+    preload = tmp_path / "provider.mjs"
+    preload.write_text(PRELOAD.replace("__MODE__", json.dumps("tools"))
+                       .replace("__STREAM_END__", json.dumps("eof"))
+                       .replace("__REASONING_EFFORT__", "null")
+                       .replace("__SESSION_PATH__", json.dumps(str(journal.with_suffix(".pi.jsonl")))))
+    command = adapter_command(root)
+    command[1:1] = ["--import", str(preload)]
+    provider = ProviderConfig(api_key="offline-secret", base_url="https://example.invalid/v1",
+                              model="offline-exact-model", timeout_seconds=30)
+
+    async def cancel_active_tool():
+        task = asyncio.create_task(run_adapter(context, provider, command, "offline", journal))
+        try:
+            assert await asyncio.to_thread(entered.wait, 20), "host tool never started"
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 10)
+            assert stopped.is_set()
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(cancel_active_tool())
+    assert context._results == {}
+    frames = [entry["frame"] for entry in native_records(journal)]
+    assert any(frame["type"] == "cancel" for frame in frames)
+    assert frames[-1]["type"] == "turn_failed" and frames[-1]["error_code"] == "cancelled"

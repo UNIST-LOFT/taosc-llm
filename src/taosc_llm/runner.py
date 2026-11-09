@@ -10,6 +10,7 @@ import sys
 import time
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from .runner_options import allocate_run, parse_args
 from .runner_process import RunnerInterrupted, RunnerTimeout, Supervisor
@@ -71,15 +72,79 @@ def _options(args) -> dict:
             for key, value in vars(args).items() if not key.startswith("_")}
 
 
+def _provider_preflight(args) -> None:
+    from .bridge import adapter_command
+    from .native import native_environment
+    from .provider import load_provider
+
+    # Parse only the explicit file, then discard the credentials. The probe has
+    # no credential pipe, model request, inherited auth or user SDK discovery.
+    load_provider(args.provider_env)
+    command = [*adapter_command(args.pi_sdk_root), "--check"]
+    with TemporaryDirectory(prefix="taosc-llm-preflight-") as temporary:
+        root = Path(temporary)
+        environment = native_environment()
+        environment.update(HOME=temporary, TMPDIR=temporary, LC_ALL="C")
+        with Supervisor(args.graceful_timeout) as supervisor:
+            job = supervisor.start(command, cwd=root, env=environment,
+                                   stdout=root / "stdout", stderr=root / "stderr", name="provider-preflight")
+            if supervisor.wait(job, timeout=30) != 0:
+                raise ValueError("Pi runtime preflight failed; check Node >=22.19 and the pinned SDK installation")
+
+
+def _subject_preflight(args, patch_format) -> None:
+    from binradar import binradar_setup as setup
+    from binradar.binradar_config import resolve_concrete_input_schedule, validate_original_baseline
+    from .preparation import _address
+
+    def metadata(name):
+        path = args.workdir / name
+        return path if os.path.lexists(path) else args.subject / name
+
+    _address(metadata("patch-location"))
+    if not (args.concrete_only and args.stop_after == "generation"):
+        destination = next((directory / name for directory in (args.workdir, args.subject)
+                            for name in ("patch-destination", "destinations")
+                            if os.path.lexists(directory / name)), metadata("patch-destination"))
+        _address(destination)
+        if patch_format == "ERM CWE-805":
+            stack = int(metadata("stack-size").read_text().strip(), 0)
+            if not 0 <= stack <= 1048576:
+                raise ValueError("stack-size must be in 0..1048576")
+            if setup.parse_allocator_trace(metadata("trace")) is None:
+                raise ValueError("ERM CWE-805 requires a complete allocator trace")
+    environment = setup.load_env(args.subject / "config.env")
+    setup._validate_setup_timeouts(environment)
+    for key in ("BINARY", "TEST_CMD", "POC_INPUT", "POC_DIR"):
+        if key not in environment or (key != "TEST_CMD" and not environment[key].strip()):
+            raise ValueError(f"{key} not found or empty in config.env")
+    binary = environment["BINARY"]
+    if Path(binary).name != binary or binary in (".", ".."):
+        raise ValueError("BINARY must be an executable basename")
+    if setup.resolve_poc(args.subject, args.workdir, environment["POC_INPUT"]) is None:
+        raise ValueError("config.env POC_INPUT does not resolve to an existing file")
+    if not any((directory / environment["POC_DIR"]).is_dir() for directory in (args.workdir, args.subject)):
+        raise ValueError("config.env POC_DIR does not resolve to an existing directory")
+    if args.concrete_run is None:
+        validate_original_baseline(resolve_concrete_input_schedule(None, environment),
+                                   environment.get("BINRADAR_FEEDBACK_MODE", "0") == "1")
+    if args.stop_after == "synthesis" and args.mode == "manual":
+        from .family import parse_candidate
+        parse_candidate(patch_format, args.predicate)
+
+
 def _preflight(args) -> str | None:
     """Validate before reserving output or touching caller-owned producer data."""
     if args.resume:
         return None
     if args.dataset is not None:
-        manifest = args.dataset / "manifest.json" if args.dataset.is_dir() else args.dataset
-        if not manifest.is_file():
-            raise ValueError(f"prepared dataset manifest not found: {manifest}")
+        from .dataset import load_dataset
+        dataset = load_dataset(args.dataset)
+        if args.mode == "manual" and args.stop_after == "synthesis":
+            from .family import parse_candidate
+            parse_candidate(dataset.patch_format, args.predicate)
     else:
+        patch_format = None
         if not args.subject.is_dir() or not args.workdir.is_dir():
             raise ValueError("--subject and --workdir must identify an existing prepared subject")
         if not (args.concrete_only and args.stop_after == "generation"):
@@ -105,9 +170,26 @@ def _preflight(args) -> str | None:
             expected = args.binradar_run / "replay.sock"
             if args.replay_socket.resolve() != expected.resolve():
                 raise ValueError("--replay-socket must belong to --binradar-run")
+        _subject_preflight(args, patch_format)
+    if args.replay_socket is not None:
+        from . import replay
+        if args.dataset is not None:
+            replay.validate_dataset(dataset, args.replay_socket)
+        else:
+            state = replay.status(args.replay_socket)
+            if state["state"] not in ("ready", "evaluating"):
+                raise ValueError("external replay endpoint must be ready before reuse")
     if args.mode == "provider" and args.stop_after == "synthesis":
-        if not args.provider_env.is_file():
-            raise ValueError(f"provider environment file not found: {args.provider_env}")
+        _provider_preflight(args)
+    if args.dataset is None and args.stop_after != "generation":
+        rea = args.rea or os.environ.get("TAOSC_LLM_REA")
+        if rea:
+            executable = shutil.which(rea)
+            if executable is None:
+                raise ValueError(f"REA executable not found: {rea}")
+            args.rea = os.path.abspath(executable)
+        elif not (Path(__file__).absolute().parents[2] / "static-runtime.scm").is_file() or not shutil.which("guix"):
+            raise ValueError("pass --rea or set TAOSC_LLM_REA; no installed pinned REA runtime available")
     return None
 
 
@@ -157,6 +239,7 @@ class Experiment:
     def __init__(self, args, root: Path, record: dict, supervisor: Supervisor):
         self.args, self.root, self.record, self.supervisor = args, root, record, supervisor
         self.concrete_job = self.resident_job = None
+        self.concrete_started = None
         self.shutting_down = False
         attempts = record.setdefault("attempts", [])
         self.log = root / "logs" / f"attempt-{len(attempts):05d}"
@@ -202,6 +285,8 @@ class Experiment:
                 self.concrete_job = None
                 if code != 0:
                     raise StageFailure(f"concrete producer failed (exit {code}); see {self.log}")
+            elif self.args.concrete_timeout and time.monotonic() - self.concrete_started >= self.args.concrete_timeout:
+                raise RunnerTimeout(self.concrete_job, self.args.concrete_timeout)
         if self.resident_job is not None and not self.shutting_down:
             code = self.resident_job.poll()
             if code is not None:
@@ -250,28 +335,36 @@ class Experiment:
         if args.binradar_run is None and (mutation is not None or args.stop_after != "generation"):
             self.stage("prepare-cached", _python("binradar.binradar_setup", "--generate-binradar",
                                                  "-c", args.subject, "-w", args.workdir), structured=False)
+        native_limits = ["--timeout", str(args.generation_timeout)]
+        if args.forkserver_child_timeout is not None:
+            native_limits.extend(("--forkserver-child-timeout", str(args.forkserver_child_timeout)))
         if args.concrete_run is None:
+            self.concrete_started = time.monotonic()
             self.concrete_job = self._start("concrete", _python(
                 "binradar.cli", "-w", args.workdir, "--output", concrete,
-                "--generate-concrete", "--timeout", args.generation_timeout),
-                cwd=args.subject, structured=False)
+                "--generate-concrete", *native_limits), cwd=args.subject, structured=False)
         if mutation is not None and args.binradar_run is None:
+            mutation_limits = list(native_limits)
+            if args.binradar_representative_budget is not None:
+                mutation_limits.extend(("--binradar-representative-budget", str(args.binradar_representative_budget)))
             self.resident_job = self._start("binradar", _python(
                 "binradar.cli", "-w", args.workdir, "--output", mutation,
-                "--generate-binradar", "--replay-server", "--timeout", args.generation_timeout),
+                "--generate-binradar", "--replay-server", *mutation_limits),
                 cwd=args.subject, structured=False)
             args.replay_socket = mutation / "replay.sock"
         self.record["replay_socket"] = str(args.replay_socket) if args.replay_socket else None
         self.persist()
         if args.replay_socket is not None:
+            # The supervisor owns this watchdog and cleanup. A second client
+            # deadline at the same instant races the native ready transition.
             command = _python("taosc_llm.replay", "wait", "--socket", args.replay_socket,
-                              "--timeout", args.ready_timeout)
+                              "--timeout", 0)
             if self.resident_job is not None:
                 command.extend(("--pid", str(self.resident_job.pid)))
             self.stage("ready", command, timeout=args.ready_timeout)
         if self.concrete_job is not None:
             job = self.concrete_job
-            code = self.supervisor.wait(job, timeout=args.stage_timeout, tick=self.health)
+            code = self.supervisor.wait(job, tick=self.health)
             self._finish(job, code)
             self.health()
         manifest = concrete / "minimizer.sbsv"
@@ -421,6 +514,9 @@ def main(argv: list[str] | None = None) -> int:
             code = _execute(args, root, record, held_fds=(run_lock,))
             print(json.dumps(record, sort_keys=True))
             return code
+    except RunnerInterrupted as error:
+        print(f"taosc-llm-run: {error}", file=sys.stderr)
+        return error.exit_code
     except (OSError, ValueError, RuntimeError) as error:
         print(f"taosc-llm-run: {error}", file=sys.stderr)
         return 1

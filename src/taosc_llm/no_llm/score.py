@@ -75,14 +75,16 @@ class Score:
     @classmethod
     def from_evaluation(cls, population: Population, evaluation: dict) -> "Score":
         covered, regressions, failures, known = set(), set(), set(), set()
-        ignored = {key: "candidate-not-evaluated" for key in population.active}
+        normals = population.normals
+        active = population.crashes | normals
+        ignored = {key: "candidate-not-evaluated" for key in active}
         seen = set()
         for item in evaluation["cases"]:
             key = item["case_id"]
             if key in seen:
                 raise ValueError("duplicate candidate case")
             seen.add(key)
-            if key not in population.active:
+            if key not in active:
                 continue
             report = item["report"]
             candidate = report["candidate"]
@@ -99,7 +101,7 @@ class Score:
                 ignored[key] = candidate.get("reason", "outcome-unavailable")
             elif activation not in ("fired", "not_fired"):
                 ignored[key] = "candidate-" + (activation or "unknown")
-            elif key in population.normals:
+            elif key in normals:
                 ignored.pop(key)
                 known.add(key)
                 if activation == "fired":

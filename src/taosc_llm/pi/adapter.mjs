@@ -662,7 +662,18 @@ function receive(frame, options, keyPromise) {
 async function main() {
   const [major, minor] = process.versions.node.split('.').map(Number);
   insist(major > 22 || (major === 22 && minor >= 19), 'node_version_mismatch');
-  const options = parseArgs(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  if (argv.length === 3 && argv[0] === '--sdk-root' && isAbsolute(argv[1]) && argv[2] === '--check') {
+    // Local import/ABI admission only: no credentials, session, model or request.
+    globalThis.fetch = async () => { throw new SafeError('network_disabled'); };
+    const { sdk, ai, chat } = await loadSdk(argv[1]);
+    insist(typeof sdk.createAgentSession === 'function' && typeof sdk.ModelRuntime?.create === 'function'
+      && typeof ai.InMemoryCredentialStore === 'function' && typeof chat.streamSimple === 'function', 'sdk_configuration_error');
+    output('Pi SDK 1.4.0 ready\n');
+    process.stdout.end(() => process.exit(0));
+    return;
+  }
+  const options = parseArgs(argv);
   globalThis.fetch = guardedFetch;
   const keyPromise = credentials(options.fd);
   // Attach immediately so a malformed closed pipe cannot become an unhandled rejection.

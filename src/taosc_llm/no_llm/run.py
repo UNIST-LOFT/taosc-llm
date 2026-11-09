@@ -77,7 +77,11 @@ def synthesize(dataset, *, output: Path, limits: SearchLimits | None = None,
                           cache_dir=cache_dir, replay_socket=replay_socket, cancelled=cancelled)
         engine = None
         try:
-            engine = SearchEngine(backend)
+            # Restoring an incumbent is read-only authentication, not renewed
+            # search admission. Publication can legitimately finish after the
+            # search deadline; its completed evidence must survive resume.
+            with backend.restoration():
+                engine = SearchEngine(backend)
             result = engine.run()
             backend.check_cancelled()
             if result["predicate"] is not None and result["termination"] != "interrupted":

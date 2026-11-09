@@ -1,13 +1,12 @@
 """Authenticated execution adapter; no model, prompt, or provider state."""
 from __future__ import annotations
 
-import copy
-import hashlib
+from contextlib import contextmanager
 from pathlib import Path
 import time
 
 from .. import evaluation
-from ..dataset import PreparedDataset, sha256
+from ..dataset import PreparedDataset, canonical, sha256
 from ..execution import execution_identity
 from ..family import parse_candidate
 from .model import SearchLimits, SearchStopped
@@ -45,6 +44,7 @@ class Backend:
         self.result_refs = {}
         self.baseline_ref = None
         self.population = None
+        self._restoring = False
         self._bound_socket = None
         unsettled_since = None
         for event in journal.events:
@@ -103,8 +103,29 @@ class Backend:
         if self.cancelled is not None and self.cancelled.is_set():
             raise SearchStopped("interrupted")
 
+    @contextmanager
+    def restoration(self):
+        """Authenticate saved evidence even when finalization exhausted time.
+
+        This permits no execution or commit admission and never replenishes a
+        budget. Cancellation and complete dataset/capture validation still apply.
+        """
+        previous = self._restoring
+        self._restoring = self.baseline_ref is not None
+        try:
+            yield
+        finally:
+            self._restoring = previous
+
+    def check_operation(self):
+        """Bound admitted work without rejecting the final reserved evaluation."""
+        self.check_cancelled()
+        if not self._restoring and self.elapsed >= self.limits.timeout:
+            raise SearchStopped("wall-time-reached")
+
     def check(self):
         self.check_cancelled()
+        # Read-only restoration must never admit new work past the deadline.
         if self.elapsed >= self.limits.timeout:
             raise SearchStopped("wall-time-reached")
         if self.evaluations >= self.limits.max_evaluations:
@@ -119,41 +140,78 @@ class Backend:
         # Charge the whole bounded operation before admitting any target work.
         self.checkpoint_budget()
 
-    def _preserve(self, result):
-        result = copy.deepcopy(result)
-        def visit(value):
-            if isinstance(value, dict):
-                if value.get("complete") is True and all(k in value for k in ("path", "sha256", "descriptor", "artifact_sha256")):
-                    evaluation._snapshots(self.dataset, value)
-                    path = Path(value["path"])
-                    if not path.is_absolute():
-                        path = self.dataset.root / path
-                    raw = path.read_bytes()
-                    if hashlib.sha256(raw).hexdigest() != value["sha256"]:
-                        raise ValueError("capture changed during journal publication")
-                    ref = self.journal.store_bytes(raw, suffix=".brch")
-                    value["path"] = str(self.journal.directory / ref["path"])
-                for child in value.values():
-                    visit(child)
-            elif isinstance(value, list):
-                for child in value:
-                    visit(child)
-        visit(result)
-        return result
+    def _preserve(self, result, dataset):
+        # Identity authentication and content storage have different keys. Equal
+        # bytes never excuse a different selector/descriptor/provenance binding.
+        captures, objects, stored = {}, {}, {}
 
-    def load(self, reference):
-        result = self.journal.load(reference)
-        self.dataset.verify_artifacts()
+        def visit(value):
+            self.check_operation()
+            if isinstance(value, dict):
+                if value.get("complete") is True and all(k in value for k in
+                        ("path", "sha256", "descriptor", "artifact_sha256")):
+                    if id(value) in objects:
+                        return objects[id(value)]
+                    key = canonical(value)
+                    if key not in captures:
+                        raw = dataset.capture_bytes(value)
+                        self.check_operation()
+                        digest = value["sha256"]
+                        if digest not in stored:
+                            stored[digest] = self.journal.store_bytes(raw, suffix=".brch")
+                        captures[key] = str(self.journal.directory / stored[digest]["path"])
+                    preserved = {**value, "path": captures[key]}
+                    objects[id(value)] = preserved
+                    return preserved
+                children = {key: (visit(child) if key not in ("branches", "offline_branches")
+                                  and isinstance(child, (dict, list)) else child)
+                            for key, child in value.items()}
+                return children if any(children[key] is not child for key, child in value.items()) else value
+            if isinstance(value, list):
+                children = [visit(child) if isinstance(child, (dict, list)) else child for child in value]
+                return children if any(a is not b for a, b in zip(children, value)) else value
+            return value
+
+        preserved = visit(result)
+        self.check_operation()
+        return preserved
+
+    def _validate_result(self, dataset, result):
+        """Retain all actual, representative and offline full-vector mirrors."""
         for item in result["cases"]:
+            self.check_operation()
             for record in (item, item.get("neutral_baseline", {})):
                 capture = record.get("capture")
                 if capture and capture.get("complete") is True:
-                    states = evaluation._snapshots(self.dataset, capture)
-                    if evaluation._vector(capture["descriptor"], states) != capture["branches"]:
+                    states = evaluation._snapshots(dataset, capture)
+                    actual = capture["branches"]
+                    if evaluation._vector(capture["descriptor"], states, dataset=dataset) != actual:
                         raise ValueError("journal representative evaluator mismatch")
+                    if ((record.get("status") != "unavailable" or record.get("branches") is not None)
+                            and record.get("branches") != actual):
+                        raise ValueError("journal observed vector mismatch")
                     if (record.get("status") != "unavailable"
-                            and evaluation._vector(record["descriptor"], states) != capture["branches"]):
+                            and evaluation._vector(record["descriptor"], states, dataset=dataset) != actual):
                         raise ValueError("journal candidate vector mismatch")
+                reference = record.get("offline_reference")
+                if reference and reference.get("complete") is True:
+                    states = evaluation._snapshots(dataset, reference)
+                    actual = reference["branches"]
+                    if evaluation._vector(reference["descriptor"], states, dataset=dataset) != actual:
+                        raise ValueError("journal offline representative evaluator mismatch")
+                    predicted = evaluation._vector(record["descriptor"], states, dataset=dataset)
+                    divergence = next((index for index, (a, b) in enumerate(zip(predicted, actual))
+                                       if a != b), None)
+                    if (record.get("offline_branches") != predicted
+                            or record.get("first_divergence") != divergence):
+                        raise ValueError("journal offline vector mismatch")
+        self.check_operation()
+
+    def load(self, reference):
+        self.check_operation()
+        result = self.journal.load(reference)
+        with self.dataset.validation(check=self.check_operation) as dataset:
+            self._validate_result(dataset, result)
         return result
 
     def baseline(self):
@@ -162,23 +220,27 @@ class Backend:
         from ..poc import poc_case
         from ..execution import execute_original
         from ..evidence import _project_case
-        cases = {case["id"]: case for case in self.dataset.cases()}
-        poc = poc_case(self.dataset)
-        if poc is not None:
-            cases.setdefault(poc["id"], poc)
-        missing = [case for case in cases.values()
-                   if case["domain"] == "system" and not case.get("observation")]
-        self.reserve(sum(case["domain"] == "system" for case in cases.values()) + len(missing))
-        with self.dataset.validation() as dataset:
+        self.check()
+        with self.dataset.validation(check=self.check_operation) as dataset:
+            cases = {case["id"]: case for case in dataset.cases()}
+            poc = poc_case(dataset)
+            if poc is not None:
+                cases.setdefault(poc["id"], poc)
+            missing = [case for case in cases.values()
+                       if case["domain"] == "system" and not case.get("observation")]
+            self.reserve(sum(case["domain"] == "system" for case in cases.values()) + len(missing))
             originals = {}
             for case in missing:
+                self.check_operation()
                 record = execute_original(dataset, case, self.cache_dir / "originals")
                 if record["artifact_sha256"] != dataset.manifest["artifacts"][dataset.binary + ".orig"]["sha256"]:
                     raise ValueError("original baseline artifact mismatch")
                 originals[case["id"]] = record
             result = evaluation._evaluate(dataset, None, "p0", case_ids=None, workers=self.workers,
-                                          execute=True, cache_dir=self.cache_dir)
+                                          execute=True, cache_dir=self.cache_dir,
+                                          operation_check=self.check_operation)
             for item in result["cases"]:
+                self.check_operation()
                 case = cases[item["case_id"]]
                 if case["id"] in originals:
                     record = originals[case["id"]]
@@ -190,10 +252,11 @@ class Backend:
                     hits = (case.get("observation") or {}).get("patch-hit")
                 if type(hits) is int:
                     item["original_patch_hits"] = hits
-        self.check_cancelled()
-        result = self._preserve(result)
-        self.baseline_ref = self.journal.store(result)
-        self.journal.append("baseline", {"result": self.baseline_ref})
+            result = self._preserve(result, dataset)
+            reference = self.journal.store(result)
+            self.check_operation()
+            self.journal.append("baseline", {"result": reference})
+            self.baseline_ref = reference
         self.checkpoint_budget()
         return result
 
@@ -201,38 +264,46 @@ class Backend:
         candidate = parse_candidate(self.dataset.patch_format, source)
         if candidate.descriptor in self.result_refs:
             return self.load(self.result_refs[candidate.descriptor])
+        self.check()
         ids = sorted(self.population.active) if self.population is not None else None
-        count = len(ids) if ids is not None else len(self.dataset.cases()) + 1
-        # A bridge evaluates its whole retained function inventory before the
-        # existing API filters rows. Reserve that population as well.
-        if self.socket is not None:
-            self._connect_policy()
-            count = max(count, len(self.dataset.cases()))
-        self.reserve(2 * count)
-        from ..poc import poc_case
-        poc = poc_case(self.dataset)
-        include_poc = poc is not None and (ids is None or poc["id"] in ids)
-        result = evaluation.evaluate_dataset(self.dataset, source, case_ids=ids, workers=self.workers,
-                                             execute=True, cache_dir=self.cache_dir,
-                                             replay_socket=self.socket, include_poc=include_poc)
-        self.check_cancelled()
-        result = self._preserve(result)
-        reference = self.journal.store(result)
-        self.journal.append("evaluation", {"descriptor": candidate.descriptor, "result": reference})
-        self.result_refs[candidate.descriptor] = reference
+        with self.dataset.validation(check=self.check_operation) as dataset:
+            count = len(ids) if ids is not None else len(dataset.cases()) + 1
+            # A bridge evaluates its whole retained function inventory before the
+            # existing API filters rows. Reserve that population as well.
+            if self.socket is not None:
+                self._connect_policy()
+                count = max(count, len(dataset.cases()))
+            self.reserve(2 * count)
+            from ..poc import poc_case
+            poc = poc_case(dataset)
+            include_poc = poc is not None and (ids is None or poc["id"] in ids)
+            result = evaluation._evaluate(dataset, candidate, candidate.descriptor,
+                                          case_ids=ids, workers=self.workers, execute=True,
+                                          cache_dir=self.cache_dir, replay_socket=self.socket,
+                                          include_poc=include_poc,
+                                          operation_check=self.check_operation)
+            result = self._preserve(result, dataset)
+            reference = self.journal.store(result)
+            self.check_operation()
+            self.journal.append("evaluation", {"descriptor": candidate.descriptor, "result": reference})
+            self.result_refs[candidate.descriptor] = reference
         self.checkpoint_budget()
         return result
 
     def snapshots(self, result):
         output = {}
-        for item in result["cases"]:
-            if self.population is not None and item["case_id"] not in self.population.active:
-                continue
-            capture = item.get("capture")
-            if not capture or capture.get("complete") is not True:
-                capture = item.get("neutral_baseline", {}).get("capture")
-            if capture and capture.get("complete") is True:
-                states = evaluation._snapshots(self.dataset, capture)
-                if states:
-                    output[item["case_id"]] = states
+        active = self.population.active if self.population is not None else None
+        with self.dataset.validation(check=self.check_operation) as dataset:
+            self._validate_result(dataset, result)
+            for item in result["cases"]:
+                self.check_operation()
+                if active is not None and item["case_id"] not in active:
+                    continue
+                capture = item.get("capture")
+                if not capture or capture.get("complete") is not True:
+                    capture = item.get("neutral_baseline", {}).get("capture")
+                if capture and capture.get("complete") is True:
+                    states = evaluation._snapshots(dataset, capture)
+                    if states:
+                        output[item["case_id"]] = states
         return output

@@ -555,7 +555,17 @@ invocation cwd. Lexical symlink parents are preserved. Workdir `patch-format`
 wins, with subject fallback only when absent. Only `ERM generic`/`ERM CWE-805`
 proceed; other nonempty values emit JSON `status=skipped`, exit 0, and allocate
 nothing. Missing/invalid metadata is an error. Only concrete-only generation
-without synthesis bypasses the family check.
+without synthesis bypasses the family check. Before reserving output or starting
+producers, the runner checks positive 64-bit patch addresses, subject/POC settings,
+native timeout values, CWE allocator/stack metadata, and manual predicate grammar.
+A supplied dataset is authenticated. Provider synthesis parses only the explicit
+provider file and performs a credential-free Node/Pi import/ABI check (30-second
+supervised cap); missing SDK, incompatible Node and malformed local configuration
+fail here, not after generation. This is offline admission, not proof of remote
+credentials/model availability. An explicit REA path must resolve before generation.
+An explicit external replay endpoint must already answer as ready/evaluating;
+dataset reuse also checks its frozen mutation binding before warming. Omit the
+socket for offline reuse rather than naming a dead endpoint.
 
 ### Run directory selection
 
@@ -606,10 +616,24 @@ execution; caller-owned runs/servers are never signalled, restarted or shut down
 | Option | Default | Scope |
 |---|---:|---|
 | `--generation-timeout` | 7200 s | Native per-phase integer budget; 0 explicitly unlimited. |
-| `--ready-timeout` | 7200 s | Whole resident readiness wait; 0 explicitly unlimited. |
-| `--stage-timeout` | 7200 s | Each foreground stage and post-readiness concrete wait; 0 explicitly unlimited. |
+| `--forkserver-child-timeout` | subject/default | Optional native per-child cap, passed to owned producers; native phase/attempt clamping still applies. |
+| `--binradar-representative-budget` | subject/default | Optional cap on actual mutation-generation representative replies; 0 unlimited. Requires owned mutation generation. |
+| `--ready-timeout` | 0 | Optional external wall cap covering startup/PROBE/generation until ready. 0 adds no outer deadline. |
+| `--concrete-timeout` | 0 | Optional external concrete wall cap **from launch**, including PROBE and MINIMIZER drain; monitored even while waiting for ready. |
+| `--stage-timeout` | 0 | Optional external wall cap per setup/dataset/warm/synthesis stage; does not bound producer completion. |
 | `--graceful-timeout` | 10 s | Grace before TERM/KILL escalation; positive. |
 | `--search-timeout` | 3600 s | Persistent no-LLM search admission budget, not whole-program wall time. |
+
+The default external watchdogs are disabled deliberately, not the native budgets:
+PROBE precedes the generation clock, and concrete MINIMIZER has a shared native
+`T + 600` drain budget plus an in-flight QASAN execution and cleanup. A second
+7200-second whole-process timeout truncated both policies. Provider synthesis
+likewise has per-operation budgets and optional review, not one 7200-second total.
+Set explicit external caps when an overall wall bound is required; they are hard
+supervisor limits and may intentionally stop before native completion. A stuck
+stage outside its own native/tool deadlines otherwise has no runner wall cap.
+Readiness has one watchdog owner (the supervisor), not racing client/parent timers.
+Changing `--generation-timeout` does not change no-LLM search or provider budgets.
 
 `--execution-workers` defaults to 4 (1–32). No-LLM atom/beam/clause/factor/depth
 and evaluation/execution limits match its direct CLI. Explicit search options

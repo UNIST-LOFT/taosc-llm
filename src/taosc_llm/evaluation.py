@@ -17,11 +17,13 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import time
 
 from binradar.binradar_feedback_capture import read_case, read_header, unpack_branches
 from binradar.binradar_taosc_predicates import (
     evaluate_cached_predicate, load_runtime_predicates, parse_cached_snapshots,
     parse_predicate_descriptor, predicate_descriptor, predicate_stack_bytes,
+    prepare_generic_environments,
 )
 from binradar.binradar_verifier import CONCRETE_ORACLE
 
@@ -56,16 +58,30 @@ def _atomic(path: Path, value) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(part, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     finally:
         if os.path.exists(part):
             os.unlink(part)
 
 
 @contextmanager
-def _lock(path: Path):
+def _lock(path: Path, operation_check=None):
     # flock is per open file description, protecting both threads and processes.
     with path.open('a') as stream:
-        fcntl.flock(stream, fcntl.LOCK_EX)
+        if operation_check is None:
+            fcntl.flock(stream, fcntl.LOCK_EX)
+        else:
+            while True:
+                operation_check()
+                try:
+                    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    time.sleep(0.05)
         try:
             yield
         finally:
@@ -80,7 +96,21 @@ class _CaptureMetadata:
     stack_bytes: int
 
 
+def _memo(dataset, namespace, key, factory):
+    memo = getattr(dataset, '_memo', None)
+    return factory() if memo is None else memo(namespace, key, factory)
+
+
+def _descriptor(dataset, descriptor):
+    return _memo(dataset, 'descriptor', descriptor,
+                 lambda: parse_predicate_descriptor(descriptor))
+
+
 def _capture_metadata(dataset):
+    return _memo(dataset, 'capture-metadata', None, lambda: _read_capture_metadata(dataset))
+
+
+def _read_capture_metadata(dataset):
     with dataset.artifact(dataset.binary + '.brcached').open('rb') as stream:
         header = stream.read(20)
     return _CaptureMetadata(
@@ -98,12 +128,23 @@ def _snapshots(dataset, capture):
 
 
 def _validated_snapshots(dataset, capture, metadata):
+    # Include every metadata assertion, not only the content address. The tuple
+    # is immutable and retained for stable per-operation replay-cache identity.
+    from .dataset import canonical
+    key = (canonical(capture), metadata)
+    return _memo(dataset, 'validated-captures', key,
+                 lambda: tuple(_read_validated_snapshots(dataset, capture, metadata)))
+
+
+def _read_validated_snapshots(dataset, capture, metadata):
+    from .dataset import _capture_selector
     if capture.get('complete') is not True:
         raise ValueError(capture.get('reason', 'incomplete-capture'))
+    expected_id = _capture_selector(capture)
     descriptor = capture.get('descriptor')
     if not isinstance(descriptor, str) or not descriptor:
         raise ValueError('capture-descriptor-unavailable')
-    parsed = parse_predicate_descriptor(descriptor)
+    parsed = _descriptor(dataset, descriptor)
     if descriptor != 'p0' and isinstance(parsed, str) == metadata.cwe:
         raise ValueError('capture-descriptor-family-mismatch')
     if capture.get('artifact_sha256') != metadata.artifact_sha256:
@@ -113,19 +154,30 @@ def _validated_snapshots(dataset, capture, metadata):
     path = Path(capture['path'])
     if not path.is_absolute():
         snapshots = dataset.snapshots(capture)
-        expected_id = capture.get('patch_id', capture.get('capture_id', 0))
         if any(state.patch_id != expected_id for state in snapshots):
             raise ValueError('capture-id-mismatch')
-        return snapshots
+        parse = getattr(dataset, '_parsed_capture', None)
+        return snapshots if parse is None else parse(capture)
     # Absolute paths arise only from our owned cache or authenticated journals.
-    if sha256(path) != capture['sha256']:
-        raise ValueError('capture-hash-mismatch')
-    snapshots, error = parse_cached_snapshots(path.read_bytes())
-    if error:
-        raise ValueError(error)
+    parse = getattr(dataset, '_parsed_capture', None)
+    if parse is not None:
+        snapshots = parse(capture)
+    else:
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != capture['sha256']:
+            raise ValueError('capture-hash-mismatch')
+        sidecar = capture.get('sidecar')
+        if sidecar is not None:
+            sidecar_path = Path(sidecar['path'])
+            if not sidecar_path.is_absolute():
+                sidecar_path = dataset.root / sidecar_path
+            if sha256(sidecar_path) != sidecar['sha256']:
+                raise ValueError('capture-sidecar-hash-mismatch')
+        snapshots, error = parse_cached_snapshots(raw)
+        if error:
+            raise ValueError(error)
     if [s.branch for s in snapshots] != capture['branches']:
         raise ValueError('capture-vector-mismatch')
-    expected_id = capture.get('patch_id', capture.get('capture_id', 0))
     if any(state.patch_id != expected_id for state in snapshots):
         raise ValueError('capture-id-mismatch')
     if any(s.is_CWE805 != metadata.cwe
@@ -134,14 +186,25 @@ def _validated_snapshots(dataset, capture, metadata):
     return snapshots
 
 
-def _vector(descriptor, snapshots):
-    if descriptor == 'p0':
-        return [0] * len(snapshots)
-    parsed = parse_predicate_descriptor(descriptor)
-    required = predicate_stack_bytes(parsed)
-    if any(len(state.stack) < required for state in snapshots):
-        raise ValueError('representative-stack-unavailable')
-    return evaluate_cached_predicate(parsed, snapshots)
+def _vector(descriptor, snapshots, dataset=None):
+    """Replay the full vector, retaining diagnostics even after divergence."""
+    # Only immutable state sequences can safely carry a cached replay identity.
+    # Keep a strong reference so an ephemeral tuple's id cannot be recycled.
+    scoped = dataset if isinstance(snapshots, tuple) else None
+    _memo(scoped, 'snapshot-sequences', id(snapshots), lambda: snapshots)
+    def replay_inputs():
+        environments = prepare_generic_environments(snapshots)
+        return snapshots, None if environments is None else tuple(environments)
+    def replay():
+        if descriptor == 'p0':
+            return (0,) * len(snapshots)
+        parsed = _descriptor(dataset, descriptor)
+        required = predicate_stack_bytes(parsed)
+        if any(len(state.stack) < required for state in snapshots):
+            raise ValueError('representative-stack-unavailable')
+        _, environments = _memo(scoped, 'replay-inputs', id(snapshots), replay_inputs)
+        return tuple(evaluate_cached_predicate(parsed, snapshots, environments))
+    return list(_memo(scoped, 'vectors', (id(snapshots), descriptor), replay))
 
 
 @dataclass(frozen=True)
@@ -156,6 +219,11 @@ class _ProducerMetadata:
 
 def _producer_metadata(dataset, identity):
     """Freeze expected identities, never trust mutable producer records ahead of use."""
+    return _memo(dataset, 'producer-metadata', _digest(identity),
+                 lambda: _read_producer_metadata(dataset, identity))
+
+
+def _read_producer_metadata(dataset, identity):
     run = dataset.manifest.get('sources', {}).get('concrete_run')
     if run is None or not identity.get('qemu'):
         return None
@@ -222,6 +290,8 @@ def _same_crash(dataset, case, capture):
         # Preparation authenticates committed frame + typed attempt-1 oracle.
         return capture.get('same_crash') if type(capture.get('same_crash')) is bool else None
     outcome = capture.get('outcome', {})
+    if not isinstance(outcome, dict):
+        return None
     oracle = outcome.get('oracle', outcome.get('concrete-oracle'))
     observed = outcome.get('outcome')
     if observed is None:
@@ -244,25 +314,53 @@ def _cache_record(path, key):
         if not isinstance(value, dict) or value.get('identity') != key:
             return None
         capture = value.get('capture')
-        return capture if isinstance(capture, dict) else None
+        if not isinstance(capture, dict) or value.get('capture_digest') != _digest(capture):
+            return None
+        return capture
     except (OSError, ValueError, TypeError):
         return None
 
 
+def _pool_descriptors(path, identity):
+    """The durable index holds record references, never reusable verdicts."""
+    try:
+        value = json.loads(path.read_text())
+        if (not isinstance(value, dict) or value.get('schema_version') != 1
+                or value.get('identity') != identity):
+            return []
+        descriptors = value.get('descriptors')
+        if (not isinstance(descriptors, list)
+                or any(not isinstance(item, str) or not item for item in descriptors)
+                or len(set(descriptors)) != len(descriptors)):
+            return []
+        return descriptors
+    except (OSError, ValueError, TypeError):
+        return []
+
+
 def _case_result(dataset, case, candidate, descriptor, execute, root, base_identity,
-                 metadata, producer):
+                 metadata, producer, operation_check=None):
+    if operation_check is not None:
+        operation_check()
     base = {'case_id': case['id'], 'domain': case['domain'], 'source': 'unavailable',
             'status': 'unavailable', 'reason': 'capture-unavailable', 'branches': None,
             'descriptor': descriptor, 'offline_branches': None, 'first_divergence': None,
             'offline_reference': None}
     if candidate is not None and candidate.required_stack_bytes > metadata.stack_bytes:
         return {**base, 'reason': 'candidate-stack-unavailable'}
-    identity = {**base_identity, 'input': case.get('input_sha256'), 'case': case['id'],
-                'descriptor': descriptor, 'observation': case.get('observation'),
-                'source': case.get('source')}
+    pool_identity = {**base_identity, 'input': case.get('input_sha256'), 'case': case['id'],
+                     'observation': case.get('observation'), 'source': case.get('source')}
+    identity = {**pool_identity, 'descriptor': descriptor}
     key = _digest(identity)
     record_path = root / (key + '.json')
-    with _lock(root / (key + '.lock')):
+    pool_key = _digest(pool_identity)
+    pool_path = root / (pool_key + '.representatives.json')
+    # Every descriptor for this case shares one lock. Neutral evaluation finishes
+    # before candidate evaluation enters here, so no recursive flock is needed.
+    with _lock(root / (pool_key + '.lock'), operation_check=operation_check):
+        if operation_check is not None:
+            operation_check()
+        representatives = _pool_descriptors(pool_path, pool_identity)
         captures = []
         own = _cache_record(record_path, identity)
         if own:
@@ -276,15 +374,25 @@ def _case_result(dataset, case, candidate, descriptor, execute, root, base_ident
         neutral = _cache_record(root / (_digest(neutral_identity) + '.json'), neutral_identity)
         if neutral and descriptor != 'p0':
             captures.append((neutral, 'cache'))
+        for representative in representatives:
+            if representative in (descriptor, 'p0'):
+                continue
+            representative_identity = {**pool_identity, 'descriptor': representative}
+            capture = _cache_record(root / (_digest(representative_identity) + '.json'),
+                                    representative_identity)
+            if capture is not None:
+                captures.append((capture, 'cache'))
         for capture, source in captures:
+            if operation_check is not None:
+                operation_check()
             try:
                 snapshots = _validated_snapshots(dataset, capture, metadata)
                 if candidate is not None and any(len(s.stack) < candidate.required_stack_bytes for s in snapshots):
                     raise ValueError('candidate-stack-unavailable')
                 actual = capture['branches']
-                if _vector(capture['descriptor'], snapshots) != actual:
+                if _vector(capture['descriptor'], snapshots, dataset=dataset) != actual:
                     raise ValueError('representative-evaluator-mismatch')
-                branches = _vector(descriptor, snapshots)
+                branches = _vector(descriptor, snapshots, dataset=dataset)
                 base['offline_branches'] = branches
                 base['offline_reference'] = capture
                 divergence = next((i for i, (a, b) in enumerate(zip(branches, actual)) if a != b), None)
@@ -305,19 +413,28 @@ def _case_result(dataset, case, candidate, descriptor, execute, root, base_ident
                 base['reason'] = _reason(error)
         if case['domain'] != 'system' or not execute:
             return base
+        if operation_check is not None:
+            operation_check()
         try:
             capture = execute_capture(dataset, case, descriptor, root / 'states')
             # Save actual executions even when BRCH is unavailable. Such entries
             # are diagnostic only and never become reusable branch evidence.
-            _atomic(record_path, {'identity': identity, 'capture': capture})
+            _atomic(record_path, {'identity': identity, 'capture': capture,
+                                  'capture_digest': _digest(capture)})
             base.update(source='executed', reuse='fresh', branches=capture.get('branches'),
                         outcome=capture.get('outcome'), capture=capture)
             snapshots = _validated_snapshots(dataset, capture, metadata)
-            if _vector(descriptor, snapshots) != capture['branches']:
+            if capture['descriptor'] != descriptor:
+                raise ExecutionUnavailable('candidate-descriptor-mismatch')
+            if _vector(descriptor, snapshots, dataset=dataset) != capture['branches']:
                 raise ExecutionUnavailable('candidate-evaluator-mismatch')
             if 2 in capture['branches']:
                 return {**base, 'reason': 'predicate-trap'}
             same = _same_crash(dataset, case, capture)
+            if same is not None and descriptor not in representatives:
+                representatives.append(descriptor)
+                _atomic(pool_path, {'schema_version': 1, 'identity': pool_identity,
+                                    'descriptors': representatives})
             return {**base, 'source': 'executed', 'branches': capture['branches'],
                     'status': 'reject_same_crash' if same is True else ('not_rejected' if same is False else 'unavailable'),
                     'reason': 'same-crash' if same is True else ('observed-not-same-crash' if same is False else 'oracle-unavailable'),
@@ -326,12 +443,13 @@ def _case_result(dataset, case, candidate, descriptor, execute, root, base_ident
             return {**base, 'reason': _reason(error)}
 
 
-def _replay_evaluate(dataset, candidate, *, case_ids, socket_path):
+def _replay_evaluate(dataset, candidate, *, case_ids, socket_path, operation_check=None):
     from . import replay
     function_ids = {case['id'] for case in dataset.cases('function')}
     if case_ids is not None and any(case not in function_ids for case in case_ids):
         raise ValueError('live replay selects only function cases')
-    result = replay.evaluate_replay(dataset, candidate, socket_path=socket_path)
+    result = replay.evaluate_replay(dataset, candidate, socket_path=socket_path,
+                                    operation_check=operation_check)
     if case_ids is not None:
         selected = set(case_ids)
         result['cases'] = [item for item in result['cases'] if item['case_id'] in selected]
@@ -351,7 +469,7 @@ def _replay_evaluate(dataset, candidate, *, case_ids, socket_path):
 
 
 def _evaluate(dataset, candidate, descriptor, *, case_ids, workers, execute, cache_dir,
-              replay_socket=None, include_poc=True):
+              replay_socket=None, include_poc=True, operation_check=None):
     """Evaluate one candidate inside the caller's active validation scope.
 
     ``replay_socket`` selects the trusted live host bridge for **function**
@@ -362,6 +480,8 @@ def _evaluate(dataset, candidate, descriptor, *, case_ids, workers, execute, cac
     Function observations without a retained native plan stay offline even
     when the host enables replay.
     """
+    if operation_check is not None:
+        operation_check()
     if dataset.patch_format not in ('ERM generic', 'ERM CWE-805'):
         raise ValueError('only ERM generic and ERM CWE-805 evaluation is supported')
     if type(workers) is not int or not 1 <= workers <= 32:
@@ -416,14 +536,16 @@ def _evaluate(dataset, candidate, descriptor, *, case_ids, workers, execute, cac
         # Finish the p0 operation before taking the candidate lock. Equal keys
         # (warming/neutral candidates) must never recursively acquire flock.
         return _case_result(dataset, case, None, 'p0', execute, root,
-                            base_identity, metadata, producer)
+                            base_identity, metadata, producer, operation_check)
 
     def evaluate(case):
+        if operation_check is not None:
+            operation_check()
         neutral = neutral_baseline(case)
         item = (dict(live[case['id']]) if case['id'] in live else
                 neutral.copy() if descriptor == 'p0' else
                 _case_result(dataset, case, candidate, descriptor, execute, root,
-                             base_identity, metadata, producer))
+                             base_identity, metadata, producer, operation_check))
         item['neutral_baseline'] = neutral
         return item
     live = {}
@@ -431,14 +553,27 @@ def _evaluate(dataset, candidate, descriptor, *, case_ids, workers, execute, cac
     if use_replay:
         replay_result = _replay_evaluate(dataset, candidate,
                                          case_ids=sorted(c['id'] for c in live_cases),
-                                         socket_path=replay_socket)
+                                         socket_path=replay_socket,
+                                         operation_check=operation_check)
         live = {item['case_id']: item for item in replay_result['cases']}
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        evaluated = {item['case_id']: item
-                     for item in pool.map(evaluate, cases)}
+        futures = [pool.submit(evaluate, case) for case in cases]
+        try:
+            evaluated = {}
+            for future in futures:
+                item = future.result()
+                evaluated[item['case_id']] = item
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            # The executor drains already-running native children under their
+            # existing caps; queued work cannot admit any further execution.
+            raise
     from .evidence import _project_case, summarize_reports
     results = [evaluated[case['id']] for case in cases]
     for case, item in zip(cases, results):
+        if operation_check is not None:
+            operation_check()
         item['report'] = _project_case(dataset, case, item, metadata=metadata, descriptor=descriptor)
     counts = {status: sum(c['status'] == status for c in results)
               for status in ('reject_same_crash', 'not_rejected', 'unavailable')}
@@ -463,7 +598,8 @@ def _evaluate(dataset, candidate, descriptor, *, case_ids, workers, execute, cac
 
 def evaluate_dataset(dataset, predicate: str, *, case_ids: list[str] | None = None,
                      workers: int = 1, execute: bool = True, cache_dir: Path | None = None,
-                     replay_socket=None, include_poc: bool = True) -> dict:
+                     replay_socket=None, include_poc: bool = True,
+                     operation_check=None) -> dict:
     """Evaluate a family predicate; ``replay_socket`` is trusted host input.
 
     It is never serialized into a model tool argument or a public patch entry.
@@ -473,11 +609,14 @@ def evaluate_dataset(dataset, predicate: str, *, case_ids: list[str] | None = No
     """
     if isinstance(dataset, (str, Path)):
         dataset = load_dataset(Path(dataset))
-    with dataset.validation() as validated:
+    scope = (dataset.validation() if operation_check is None
+             else dataset.validation(check=operation_check))
+    with scope as validated:
         candidate = parse_candidate(validated.patch_format, predicate)
         return _evaluate(validated, candidate, candidate.descriptor, case_ids=case_ids,
                          workers=workers, execute=execute, cache_dir=cache_dir,
-                         replay_socket=replay_socket, include_poc=include_poc)
+                         replay_socket=replay_socket, include_poc=include_poc,
+                         operation_check=operation_check)
 
 
 def warm_dataset(dataset, *, workers: int = 1, cache_dir: Path | None = None) -> dict:

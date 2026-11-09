@@ -14,8 +14,11 @@ def subject(tmp_path, patch_format="ERM generic"):
     directory = tmp_path / "subject"
     workdir = directory / "prepared"
     workdir.mkdir(parents=True)
-    (directory / "config.env").write_text("BINARY=fixture\n")
+    (directory / "config.env").write_text("BINARY=fixture\nTEST_CMD=@@\nPOC_INPUT=poc/input\nPOC_DIR=poc\n")
+    (directory / "poc").mkdir()
+    (directory / "poc/input").write_bytes(b"fixture")
     (workdir / "patch-location").write_text("401000\n")
+    (workdir / "patch-destination").write_text("401010\n")
     if patch_format is not None:
         (workdir / "patch-format").write_text(patch_format)
     return directory, workdir
@@ -141,3 +144,78 @@ def test_resume_refuses_uninitialized_search_without_rewriting_run(tmp_path, cap
     assert "search was not initialized" in capsys.readouterr().err
     assert summary.read_bytes() == before
     assert not (output / "logs").exists()
+
+
+@pytest.mark.parametrize("field,value", [
+    ("patch-location", "0"), ("patch-destination", "0"),
+    ("patch-destination", "10000000000000000"), ("patch-destination", "not-an-address"),
+])
+def test_invalid_address_fails_before_generation_or_output(tmp_path, capsys, field, value):
+    directory, workdir = subject(tmp_path)
+    (workdir / field).write_text(value)
+    before = {path.name: path.read_bytes() for path in workdir.iterdir()}
+    output = tmp_path / "result"
+    assert main(arguments(directory, workdir, output)) == 1
+    assert field in capsys.readouterr().err
+    assert not output.exists()
+    assert {path.name: path.read_bytes() for path in workdir.iterdir()} == before
+
+
+def test_invalid_native_timeout_fails_before_generation(tmp_path, capsys):
+    directory, workdir = subject(tmp_path)
+    config = directory / "config.env"
+    config.write_text(config.read_text() + "BINRADAR_QEMU_EXEC_TIMEOUT=nan\n")
+    output = tmp_path / "result"
+    assert main(arguments(directory, workdir, output)) == 1
+    assert "BINRADAR_QEMU_EXEC_TIMEOUT" in capsys.readouterr().err
+    assert not output.exists()
+
+
+def test_invalid_provider_configuration_is_private_and_early(tmp_path, capsys):
+    directory, workdir = subject(tmp_path)
+    provider = tmp_path / "provider.env"
+    secret = "private-fixture-secret-never-log"
+    provider.write_text(f"OPENAI_API_KEY={secret}\nOPENAI_BASE_URL=http://unsafe.example/v1\nOPENAI_MODEL=x\n")
+    output = tmp_path / "result"
+    assert main(arguments(directory, workdir, output) + [
+        "--mode", "provider", "--provider-env", str(provider)]) == 1
+    diagnostic = capsys.readouterr()
+    assert secret not in diagnostic.out + diagnostic.err
+    assert "base_url" in diagnostic.err
+    assert not output.exists()
+
+
+def test_missing_sdk_fails_before_producers(tmp_path, monkeypatch, capsys):
+    directory, workdir = subject(tmp_path)
+    provider = tmp_path / "provider.env"
+    provider.write_text("OPENAI_API_KEY=fixture-secret\nOPENAI_BASE_URL=https://ollama.com/v1\n"
+                        "OPENAI_MODEL=deepseek-v4.1-flash:1017\n")
+    monkeypatch.delenv("TAOSC_LLM_PI_SDK_ROOT", raising=False)
+    output = tmp_path / "result"
+    assert main(arguments(directory, workdir, output) + [
+        "--mode", "provider", "--provider-env", str(provider)]) == 1
+    assert "--pi-sdk-root" in capsys.readouterr().err
+    assert not output.exists()
+
+
+def test_missing_external_replay_fails_before_output(tmp_path, capsys):
+    directory, workdir = subject(tmp_path)
+    concrete, mutation = tmp_path / "concrete", tmp_path / "mutation"
+    concrete.mkdir()
+    mutation.mkdir()
+    (concrete / "minimizer.sbsv").write_text("retained")
+    (mutation / "binradar.br").write_bytes(b"retained")
+    output = tmp_path / "result"
+    assert main(arguments(directory, workdir, output) + [
+        "--concrete-run", str(concrete), "--binradar-run", str(mutation),
+        "--replay-socket", str(mutation / "replay.sock"), "--stop-after", "generation"]) == 1
+    assert "replay" in capsys.readouterr().err
+    assert not output.exists()
+
+
+def test_invalid_manual_predicate_fails_before_producers(tmp_path, capsys):
+    directory, workdir = subject(tmp_path)
+    output = tmp_path / "result"
+    assert main(arguments(directory, workdir, output) + ["--mode", "manual", "--predicate", "rax ==="]) == 1
+    assert not output.exists()
+    assert "taosc-llm-run:" in capsys.readouterr().err

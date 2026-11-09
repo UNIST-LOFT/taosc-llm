@@ -16,6 +16,7 @@ import argparse
 import hashlib
 import json
 import os
+import select
 import socket
 import stat
 import sys
@@ -81,8 +82,10 @@ def validate_status(value: dict) -> dict:
 
 
 def _read_objects(socket_path: Path, payload: dict, *,
-                  timeout: float) -> list[dict]:
+                  timeout: float, operation_check=None) -> list[dict]:
     """One newline-delimited request/response exchange on its own connection."""
+    if operation_check is not None:
+        operation_check()
     connection = None
     try:
         endpoint = socket_path.resolve(strict=True)
@@ -95,6 +98,8 @@ def _read_objects(socket_path: Path, payload: dict, *,
         raise ReplayError(
             f"replay socket unavailable: {socket_path}: {exc}") from exc
     try:
+        if operation_check is not None:
+            operation_check()
         try:
             connection.sendall(
                 json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n")
@@ -104,7 +109,21 @@ def _read_objects(socket_path: Path, payload: dict, *,
         data = bytearray()
         objects: list[dict] = []
         received = 0
+        last_activity = time.monotonic()
         while True:
+            if operation_check is not None:
+                # Callback exceptions deliberately escape protocol-error wrapping.
+                # Closing this request cancels only its batch, not the resident.
+                operation_check()
+                remaining = timeout - (time.monotonic() - last_activity)
+                if remaining <= 0:
+                    raise ReplayError(f"replay response timed out after {timeout:g}s: {socket_path}")
+                try:
+                    readable, _, _ = select.select([connection], [], [], min(WAIT_INTERVAL, remaining))
+                except OSError as exc:
+                    raise ReplayError(f"replay response failed: {socket_path}: {exc}") from exc
+                if not readable:
+                    continue
             try:
                 chunk = connection.recv(65536)
             except TimeoutError as exc:
@@ -116,6 +135,7 @@ def _read_objects(socket_path: Path, payload: dict, *,
                     f"replay response failed: {socket_path}: {exc}") from exc
             if not chunk:
                 break
+            last_activity = time.monotonic()
             data.extend(chunk)
             received += len(chunk)
             if received > RESPONSE_LIMIT:
@@ -140,8 +160,9 @@ def _read_objects(socket_path: Path, payload: dict, *,
         connection.close()
 
 
-def status(socket_path, *, timeout: float = STATUS_TIMEOUT) -> dict:
-    objects = _read_objects(Path(socket_path), {"op": "status"}, timeout=timeout)
+def status(socket_path, *, timeout: float = STATUS_TIMEOUT, operation_check=None) -> dict:
+    objects = _read_objects(Path(socket_path), {"op": "status"}, timeout=timeout,
+                            operation_check=operation_check)
     if len(objects) != 1:
         raise ReplayError("replay status must return exactly one object")
     if "error" in objects[0]:
@@ -227,7 +248,7 @@ def retained_cases(dataset) -> list[dict]:
             or (case.get("capture") or {}).get("same_crash") is True]
 
 
-def validate_dataset(dataset, socket_path) -> tuple[Path, list[dict], dict]:
+def validate_dataset(dataset, socket_path, *, operation_check=None) -> tuple[Path, list[dict], dict]:
     """Bind the live service to the frozen dataset before any predicate runs.
 
     The dataset records the exact mutation run it imported, so a socket from a
@@ -240,7 +261,7 @@ def validate_dataset(dataset, socket_path) -> tuple[Path, list[dict], dict]:
             f"replay socket {actual} is not the dataset's binradar run "
             f"({expected})")
     cases = retained_cases(dataset)
-    info = status(actual)
+    info = status(actual, operation_check=operation_check)
     if info["state"] not in ("ready", "evaluating"):
         raise ReplayError(
             f"replay server is not ready (state={info['state']}); wait for "
@@ -294,7 +315,7 @@ def _validate_done(value: dict) -> dict:
 def _capture(dataset, row: dict, candidate) -> dict | None:
     """Authenticate the native-owned representative, not the caller's selector."""
     from binradar.binradar_taosc_predicates import parse_cached_snapshots
-    from .evaluation import _capture_metadata, _validated_snapshots, _vector
+    from .evaluation import _capture_metadata, _memo, _validated_snapshots, _vector
 
     identity = row.get("capture")
     if row["outcome"] == "unavailable":
@@ -340,9 +361,17 @@ def _capture(dataset, row: dict, candidate) -> dict | None:
             payload = stream.read(64 * 1024 * 1024 + 1)
         if len(payload) != info.st_size or hashlib.sha256(payload).hexdigest() != digest:
             raise ReplayError("replay capture hash mismatch")
-        snapshots, error = parse_cached_snapshots(payload)
-        if error:
-            raise ValueError(error)
+        # Preserve the native-owned path/type/size/hash checks above, then
+        # share these already authenticated bytes and the native parse with
+        # validation, evidence projection and journal preservation.
+        cache_key = (str(path), digest)
+        _memo(dataset, 'record-bytes', cache_key, lambda: payload)
+        def parse():
+            states, error = parse_cached_snapshots(payload)
+            if error:
+                raise ValueError(error)
+            return tuple(states)
+        snapshots = _memo(dataset, 'parsed-brch', digest, parse)
         branches = [state.branch for state in snapshots]
         if not branches or any(branch not in (0, 1) for branch in branches):
             raise ValueError("replay-capture-incomplete-or-trapped")
@@ -354,8 +383,8 @@ def _capture(dataset, row: dict, candidate) -> dict | None:
                    "outcome": {"outcome": row["outcome"]},
                    "same_crash": row["outcome"] == "target-crash"}
         snapshots = _validated_snapshots(dataset, capture, metadata)
-        if _vector(descriptor, snapshots) != branches or \
-                _vector(candidate.descriptor, snapshots) != branches:
+        if _vector(descriptor, snapshots, dataset=dataset) != branches or \
+                _vector(candidate.descriptor, snapshots, dataset=dataset) != branches:
             raise ValueError("replay-capture-vector-mismatch")
         return capture
     except (OSError, ValueError, KeyError, RuntimeError) as exc:
@@ -391,7 +420,8 @@ def _case_result(dataset, row: dict, candidate) -> dict:
 
 
 def _exchange(path: Path, source_predicate: str, *,
-              admission_timeout: float, response_timeout: float) -> list[dict]:
+              admission_timeout: float, response_timeout: float,
+              operation_check=None) -> list[dict]:
     deadline = time.monotonic() + admission_timeout
     request = {"op": "evaluate",
                "patches": [{"id": 1, "predicate": source_predicate}]}
@@ -400,11 +430,14 @@ def _exchange(path: Path, source_predicate: str, *,
         # streamed.  Another host evaluation (for example a debugging
         # ``taosc-llm-evaluate``) may own the snapshot for a while, so retry
         # until this bounded admission deadline.
+        if operation_check is not None:
+            operation_check()
         if time.monotonic() >= deadline:
             raise ReplayError(
                 f"timed out after {admission_timeout:g}s waiting for the "
                 "replay evaluation owner")
-        objects = _read_objects(path, request, timeout=response_timeout)
+        objects = _read_objects(path, request, timeout=response_timeout,
+                                operation_check=operation_check)
         if len(objects) == 1 and objects[0].get("error") == BUSY:
             time.sleep(min(WAIT_INTERVAL, max(0.0, deadline - time.monotonic())))
             continue
@@ -413,18 +446,23 @@ def _exchange(path: Path, source_predicate: str, *,
 
 def evaluate_replay(dataset, candidate, *, socket_path=None,
                     admission_timeout: float = ADMISSION_TIMEOUT,
-                    response_timeout: float = RESPONSE_TIMEOUT) -> dict:
+                    response_timeout: float = RESPONSE_TIMEOUT,
+                    operation_check=None) -> dict:
     """Evaluate one candidate over every retained mutation in the live snapshot."""
-    with dataset.validation() as validated:
+    scope = (dataset.validation() if operation_check is None
+             else dataset.validation(check=operation_check))
+    with scope as validated:
         return _evaluate_replay(validated, candidate, socket_path=socket_path,
                                 admission_timeout=admission_timeout,
-                                response_timeout=response_timeout)
+                                response_timeout=response_timeout,
+                                operation_check=operation_check)
 
 
 def _evaluate_replay(dataset, candidate, *, socket_path, admission_timeout,
-                     response_timeout):
+                     response_timeout, operation_check=None):
     path, cases, _info = validate_dataset(
-        dataset, dataset_socket(dataset) if socket_path is None else socket_path)
+        dataset, dataset_socket(dataset) if socket_path is None else socket_path,
+        operation_check=operation_check)
     if not cases:
         return {
             "cases": [], "status": "unavailable",
@@ -435,10 +473,13 @@ def _evaluate_replay(dataset, candidate, *, socket_path, admission_timeout,
         }
     objects = _exchange(path, candidate.source_predicate,
                         admission_timeout=admission_timeout,
-                        response_timeout=response_timeout)
+                        response_timeout=response_timeout,
+                        operation_check=operation_check)
     rows: list[dict] = []
     terminal: dict | None = None
     for value in objects:
+        if operation_check is not None:
+            operation_check()
         if "error" in value:
             if rows:
                 raise ReplayError(
@@ -465,8 +506,11 @@ def _evaluate_replay(dataset, candidate, *, socket_path, admission_timeout,
             terminal["unavailable"] != sum(row["outcome"] == "unavailable" for row in rows):
         raise ReplayError("replay terminal counts disagree with streamed cases")
     by_mutation = {row["mutation"]: row for row in rows}
-    results = [_case_result(dataset, by_mutation[int(case["id"].split(":", 1)[1])], candidate)
-               for case in cases]
+    results = []
+    for case in cases:
+        if operation_check is not None:
+            operation_check()
+        results.append(_case_result(dataset, by_mutation[int(case["id"].split(":", 1)[1])], candidate))
     counts = {status: sum(item["status"] == status for item in results)
               for status in ("reject_same_crash", "not_rejected", "unavailable")}
     status = ("reject_same_crash" if counts["reject_same_crash"] else

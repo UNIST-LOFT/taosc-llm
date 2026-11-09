@@ -61,6 +61,9 @@ class FiniteExecution:
     def checkpoint_budget(self):
         pass
 
+    def check_operation(self):
+        pass
+
     def check(self):
         if self.evaluations >= self.limits.max_evaluations:
             raise SearchStopped("evaluation-budget-reached")

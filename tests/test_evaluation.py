@@ -10,7 +10,7 @@ import pytest
 
 from binradar.binradar_taosc_predicates import (
     CACHED_SNAPSHOT_HEADER, CACHED_SNAPSHOT_MAGIC, CACHED_SNAPSHOT_VERSION,
-    CACHED_SNAPSHOT_REGS,
+    CACHED_SNAPSHOT_REGS, CACHED_SNAPSHOT_CLAMPS, CACHED_SNAPSHOT_FLAG_CWE805,
 )
 from taosc_llm import evaluation
 from taosc_llm.execution import sha256
@@ -49,7 +49,9 @@ class Dataset:
                 raise ValueError('fixture artifact mismatch')
 
     @contextmanager
-    def validation(self):
+    def validation(self, *, check=None):
+        if check is not None:
+            check()
         self.verify_artifacts()
         yield self
 
@@ -60,13 +62,18 @@ class Dataset:
         return next(row for row in self.rows if row['id'] == case_id)
 
 
-def capture(dataset, *, values=(0,), branches=(0,), descriptor='p0', normal=False, same=None):
+def capture(dataset, *, values=(0,), branches=(0,), descriptor='p0', normal=False, same=None,
+            cwe=False):
     raw = b''
     for value, branch in zip(values, branches):
         registers = [0] * 16
         # BinRadar register layout uses rax at index 0.
         registers[0] = value
-        raw += CACHED_SNAPSHOT_HEADER.pack(CACHED_SNAPSHOT_MAGIC, CACHED_SNAPSHOT_VERSION, 0, branch, 0, 0)
+        flags = CACHED_SNAPSHOT_FLAG_CWE805 if cwe else 0
+        raw += CACHED_SNAPSHOT_HEADER.pack(CACHED_SNAPSHOT_MAGIC, CACHED_SNAPSHOT_VERSION, 0, branch, 0, flags)
+        if cwe:
+            clamps = [(100, 200)] + [(0, 0)] * 255
+            raw += CACHED_SNAPSHOT_CLAMPS.pack(*(cell for clamp in clamps for cell in clamp))
         raw += CACHED_SNAPSHOT_REGS.pack(*registers)
     digest = hashlib.sha256(raw).hexdigest()
     path = dataset.root / (digest + '.brch')
@@ -362,3 +369,219 @@ def test_warm_is_explicit_neutral_descriptor(dataset, tmp_path, monkeypatch):
     assert calls == ['p0']
     assert result['predicate'] is None
     assert result['verified'] is False
+
+
+def representative_scenario(dataset, cwe):
+    from taosc_llm.family import parse_candidate
+    pointer = 's->rax >= i->begin && s->rax < i->end'
+    dataset.patch_format = 'ERM CWE-805' if cwe else 'ERM generic'
+    expressions = ((pointer, f'({pointer}) || ({pointer})', '1 * s->rax < i->end - i->begin')
+                   if cwe else ('rax != 0', 'rax > 0', 'rax == 0'))
+    values = (99, 100, 99) if cwe else (1, 0, 1)
+    candidates = [parse_candidate(dataset.patch_format, expression) for expression in expressions]
+    dataset.rows[0]['capture'] = capture(dataset, values=values, branches=(0, 0, 0), cwe=cwe)
+    return expressions, candidates, values
+
+
+@pytest.mark.parametrize('cwe', [False, True])
+def test_durable_nonneutral_representative_reuses_different_descriptor(dataset, tmp_path, monkeypatch, cwe):
+    expressions, candidates, values = representative_scenario(dataset, cwe)
+    actual = {candidates[0].descriptor: (1, 0, 1), candidates[2].descriptor: (0, 1, 0)}
+    executions = []
+    def run(ds, case, descriptor, directory):
+        executions.append(descriptor)
+        return capture(ds, values=values, branches=actual[descriptor], descriptor=descriptor,
+                       normal=True, cwe=cwe)
+    monkeypatch.setattr(evaluation, 'execute_capture', run)
+    cache = tmp_path / 'cache'
+    first = evaluation.evaluate_dataset(dataset, expressions[0], cache_dir=cache)
+    assert first['cases'][0]['source'] == 'executed'
+    assert first['cases'][0]['branches'] == [1, 0, 1]
+    # A separate API operation must discover the real A capture through the
+    # durable pool; B has no exact record and differs from the neutral vector.
+    second = evaluation.evaluate_dataset(dataset, expressions[1], execute=False, cache_dir=cache)
+    row = second['cases'][0]
+    assert row['status'] == 'not_rejected'
+    assert row['source'] == 'cache'
+    assert row['reuse'] == 'full-vector-equivalent'
+    assert row['capture']['descriptor'] == candidates[0].descriptor
+    assert row['report']['candidate']['capture']['total_hits'] == 3
+    third = evaluation.evaluate_dataset(dataset, expressions[2], cache_dir=cache)
+    assert third['cases'][0]['source'] == 'executed'
+    assert third['cases'][0]['branches'] == [0, 1, 0]
+    assert executions == [candidates[0].descriptor, candidates[2].descriptor]
+
+
+@pytest.mark.parametrize('cwe', [False, True])
+def test_parallel_equivalent_descriptors_share_real_representative(dataset, tmp_path, monkeypatch, cwe):
+    expressions, candidates, values = representative_scenario(dataset, cwe)
+    gate = threading.Barrier(2)
+    executions = []
+    def run(ds, case, descriptor, directory):
+        executions.append(descriptor)
+        time.sleep(0.03)
+        return capture(ds, values=values, branches=(1, 0, 1), descriptor=descriptor,
+                       normal=True, cwe=cwe)
+    monkeypatch.setattr(evaluation, 'execute_capture', run)
+    def evaluate(expression):
+        gate.wait(timeout=5)
+        return evaluation.evaluate_dataset(dataset, expression, cache_dir=tmp_path / 'cache')
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        results = list(workers.map(evaluate, expressions[:2]))
+    assert len(executions) == 1
+    assert all(result['cases'][0]['status'] == 'not_rejected' for result in results)
+    assert {result['cases'][0]['source'] for result in results} == {'executed', 'cache'}
+    assert all(result['cases'][0]['capture']['descriptor'] == executions[0] for result in results)
+
+
+@pytest.mark.parametrize('change', ['dataset', 'input', 'case', 'source', 'observation',
+                                    'environment', 'oracle', 'runtime', 'evaluator'])
+def test_representative_pool_retains_every_non_descriptor_identity(dataset, tmp_path, monkeypatch, change):
+    expressions, candidates, values = representative_scenario(dataset, False)
+    monkeypatch.setattr(evaluation, 'execute_capture', lambda ds, case, descriptor, directory:
+                        capture(ds, values=values, branches=(1, 0, 1), descriptor=descriptor, normal=True))
+    cache = tmp_path / 'cache'
+    assert evaluation.evaluate_dataset(dataset, expressions[0], cache_dir=cache)['status'] == 'not_rejected'
+    if change == 'dataset':
+        dataset.dataset_id = 'other-dataset'
+    elif change == 'input':
+        dataset.rows[0]['input_sha256'] = 'f' * 64
+    elif change == 'case':
+        dataset.rows[0]['id'] = 'system:9'
+    elif change == 'source':
+        dataset.rows[0]['source'] = {'filename': 'other-input'}
+    elif change == 'observation':
+        dataset.rows[0]['observation'] = {'exit': 'ok'}
+    elif change == 'environment':
+        monkeypatch.setattr(dataset, 'execution_environment', lambda: {'BINARY': 'harmless', 'TEST_CMD': 'changed'})
+    elif change == 'oracle':
+        dataset.manifest['oracles']['concrete_reference'] = 44
+    elif change == 'runtime':
+        monkeypatch.setattr(evaluation, 'execution_identity', lambda: {'qemu': 'other', 'oracle': 'qasan-main-v2'})
+    else:
+        original_sha256 = evaluation.sha256
+        monkeypatch.setattr(evaluation, 'sha256', lambda path:
+                            'e' * 64 if Path(path) == Path(evaluation.__file__) else original_sha256(path))
+    second = evaluation.evaluate_dataset(dataset, expressions[1], execute=False, cache_dir=cache)
+    assert second['status'] == 'unavailable'
+    assert second['cases'][0]['branches'] is None
+
+
+@pytest.mark.parametrize('damage', ['bytes', 'partial', 'selector', 'mirror', 'sidecar', 'index', 'record', 'metadata'])
+def test_damaged_durable_representative_never_becomes_success(dataset, tmp_path, monkeypatch, damage):
+    import json
+    expressions, candidates, values = representative_scenario(dataset, False)
+    monkeypatch.setattr(evaluation, 'execute_capture', lambda ds, case, descriptor, directory:
+                        capture(ds, values=values, branches=(1, 0, 1), descriptor=descriptor, normal=True))
+    cache = tmp_path / 'cache'
+    first = evaluation.evaluate_dataset(dataset, expressions[0], cache_dir=cache)
+    saved = first['cases'][0]['capture']
+    root = cache / 'evaluation-v2' / evaluation._digest(dataset.dataset_id)
+    index_path = next(root.glob('*.representatives.json'))
+    index = json.loads(index_path.read_text())
+    identity = {**index['identity'], 'descriptor': candidates[0].descriptor}
+    record_path = root / (evaluation._digest(identity) + '.json')
+    record = json.loads(record_path.read_text())
+    if damage == 'bytes':
+        Path(saved['path']).write_bytes(b'corrupt')
+    elif damage == 'partial':
+        raw = Path(saved['path']).read_bytes()[:-1]
+        Path(saved['path']).write_bytes(raw)
+        record['capture']['sha256'] = hashlib.sha256(raw).hexdigest()
+    elif damage == 'selector':
+        record['capture']['patch_id'] = 27
+    elif damage == 'mirror':
+        record['capture']['descriptor'] = 'p0'
+    elif damage == 'sidecar':
+        sidecar = tmp_path / 'sidecar.sbsv'
+        sidecar.write_text('changed')
+        record['capture']['sidecar'] = {'path': str(sidecar), 'sha256': '0' * 64}
+    elif damage == 'index':
+        index['descriptors'].append(None)
+        index_path.write_text(json.dumps(index))
+    elif damage == 'metadata':
+        record['capture']['outcome']['fault_addr'] = 999
+    else:
+        record = {'identity': identity, 'capture': []}
+    if damage != 'metadata' and isinstance(record.get('capture'), dict):
+        record['capture_digest'] = evaluation._digest(record['capture'])
+    record_path.write_text(json.dumps(record))
+    second = evaluation.evaluate_dataset(dataset, expressions[1], execute=False, cache_dir=cache)
+    assert second['status'] == 'unavailable'
+    assert second['cases'][0]['branches'] is None
+
+
+@pytest.mark.parametrize('cwe', [False, True])
+@pytest.mark.parametrize('state', ['trap', 'timeout', 'incomplete'])
+def test_unusable_real_execution_is_not_published_as_representative(dataset, tmp_path, monkeypatch, cwe, state):
+    from taosc_llm.family import parse_candidate
+    expressions, candidates, values = representative_scenario(dataset, cwe)
+    branches = (1, 0, 1)
+    if state == 'trap':
+        atom = '8 * s->rax < i->end - i->begin' if cwe else 'rax / 0'
+        expressions = (atom, f'({atom}) || ({atom})')
+        candidates = [parse_candidate(dataset.patch_format, expression) for expression in expressions]
+        values = ((1 << 64) - 1,) if cwe else (1,)
+        branches = (2,)
+        dataset.rows[0]['capture'] = capture(dataset, values=values, branches=(0,), cwe=cwe)
+    def run(ds, case, descriptor, directory):
+        result = capture(ds, values=values, branches=branches, descriptor=descriptor, normal=True, cwe=cwe)
+        if state == 'timeout':
+            result['outcome']['outcome'] = 'timeout'
+        elif state == 'incomplete':
+            result['complete'] = False
+        return result
+    monkeypatch.setattr(evaluation, 'execute_capture', run)
+    cache = tmp_path / 'cache'
+    first = evaluation.evaluate_dataset(dataset, expressions[0], cache_dir=cache)
+    assert first['status'] == 'unavailable'
+    assert first['cases'][0]['source'] == 'executed'
+    second = evaluation.evaluate_dataset(dataset, expressions[1], execute=False, cache_dir=cache)
+    assert second['status'] == 'unavailable'
+    assert second['cases'][0]['branches'] is None
+    root = cache / 'evaluation-v2' / evaluation._digest(dataset.dataset_id)
+    assert not list(root.glob('*.representatives.json'))
+
+
+def test_operation_stop_propagates_and_prevents_remaining_concrete_cases(dataset, tmp_path, monkeypatch):
+    class SearchStopped(RuntimeError):
+        pass
+    stopped = threading.Event()
+    executions = []
+    dataset.rows += [{**dataset.rows[0], 'id': f'system:{index}'} for index in range(1, 20)]
+    def check():
+        if stopped.is_set():
+            raise SearchStopped('cancelled')
+    def run(ds, case, descriptor, directory):
+        executions.append((case['id'], descriptor))
+        stopped.set()
+        return capture(ds, descriptor=descriptor)
+    monkeypatch.setattr(evaluation, 'execute_capture', run)
+    cache = tmp_path / 'cache'
+    with pytest.raises(SearchStopped, match='cancelled'):
+        evaluation.evaluate_dataset(dataset, '1', workers=1, cache_dir=cache, operation_check=check)
+    assert executions == [('system:0', 'p0')]
+    root = cache / 'evaluation-v2' / evaluation._digest(dataset.dataset_id)
+    assert not list(root.glob('*.result.json'))
+
+
+def test_operation_stop_interrupts_contended_pool_lock_without_releasing_owner(tmp_path):
+    class SearchStopped(RuntimeError):
+        pass
+    path = tmp_path / 'pool.lock'
+    checks = 0
+    def check():
+        nonlocal checks
+        checks += 1
+        if checks > 1:
+            raise SearchStopped('cancelled while waiting')
+    with evaluation._lock(path):
+        with pytest.raises(SearchStopped, match='while waiting'):
+            with evaluation._lock(path, operation_check=check):
+                pytest.fail('contended cancelled operation acquired lock')
+        # The interrupted waiter must not unlock the original owner's flock.
+        with path.open('a') as contender:
+            with pytest.raises(BlockingIOError):
+                evaluation.fcntl.flock(contender, evaluation.fcntl.LOCK_EX | evaluation.fcntl.LOCK_NB)
+    with evaluation._lock(path, operation_check=lambda: None):
+        assert path.is_file()

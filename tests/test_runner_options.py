@@ -99,6 +99,15 @@ def test_normalization_preserves_lexical_symlink_parents(tmp_path, monkeypatch):
     ["--resume", "--output", "result", "--mode", "provider", "--provider-env", "provider.env"],
     ["--timeout", "1"], ["--no-llm"], ["--skip-concrete"], ["--only-concrete"], ["--outdir", "out"],
     ["--sub", "subject"],
+    ["--binradar-representative-budget", "-1"],
+    ["--binradar-representative-budget", "2147483648"],
+    ["--binradar-representative-budget", "1", "--dataset", "data"],
+    ["--binradar-representative-budget", "1", "--binradar-run", "mutation"],
+    ["--binradar-representative-budget", "1", "--concrete-only"],
+    ["--forkserver-child-timeout", "0"],
+    ["--forkserver-child-timeout", "10", "--dataset", "data"],
+    ["--forkserver-child-timeout", "10", "--concrete-only", "--concrete-run", "concrete"],
+    ["--concrete-timeout", "-1"],
 ])
 def test_invalid_combinations_do_not_create_output(tmp_path, monkeypatch, argv):
     monkeypatch.chdir(tmp_path)

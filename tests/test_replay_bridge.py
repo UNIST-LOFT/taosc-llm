@@ -825,3 +825,49 @@ def test_host_cache_dir_is_shared_by_tool_and_cli(dataset, run_dir, tmp_path):
     assert context.cache_dir == shared
     assert context.replay_socket is None
     assert str(shared) not in context.initial_prompt()
+
+
+def test_operation_stop_interrupts_stalled_replay_without_partial_success_or_shutdown():
+    from concurrent.futures import ThreadPoolExecutor
+    class SearchStopped(RuntimeError):
+        pass
+    streamed = threading.Event()
+    disconnected = threading.Event()
+    status_value = {'state': 'ready', 'generation_stop': 'exhausted',
+                    'remaining_plans': 0, 'retained_mutations': 2}
+    with tempfile.TemporaryDirectory(prefix='br-cancel-', dir='/tmp') as directory:
+        endpoint = Path(directory) / 'replay.sock'
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            listener.bind(str(endpoint))
+            listener.listen(2)
+            listener.settimeout(5)
+            def peer():
+                connection, _ = listener.accept()
+                with connection:
+                    connection.settimeout(5)
+                    assert json.loads(connection.recv(4096))['op'] == 'evaluate'
+                    # A valid-looking prefix is still not a completed batch.
+                    connection.sendall(b'{"mutation":2,"patch":1}\n')
+                    streamed.set()
+                    try:
+                        assert connection.recv(4096) == b''
+                    except ConnectionResetError:
+                        pass
+                    disconnected.set()
+                # A disconnected cancelled request does not stop the resident.
+                connection, _ = listener.accept()
+                with connection:
+                    connection.settimeout(5)
+                    assert json.loads(connection.recv(4096)) == {'op': 'status'}
+                    connection.sendall(json.dumps(status_value).encode() + b'\n')
+            def check():
+                if streamed.is_set():
+                    raise SearchStopped('cancelled')
+            with ThreadPoolExecutor(max_workers=1) as workers:
+                future = workers.submit(peer)
+                with pytest.raises(SearchStopped, match='cancelled'):
+                    replay._read_objects(endpoint, {'op': 'evaluate'}, timeout=10,
+                                         operation_check=check)
+                assert disconnected.wait(5)
+                assert replay.status(endpoint) == status_value
+                future.result(timeout=5)

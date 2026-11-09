@@ -47,6 +47,18 @@ def bound_path(root: Path, relative: str) -> Path:
     return path
 
 
+def _capture_selector(capture: dict) -> int:
+    branches = capture.get("branches")
+    if (not isinstance(branches, list)
+            or any(type(branch) is not int or branch not in (0, 1, 2) for branch in branches)):
+        raise ValueError("capture-vector-invalid")
+    selector = capture.get("patch_id", capture.get("capture_id", 0))
+    if (type(selector) is not int or not -1 <= selector <= 0xffffffff
+            or (selector == -1 and branches)):
+        raise ValueError("capture-id-invalid")
+    return selector
+
+
 @dataclass(frozen=True)
 class PreparedDataset:
     root: Path
@@ -82,16 +94,20 @@ class PreparedDataset:
         return path
 
     @contextmanager
-    def validation(self):
+    def validation(self, *, check=None):
         """Authenticate one operation; never retain trust on the source dataset.
 
         The yielded view may be shared with read-only workers which finish before
         this context exits. Nested scopes on that view reuse its validation.
         """
+        if check is not None:
+            check()
         validated = _ValidatedDataset(self)
         try:
-            validated._validate_all()
+            validated._validate_all(check=check)
             validated.execution_environment()
+            if check is not None:
+                check()
             yield validated
         finally:
             validated._expire()
@@ -100,18 +116,20 @@ class PreparedDataset:
         with self.validation():
             pass
 
-    def _validate_all(self) -> None:
+    def _validate_all(self, *, check=None) -> None:
         identity = dict(self.manifest)
         identity.pop("dataset_id", None)
         if hashlib.sha256(canonical(identity)).hexdigest() != self.dataset_id:
             raise ValueError("dataset manifest identity mismatch")
-        for record in self.manifest["artifacts"].values():
-            self._verify(record)
-        for record in self.manifest["analysis"]:
+        for record in (*self.manifest["artifacts"].values(), *self.manifest["analysis"]):
+            if check is not None:
+                check()
             self._verify(record)
         self._verify(self.manifest["cases"])
         seen = set()
         for case in self.cases():
+            if check is not None:
+                check()
             if case["id"] in seen or case["domain"] not in ("system", "function"):
                 raise ValueError("duplicate or invalid case")
             seen.add(case["id"])
@@ -143,12 +161,10 @@ class PreparedDataset:
             raise ValueError("incomplete capture")
         if capture.get("artifact_sha256") != self.manifest["artifacts"][self.binary + ".brcached"]["sha256"]:
             raise ValueError("capture artifact identity mismatch")
-        path = self._verify(capture)
-        if "sidecar" in capture:
-            self._verify(capture["sidecar"])
-        snapshots, error = predicates.parse_cached_snapshots(path.read_bytes())
-        if error or [item.branch for item in snapshots] != capture.get("branches"):
-            raise ValueError(error or "capture branch vector mismatch")
+        selector = _capture_selector(capture)
+        snapshots = self._parsed_capture(capture)
+        if [item.branch for item in snapshots] != capture.get("branches"):
+            raise ValueError("capture branch vector mismatch")
         cwe805 = self.patch_format == "ERM CWE-805"
         stack = int(self.execution_environment().get("BRCACHE_STACK_SIZE", "0"), 0)
         if any(item.is_CWE805 != cwe805 or len(item.stack) != (stack if cwe805 else 0)
@@ -156,12 +172,50 @@ class PreparedDataset:
             raise ValueError("capture family/stack mismatch")
         if not isinstance(capture.get("descriptor"), str) or not capture["descriptor"]:
             raise ValueError("capture descriptor unavailable")
-        descriptor = predicates.parse_predicate_descriptor(capture["descriptor"])
+        descriptor = self._memo("descriptor", capture["descriptor"],
+                                lambda: predicates.parse_predicate_descriptor(capture["descriptor"]))
         if capture["descriptor"] != "p0" and isinstance(descriptor, str) == cwe805:
             raise ValueError("capture descriptor family mismatch")
-        if "patch_id" in capture and any(item.patch_id != capture["patch_id"] for item in snapshots):
+        if any(item.patch_id != selector for item in snapshots):
             raise ValueError("capture selector identity mismatch")
-        return snapshots
+        return list(snapshots)
+
+    def _memo(self, namespace, key, factory):
+        # Raw datasets retain no trust or derived state between operations.
+        return factory()
+
+    def _capture_payload(self, capture: dict) -> bytes:
+        def read_record(record):
+            path = Path(record["path"])
+            absolute = path.is_absolute()
+            if not absolute:
+                path = bound_path(self.root, record["path"])
+            raw = path.read_bytes()
+            if hashlib.sha256(raw).hexdigest() != record["sha256"]:
+                raise ValueError("capture-hash-mismatch" if absolute
+                                 else f"dataset hash mismatch: {record['path']}")
+            return raw
+        if "sidecar" in capture:
+            read_record(capture["sidecar"])
+        return read_record(capture)
+
+    def _parsed_capture(self, capture: dict) -> tuple[predicates.CachedSnapshot, ...]:
+        # Parsing is context-free, but every referenced path and sidecar must
+        # authenticate before content-addressed parse reuse is allowed.
+        raw = self._capture_payload(capture)
+        def parse():
+            snapshots, error = predicates.parse_cached_snapshots(raw)
+            if error:
+                raise ValueError(error)
+            return tuple(snapshots)
+        return self._memo("parsed-brch", capture["sha256"], parse)
+
+    def capture_bytes(self, capture: dict) -> bytes:
+        """Return bytes only after the complete capture binding is authenticated."""
+        from .evaluation import _snapshots
+        with self.validation() as validated:
+            _snapshots(validated, capture)
+            return validated._capture_payload(capture)
 
     def execution_environment(self) -> dict[str, str]:
         allowed = {"BINARY", "TEST_CMD", "POC_INPUT", "POC_DIR", "MEMCHECK", "PATCH_LOC", "PATCH_DEST",
@@ -219,6 +273,7 @@ class _ValidatedDataset(PreparedDataset):
         object.__setattr__(self, "_rows", None)
         object.__setattr__(self, "_case_index", {})
         object.__setattr__(self, "_captures", {})
+        object.__setattr__(self, "_operation_cache", {})
         object.__setattr__(self, "_environment", None)
 
     def __getattribute__(self, name):
@@ -237,14 +292,49 @@ class _ValidatedDataset(PreparedDataset):
             self._verified.clear()
             self._case_index.clear()
             self._captures.clear()
+            self._operation_cache.clear()
             object.__setattr__(self, "_rows", None)
             object.__setattr__(self, "_environment", None)
             object.__setattr__(self, "manifest", {})
 
     @contextmanager
-    def validation(self):
+    def validation(self, *, check=None):
         self._ensure_active()
+        if check is not None:
+            check()
         yield self
+
+    def _memo(self, namespace, key, factory):
+        """Share immutable derived values only within this authenticated operation."""
+        with self._lock:
+            self._ensure_active()
+            cache = self._operation_cache.setdefault(namespace, {})
+            if key not in cache:
+                cache[key] = factory()
+            return cache[key]
+
+    def _capture_payload(self, capture: dict) -> bytes:
+        # Authenticate sidecars independently even when BRCH bytes are shared.
+        sidecar = capture.get("sidecar")
+        if sidecar is not None:
+            self._record_bytes(sidecar)
+        return self._record_bytes(capture)
+
+    def _record_bytes(self, record: dict) -> bytes:
+        key = (record["path"], record["sha256"])
+        def load():
+            path = Path(record["path"])
+            absolute = path.is_absolute()
+            if not absolute:
+                path = self._path(record["path"])
+            raw = path.read_bytes()
+            if hashlib.sha256(raw).hexdigest() != record["sha256"]:
+                raise ValueError("capture-hash-mismatch" if absolute
+                                 else f"dataset hash mismatch: {record['path']}")
+            if not absolute:
+                self._verified[key] = path
+            return raw
+        return self._memo("record-bytes", key, load)
 
     def _path(self, relative):
         self._ensure_active()

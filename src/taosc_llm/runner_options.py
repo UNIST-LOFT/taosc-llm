@@ -90,8 +90,16 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--execution-workers", type=_positive_int, default=4)
     parser.add_argument("--generation-timeout", type=int, default=7200,
                         help="native per-phase seconds; 0 means unlimited")
-    for name in ("ready-timeout", "stage-timeout"):
-        parser.add_argument(f"--{name}", type=_seconds, default=7200.0)
+    parser.add_argument("--forkserver-child-timeout", type=_positive_int,
+                        help="native per-child cap; omitted: subject configuration/default")
+    parser.add_argument("--binradar-representative-budget", type=int,
+                        help="native mutation generation representative cap; 0 means unlimited")
+    parser.add_argument("--ready-timeout", type=_seconds, default=0.0,
+                        help="optional wall cap waiting for replay readiness; 0: native budgets only (default)")
+    parser.add_argument("--concrete-timeout", type=_seconds, default=0.0,
+                        help="optional concrete wall cap from launch, including PROBE and minimizer drain; default 0")
+    parser.add_argument("--stage-timeout", type=_seconds, default=0.0,
+                        help="optional setup/dataset/warm/synthesis wall cap; default 0, independent of generation")
     parser.add_argument("--graceful-timeout", type=_positive_seconds, default=10.0)
     parser.add_argument("--search-timeout", type=_positive_seconds)
     limits = SearchLimits()
@@ -128,6 +136,14 @@ def parse_args(argv=None) -> argparse.Namespace:
         parser.error("--execution-workers must be between 1 and 32")
     if args.generation_timeout < 0:
         parser.error("--generation-timeout must be nonnegative whole seconds")
+    if args.binradar_representative_budget is not None:
+        if not 0 <= args.binradar_representative_budget <= 2147483647:
+            parser.error("--binradar-representative-budget must be in 0..2147483647")
+        if args.concrete_only or args.binradar_run is not None or args.dataset is not None or args.resume:
+            parser.error("--binradar-representative-budget requires owned mutation generation")
+    if args.forkserver_child_timeout is not None and (args.dataset is not None or args.resume
+            or (args.concrete_run is not None and (args.concrete_only or args.binradar_run is not None))):
+        parser.error("--forkserver-child-timeout requires owned generation")
     if max(args.analysis_timeout, args.analysis_query_timeout) > 2147483:
         parser.error("analysis timeouts must not exceed 2147483 seconds")
     if args.run_id == "l" and not args.resume:

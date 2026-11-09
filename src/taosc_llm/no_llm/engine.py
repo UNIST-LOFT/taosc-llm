@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 
+from ..dataset import canonical
 from ..family import parse_candidate
 from .model import SearchStopped
 from .score import Population, Score, improves, new_owners, preserves
@@ -44,7 +45,8 @@ class SearchEngine:
         if references:
             loaded = {}
             for case, reference in references.items():
-                key = reference["sha256"]
+                backend.check_operation()
+                key = canonical(reference)
                 if key not in loaded:
                     loaded[key] = backend.snapshots(backend.load(reference))
                 if case not in loaded[key]:
@@ -52,7 +54,7 @@ class SearchEngine:
                 snapshots[case] = loaded[key][case]
         else:
             references.update({case: backend.baseline_ref for case in snapshots})
-        self.space = Space(self.family, snapshots, self.limits)
+        self.space = Space(self.family, snapshots, self.limits, check=backend.check_operation)
         if self.state["atoms"]:
             if set(self.state["atoms"]) != set(self.space.atoms):
                 raise ValueError("checkpoint atom corpus mismatch")
@@ -134,18 +136,27 @@ class SearchEngine:
         jump flags. One complete actual hit with prefix=0 and composed=1 is the
         marginal witness; real paired outcomes establish the case contribution.
         """
-        from binradar.binradar_taosc_predicates import evaluate_cached_predicate
+        from binradar.binradar_taosc_predicates import evaluate_cached_predicate, prepare_generic_environments
         prefix_source = compose(self.family, prefix)
         prefix_parsed = parse_candidate(self.family, prefix_source).parsed if prefix_source is not None else None
         full = parse_candidate(self.family, compose(self.family, prefix + (tuple(factors),))).parsed
         captures = self.backend.snapshots(result)
-        witnesses = {}
+        witnesses, evaluated = {}, {}
         for key in owners:
-            states = captures.get(key, [])
-            prior = evaluate_cached_predicate(prefix_parsed, states) if prefix_parsed is not None else [0] * len(states)
-            branches = evaluate_cached_predicate(full, states)
-            index = next((index for index, (old, new, state) in enumerate(zip(prior, branches, states))
-                          if old == 0 and new == 1 and state.branch == 1), None)
+            self.backend.check_operation()
+            states = captures.get(key, ())
+            if not states:
+                return None
+            if id(states) not in evaluated:
+                environments = prepare_generic_environments(states)
+                prior = (evaluate_cached_predicate(prefix_parsed, states, environments)
+                         if prefix_parsed is not None else [0] * len(states))
+                branches = evaluate_cached_predicate(full, states, environments)
+                self.backend.check_operation()
+                evaluated[id(states)] = next((index for index, (old, new, state)
+                                              in enumerate(zip(prior, branches, states))
+                                              if old == 0 and new == 1 and state.branch == 1), None)
+            index = evaluated[id(states)]
             if index is None:
                 return None
             witnesses[key] = {"hit": index, "prefix_branch": 0, "branch": 1}
@@ -227,6 +238,9 @@ class SearchEngine:
         self._save()
 
     def _accept_introduction(self, best):
+        current = self.backend.load(best["evaluation"])
+        score = Score.from_evaluation(self.population, current)
+        self.backend.check_operation()
         prefix = _clauses(self.state["clauses"])
         self.state["clauses"].append({"id": self.state["revision"] + 1,
                                       "factors": best["factors"], "introduced_factors": best["factors"],
@@ -235,12 +249,13 @@ class SearchEngine:
                                       "owners": best["owners"], "introduction": best["evaluation"],
                                       "witnesses": best["witnesses"]})
         self.state["evaluation"] = best["evaluation"]
-        self.current = self.backend.load(best["evaluation"])
-        self.score = Score.from_evaluation(self.population, self.current)
+        self.current = current
+        self.score = score
         self.state.update(draft=None, blocked=[], revision=self.state["revision"] + 1)
         self._save(commit="introduce")
 
     def _accept_refinement(self, draft, factors, result, reference, local_reference, witnesses):
+        self.backend.check_operation()
         clause = self.state["clauses"][draft["index"]]
         clause["factors"] = list(factors)
         clause["refinement"] = {"evaluation": reference, "local_evaluation": local_reference,

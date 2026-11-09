@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from io import StringIO
 import re
 
 import sbsv
@@ -157,14 +158,14 @@ def _capture(dataset, capture, metadata, descriptor=None):
     try:
         snapshots = _validated_snapshots(dataset, capture, metadata)
         branches = [state.branch for state in snapshots]
-        if _vector(capture['descriptor'], snapshots) != branches:
+        if _vector(capture['descriptor'], snapshots, dataset=dataset) != branches:
             raise ValueError('representative-evaluator-mismatch')
         if descriptor is not None:
-            from binradar.binradar_taosc_predicates import parse_predicate_descriptor
-            parsed = parse_predicate_descriptor(descriptor)
+            from .evaluation import _descriptor
+            parsed = _descriptor(dataset, descriptor)
             if descriptor != 'p0' and isinstance(parsed, str) == metadata.cwe:
                 raise ValueError('candidate-descriptor-family-mismatch')
-            if _vector(descriptor, snapshots) != branches:
+            if _vector(descriptor, snapshots, dataset=dataset) != branches:
                 raise ValueError('candidate-evaluator-mismatch')
         return {'status': 'complete' if branches else 'zero_hits', 'total_hits': len(branches)}, branches
     except (OSError, ValueError, TypeError, KeyError, RuntimeError):
@@ -223,6 +224,20 @@ def mutation_provenance(dataset, case):
 
 
 def _mutation_provenance(dataset, case):
+    from .dataset import canonical
+    from .evaluation import _memo
+    fields = ('kind', 'size', 'value', 'target_extent')
+    def load():
+        result = _read_mutation_provenance(dataset, case)
+        return result['status'], tuple(tuple(write[field] for field in fields)
+                                       for write in result['writes'])
+    status, writes = _memo(dataset, 'mutation-provenance',
+                           (case['id'], case['domain'], canonical(case.get('capture'))), load)
+    return {'status': status, 'writes': [dict(zip(fields, write)) for write in writes],
+            'complete_state': False}
+
+
+def _read_mutation_provenance(dataset, case):
     if case['domain'] != 'function':
         return {'status': 'unavailable', 'writes': [], 'complete_state': False}
     capture = case.get('capture')
@@ -231,11 +246,13 @@ def _mutation_provenance(dataset, case):
         return {'status': 'unavailable', 'writes': [], 'complete_state': False}
     try:
         # The sidecar is frozen together with the prepared case, not candidate state.
-        path = dataset._verify(sidecar)
+        record_bytes = getattr(dataset, '_record_bytes', None)
+        text = (record_bytes(sidecar).decode() if record_bytes is not None
+                else dataset._verify(sidecar).read_text())
         parser = sbsv.parser()
         parser.add_schema(binradar_feedback._FEEDBACK_SCHEMA)
         parser.add_schema(binradar_feedback._MUTATION_SCHEMA)
-        with path.open() as stream:
+        with StringIO(text) as stream:
             header = parser.parse_line_detached(stream.readline())
             if (header is None or header.get_name() != 'binradar-feedback'
                     or header['version'] != 3 or header['iteration'] != int(case['id'].split(':', 1)[1])
@@ -282,9 +299,9 @@ def _offline_prediction(dataset, evaluated, metadata):
     try:
         snapshots = _validated_snapshots(dataset, capture, metadata)
         actual = capture['branches']
-        if _vector(capture['descriptor'], snapshots) != actual:
+        if _vector(capture['descriptor'], snapshots, dataset=dataset) != actual:
             return None
-        branches = _vector(evaluated['descriptor'], snapshots)
+        branches = _vector(evaluated['descriptor'], snapshots, dataset=dataset)
         divergence = next((index for index, (a, b) in enumerate(zip(branches, actual)) if a != b), None)
         if branches != evaluated['offline_branches'] or divergence != evaluated.get('first_divergence'):
             return None

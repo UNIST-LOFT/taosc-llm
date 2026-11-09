@@ -62,14 +62,9 @@ def _round_robin(streams: list[Iterator[str]]) -> Iterator[str]:
         streams = remaining
 
 
-def _constants(snapshots: list[predicates.CachedSnapshot], index: int) -> tuple[str, ...]:
-    # The boundary pool is bounded independently of capture count.  New captures
+def _constants(observed: dict[int, None]) -> tuple[str, ...]:
+    # The boundary pool is bounded independently of capture count. New captures
     # rebuild it; no full-state-equivalent predicate is permanently discarded.
-    observed: dict[int, None] = {}
-    for snapshot in snapshots:
-        observed.setdefault(predicates.wrap64(snapshot.registers[index]), None)
-        if len(observed) >= 24:
-            break
     boundaries = ([min(observed), max(observed), *observed] if observed else [])
     neighbors = [neighbor for value in boundaries for neighbor in (value - 1, value + 1)
                  if _MIN64 <= neighbor <= _MAX64]
@@ -124,12 +119,22 @@ def _binary_operands(constants: tuple[tuple[str, ...], ...], depth: int) -> Iter
             yield f"{operand} {comparison} {target}"
 
 
-def _generic_atoms(snapshots: list[predicates.CachedSnapshot], depth: int) -> Iterator[str]:
-    constants = tuple(_constants(snapshots, index) for index in range(len(_REGISTERS)))
-    varying = tuple(index for index in range(len(_REGISTERS))
-                    if snapshots and any(state.registers[index] != snapshots[0].registers[index]
-                                         for state in snapshots[1:]))
-    fixed = tuple(index for index in range(len(_REGISTERS)) if index not in varying)
+def _generic_atoms(snapshots: list[predicates.CachedSnapshot], depth: int, check=None) -> Iterator[str]:
+    observed: list[dict[int, None]] = [{} for _ in _REGISTERS]
+    varying_set = set()
+    for turn, state in enumerate(snapshots):
+        if check is not None and turn % 256 == 0:
+            check()
+        for index, value in enumerate(state.registers):
+            if len(observed[index]) < 24:
+                observed[index].setdefault(predicates.wrap64(value), None)
+            if value != snapshots[0].registers[index]:
+                varying_set.add(index)
+        if len(varying_set) == len(_REGISTERS) and all(len(pool) == 24 for pool in observed):
+            break
+    constants = tuple(_constants(pool) for pool in observed)
+    varying = tuple(index for index in range(len(_REGISTERS)) if index in varying_set)
+    fixed = tuple(index for index in range(len(_REGISTERS)) if index not in varying_set)
     streams = [_thresholds(constants, varying), _thresholds(constants, fixed), _relations()]
     if depth >= 2:
         streams.extend([_unary_operands(), _binary_operands(constants, 2)])
@@ -169,7 +174,7 @@ def _stack_sizes(extent: int, width: int) -> Iterator[str]:
 
 
 def atoms(patch_format: str, snapshots: list[predicates.CachedSnapshot],
-          limits: SearchLimits) -> tuple[str, ...]:
+          limits: SearchLimits, *, check=None) -> tuple[str, ...]:
     """Generate at most max_atoms valid, deterministic, syntactically distinct atoms.
 
     Generic operand_depth counts leaf operands as 1 (comparison is outside that
@@ -178,18 +183,26 @@ def atoms(patch_format: str, snapshots: list[predicates.CachedSnapshot],
     """
     _family(patch_format)
     cwe = patch_format == "ERM CWE-805"
-    if any(snapshot.is_CWE805 != cwe for snapshot in snapshots):
-        raise ValueError("snapshot family does not match patch-format")
+    extent = None
+    for index, snapshot in enumerate(snapshots):
+        if check is not None and index % 256 == 0:
+            check()
+        if snapshot.is_CWE805 != cwe:
+            raise ValueError("snapshot family does not match patch-format")
+        if cwe:
+            extent = len(snapshot.stack) if extent is None else min(extent, len(snapshot.stack))
     if cwe:
-        extent = min((len(snapshot.stack) for snapshot in snapshots), default=0)
+        extent = extent or 0
         stream = _round_robin([_register_pointers(), _register_sizes(),
                                _stack_pointers(extent),
                                *(_stack_sizes(extent, width) for width in (8, 16, 32))])
     else:
-        stream = _generic_atoms(snapshots, limits.operand_depth)
+        stream = _generic_atoms(snapshots, limits.operand_depth, check)
     result = []
     seen: set[str] = set()
     for expression in stream:
+        if check is not None:
+            check()
         # The parser also enforces runtime source/descriptor/depth bounds.
         candidate = parse_candidate(patch_format, expression)
         if candidate.descriptor in seen:
@@ -211,31 +224,61 @@ class Space:
 
     def __init__(self, patch_format: str,
                  snapshots_by_case: dict[str, list[predicates.CachedSnapshot]],
-                 limits: SearchLimits):
+                 limits: SearchLimits, *, check=None):
         _family(patch_format)
         self.patch_format = patch_format
         self.limits = limits
+        self._check = check
         self._snapshots: dict[str, tuple[predicates.CachedSnapshot, ...]] = {}
-        self._cache: OrderedDict[str, tuple[int, int]] = OrderedDict()
+        self._cache: OrderedDict[str, tuple[bytes, bytes]] = OrderedDict()
         self._cache_limit = max(32, min(4096, limits.max_atoms + limits.beam_width * limits.max_clauses))
         self.atoms: tuple[str, ...] = ()
         self.update(snapshots_by_case)
 
     def update(self, snapshots_by_case: dict[str, list[predicates.CachedSnapshot]]) -> None:
         """Add/replace the supplied cases; invalidate all capture-derived caches."""
-        updated = {**self._snapshots,
-                   **{case: tuple(rows) for case, rows in snapshots_by_case.items()}}
-        flattened = [snapshot for case in sorted(updated) for snapshot in updated[case]]
-        generated = atoms(self.patch_format, flattened, self.limits)
+        updated = dict(self._snapshots)
+        for case, rows in snapshots_by_case.items():
+            if self._check is not None:
+                self._check()
+            updated[case] = tuple(rows)
+        # Authenticated captures share frozen states. Evaluate each state object
+        # once, while retaining every case's complete ordered index vector.
+        flattened, positions, indices, captures = [], {}, {}, {}
+        for case in sorted(updated):
+            if self._check is not None:
+                self._check()
+            rows = updated[case]
+            if id(rows) not in captures:
+                selected = []
+                for turn, state in enumerate(rows):
+                    if self._check is not None and turn % 256 == 0:
+                        self._check()
+                    if id(state) not in positions:
+                        positions[id(state)] = len(flattened)
+                        flattened.append(state)
+                    selected.append(positions[id(state)])
+                captures[id(rows)] = tuple(selected)
+            indices[case] = captures[id(rows)]
+        generated = atoms(self.patch_format, flattened, self.limits, check=self._check)
         available = set(generated)
         # Keep the order of still-proposed atoms stable without keeping stale
         # capture boundaries forever or crowding out new evidence-derived atoms.
         retained = tuple(atom for atom in self.atoms if atom in available)
         retained_set = set(retained)
+        environments = [] if self.patch_format == "ERM generic" else None
+        if environments is not None:
+            for start in range(0, len(flattened), 256):
+                if self._check is not None:
+                    self._check()
+                environments.extend(predicates.prepare_generic_environments(flattened[start:start + 256]))
+        if self._check is not None:
+            self._check()
         self.atoms = retained + tuple(atom for atom in generated if atom not in retained_set)
         self._snapshots = dict(sorted(updated.items()))
+        self._indices = indices
         self._flat = flattened
-        self._environments = predicates.prepare_generic_environments(flattened)
+        self._environments = tuple(environments) if environments is not None else None
         self._cache.clear()
 
     def expression(self, clauses: tuple[Clause, ...]) -> str | None:
@@ -246,35 +289,54 @@ class Space:
         return compose(self.patch_format, clauses)
 
     def predict(self, clauses: tuple[Clause, ...]) -> dict[str, tuple[int, ...]]:
+        if self._check is not None:
+            self._check()
         expression = self.expression(clauses)
-        if not clauses:
-            # The empty program is the actual neutral baseline, not the
-            # internal logical-true draft represented by a single empty clause.
-            return {case: (0,) * len(rows) for case, rows in self._snapshots.items()}
-        if expression is None:
-            # Heuristic only: CWE's unsafe true draft has no source encoding.
-            return {case: (1,) * len(rows) for case, rows in self._snapshots.items()}
+        if not clauses or expression is None:
+            # Empty program is neutral; CWE's unencodable true draft is only a
+            # heuristic, not an executable candidate or outcome assertion.
+            branch = 0 if not clauses else 1
+            result, vectors = {}, {}
+            for case, rows in self._snapshots.items():
+                if self._check is not None:
+                    self._check()
+                if len(rows) not in vectors:
+                    vectors[len(rows)] = (branch,) * len(rows)
+                result[case] = vectors[len(rows)]
+            return result
         candidate = parse_candidate(self.patch_format, expression)
         key = candidate.descriptor
         bits = self._cache.get(key)
         if bits is None:
-            ones = traps = 0
+            ones = bytearray((len(self._flat) + 7) // 8)
+            traps = bytearray(len(ones))
             for index, snapshot in enumerate(self._flat):
+                if self._check is not None and index % 256 == 0:
+                    self._check()
                 environment = self._environments[index] if self._environments is not None else None
                 branch = predicates.evaluate_cached_branch(candidate.parsed, snapshot, environment)
-                ones |= (branch == 1) << index
-                traps |= (branch == 2) << index
-            bits = (ones, traps)
+                if branch == 1:
+                    ones[index // 8] |= 1 << (index % 8)
+                elif branch == 2:
+                    traps[index // 8] |= 1 << (index % 8)
+            bits = (bytes(ones), bytes(traps))
             self._cache[key] = bits
             if len(self._cache) > self._cache_limit:
                 self._cache.popitem(last=False)
         else:
             self._cache.move_to_end(key)
         ones, traps = bits
-        result = {}
-        offset = 0
-        for case, rows in self._snapshots.items():
-            result[case] = tuple(2 if (traps >> index) & 1 else (ones >> index) & 1
-                                 for index in range(offset, offset + len(rows)))
-            offset += len(rows)
+        result, vectors = {}, {}
+        for case, indices in self._indices.items():
+            if self._check is not None:
+                self._check()
+            if id(indices) not in vectors:
+                branches = []
+                for turn, index in enumerate(indices):
+                    if self._check is not None and turn % 256 == 0:
+                        self._check()
+                    bit = 1 << (index % 8)
+                    branches.append(2 if traps[index // 8] & bit else int(bool(ones[index // 8] & bit)))
+                vectors[id(indices)] = tuple(branches)
+            result[case] = vectors[id(indices)]
         return result

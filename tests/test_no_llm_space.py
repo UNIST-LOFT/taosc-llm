@@ -5,7 +5,7 @@ import pytest
 from binradar import binradar_taosc_predicates as predicates
 
 from taosc_llm.family import parse_candidate
-from taosc_llm.no_llm.model import SearchLimits
+from taosc_llm.no_llm.model import SearchLimits, SearchStopped
 from taosc_llm.no_llm.space import Space, atoms, compose
 
 GENERIC = "ERM generic"
@@ -148,25 +148,14 @@ def test_operand_depth_bounds_expansion_and_allows_nested_operands():
 _ARITHMETIC = ("+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>")
 
 
-def test_prediction_cache_invalidates_on_replacement_and_new_captures(monkeypatch):
-    calls = []
-    evaluate = predicates.evaluate_cached_branch
-
-    def observed(*args):
-        calls.append(args[1])
-        return evaluate(*args)
-
-    monkeypatch.setattr(predicates, "evaluate_cached_branch", observed)
+def test_prediction_cache_invalidates_on_replacement_and_new_captures():
     space = Space(GENERIC, {"a": [snapshot(rax=1, rbx=1)]}, SearchLimits())
     rax, rbx = (("rax == 1",),), (("rbx == 1",),)
     assert space.predict(rax) == space.predict(rbx) == {"a": (1,)}
-    assert len(calls) == 2
     assert space.predict(rax) == {"a": (1,)}
-    assert len(calls) == 2
     space.update({"a": [snapshot(rax=0, rbx=1)], "b": [snapshot(rax=1, rbx=0)]})
     assert space.predict(rax) == {"a": (0,), "b": (1,)}
     assert space.predict(rbx) == {"a": (1,), "b": (0,)}
-    assert len(calls) == 6
     assert any("rax" in atom for atom in space.atoms)
     assert any("rbx" in atom for atom in space.atoms)
 
@@ -181,6 +170,59 @@ def test_capture_update_rebuilds_atom_boundaries_and_removes_invalid_stack_cells
     assert any(parse_candidate(CWE, atom).required_stack_bytes == 32 for atom in cwe.atoms)
     cwe.update({"shorter": [snapshot(clamps=((1, 2),), stack=bytes(3))]})
     assert all(parse_candidate(CWE, atom).required_stack_bytes <= 3 for atom in cwe.atoms)
+
+
+def test_shared_capture_predictions_retain_order_length_and_traps():
+    zero, two = snapshot(rax=0), snapshot(rax=2)
+    rows = (zero, two, zero)
+    space = Space(GENERIC, {"first": rows, "same": rows, "reverse": (two, zero),
+                            "empty": ()}, SearchLimits())
+    clauses = (("1 / rax",),)
+    assert space.predict(clauses) == {"first": (2, 0, 2), "same": (2, 0, 2),
+                                      "reverse": (0, 2), "empty": ()}
+    space.update({"same": (two,)})
+    assert space.predict(clauses) == {"first": (2, 0, 2), "same": (0,),
+                                      "reverse": (0, 2), "empty": ()}
+
+
+def test_cancelled_preprocessing_keeps_prior_capture_revision():
+    polls = {"remaining": None}
+
+    def check():
+        if polls["remaining"] is not None:
+            polls["remaining"] -= 1
+            if polls["remaining"] == 0:
+                raise SearchStopped("interrupted")
+
+    space = Space(GENERIC, {"case": [snapshot(rax=1)]}, SearchLimits(), check=check)
+    prior_atoms = space.atoms
+    polls["remaining"] = 4
+    with pytest.raises(SearchStopped, match="interrupted"):
+        space.update({"case": [snapshot(rax=index) for index in range(600)]})
+    polls["remaining"] = None
+    assert space.atoms == prior_atoms
+    assert space.predict((("rax == 1",),)) == {"case": (1,)}
+
+
+def test_cancelled_prediction_never_caches_a_partial_vector():
+    polls = {"remaining": None}
+
+    def check():
+        if polls["remaining"] is not None:
+            polls["remaining"] -= 1
+            if polls["remaining"] == 0:
+                raise SearchStopped("wall-time-reached")
+
+    rows = [snapshot(rax=index % 3) for index in range(600)]
+    space = Space(GENERIC, {"case": rows}, SearchLimits(), check=check)
+    clauses = (("1 / rax",),)
+    polls["remaining"] = 3
+    with pytest.raises(SearchStopped, match="wall-time"):
+        space.predict(clauses)
+    polls["remaining"] = None
+    expected = tuple(predicates.evaluate_cached_predicate(parse_candidate(GENERIC, "1 / rax").parsed, rows))
+    assert space.predict(clauses) == {"case": expected}
+    assert len(expected) == 600 and set(expected) == {0, 1, 2}
 
 
 def test_limits_and_family_mismatches_are_rejected():

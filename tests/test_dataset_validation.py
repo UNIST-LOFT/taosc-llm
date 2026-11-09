@@ -120,7 +120,8 @@ def test_nested_scope_lifetime_and_expiry(dataset, error_exit):
 @pytest.mark.parametrize("field,value", [
     ("descriptor", ""), ("descriptor", "c1p16"),
     ("descriptor", "c1p0"),
-    ("branches", [1]), ("patch_id", 9), ("complete", False),
+    ("branches", [1]), ("branches", [False]), ("branches", None),
+    ("patch_id", 9), ("patch_id", False), ("complete", False),
     ("artifact_sha256", "0" * 64),
 ])
 def test_cached_capture_still_binds_all_metadata(dataset, field, value):
@@ -197,3 +198,85 @@ def test_load_returns_independently_authenticating_unscoped_dataset(dataset):
     with pytest.raises(ValueError, match="hash mismatch"):
         with loaded.validation():
             pytest.fail("loaded dataset retained trust")
+
+
+def test_operation_capture_bytes_and_vectors_do_not_expose_cached_mutability(dataset, tmp_path):
+    from taosc_llm import evaluation
+    from taosc_llm.family import parse_candidate
+    with dataset.validation() as view:
+        relative = view.case('function:2')['capture']
+        raw = view.capture_bytes(relative)
+        absolute_path = tmp_path / 'owned.brch'
+        absolute_path.write_bytes(raw)
+        absolute = {**relative, 'path': str(absolute_path)}
+        states = evaluation._snapshots(view, absolute)
+        assert isinstance(states, tuple)
+        assert view.capture_bytes(absolute) == raw
+        descriptor = parse_candidate(view.patch_format, '1').descriptor
+        branches = evaluation._vector(descriptor, states, dataset=view)
+        assert branches == [1] * len(states)
+        branches.clear()
+        assert evaluation._vector(descriptor, states, dataset=view) == [1] * len(states)
+        assert evaluation._vector('p0', states, dataset=view) == [0] * len(states)
+        changed = {**absolute, 'patch_id': 99}
+        with pytest.raises(ValueError, match='id-mismatch'):
+            evaluation._snapshots(view, changed)
+        assert evaluation._snapshots(view, absolute) == states
+        alternate_path = tmp_path / 'corrupt-alias.brch'
+        alternate_path.write_bytes(b'not the authenticated shared bytes')
+        with pytest.raises(ValueError, match='capture-hash-mismatch'):
+            evaluation._snapshots(view, {**absolute, 'path': str(alternate_path)})
+    absolute_path.write_bytes(b'changed after operation')
+    with dataset.validation() as view:
+        with pytest.raises(ValueError, match='capture-hash-mismatch'):
+            evaluation._snapshots(view, absolute)
+
+
+def test_operation_absolute_sidecar_binding_revalidated_next_scope(dataset, tmp_path):
+    import hashlib
+    from taosc_llm import evaluation
+    with dataset.validation() as view:
+        original = view.case('function:2')['capture']
+        absolute_path = tmp_path / 'owned.brch'
+        absolute_path.write_bytes(view.capture_bytes(original))
+        sidecar_path = tmp_path / 'owned.sbsv'
+        sidecar_path.write_bytes(b'authenticated sidecar')
+        sidecar = {'path': str(sidecar_path), 'sha256': hashlib.sha256(sidecar_path.read_bytes()).hexdigest()}
+        capture = {**original, 'path': str(absolute_path), 'sidecar': sidecar}
+        assert evaluation._snapshots(view, capture)
+        with pytest.raises(ValueError, match='capture-hash-mismatch'):
+            evaluation._snapshots(view, {**capture, 'sidecar': {**sidecar, 'sha256': '0' * 64}})
+    sidecar_path.write_bytes(b'changed sidecar')
+    with dataset.validation() as view:
+        with pytest.raises(ValueError, match='capture-hash-mismatch'):
+            evaluation._snapshots(view, capture)
+
+
+def test_vector_cache_never_reuses_mutated_caller_state_lists(dataset):
+    from taosc_llm import evaluation
+    from taosc_llm.family import parse_candidate
+    with dataset.validation() as view:
+        states = view.snapshots(view.case('function:2')['capture'])
+        descriptor = parse_candidate(view.patch_format, '1').descriptor
+        assert evaluation._vector(descriptor, states, dataset=view) == [1]
+        states.clear()
+        assert evaluation._vector(descriptor, states, dataset=view) == []
+
+
+def test_cooperative_validation_interrupts_and_does_not_retain_trust(dataset):
+    class Cancelled(Exception):
+        pass
+    checks = 0
+    def check():
+        nonlocal checks
+        checks += 1
+        if checks == 3:
+            raise Cancelled()
+    with pytest.raises(Cancelled):
+        with dataset.validation(check=check):
+            pytest.fail('cancelled validation yielded')
+    with dataset.validation() as view:
+        assert view.case('function:2')['capture']['complete'] is True
+        with pytest.raises(Cancelled):
+            with view.validation(check=lambda: (_ for _ in ()).throw(Cancelled())):
+                pytest.fail('cancelled nested operation yielded')

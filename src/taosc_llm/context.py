@@ -113,9 +113,9 @@ class SynthesisContext:
         from .tools import tool_definitions
         return tool_definitions()
 
-    def call_tool(self, name, args):
+    def call_tool(self, name, args, *, operation_check=None):
         from .tools import call_tool
-        return call_tool(self, name, args)
+        return call_tool(self, name, args, operation_check=operation_check)
 
     def validate_proposal(self, value):
         from .tools import validate_proposal

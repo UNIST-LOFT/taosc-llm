@@ -6,7 +6,9 @@ import os
 import re
 import shutil
 import sys
+import time
 import uuid
+from threading import Event
 from importlib.resources import files
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -57,6 +59,15 @@ async def run_adapter(context: SynthesisContext, provider: ProviderConfig,
     # The initial prompt already supplies the frozen model-safe projection.
     inspected = bool(context.projection)
     checked = set()
+    tool_cancelled = Event()
+    tool_deadline = None
+
+    def check_tool_operation():
+        if tool_cancelled.is_set() or (tool_deadline is not None and time.monotonic() >= tool_deadline):
+            # Tool dispatch sanitizes this to a failed tool response. Interrupted
+            # evaluations publish no result; an in-flight native child may drain.
+            raise TimeoutError("host tool operation stopped")
+
     request_id = uuid.uuid4().hex
     read_fd, write_fd = os.pipe()
     key_bytes = json.dumps({"api_key": provider.api_key}).encode()
@@ -145,10 +156,13 @@ async def run_adapter(context: SynthesisContext, provider: ProviderConfig,
                 # One host tool at a time. Cancellation drains native work before
                 # stopping the adapter; the evaluator owns bounded process-group
                 # execution and worker limits.
-                task = asyncio.create_task(asyncio.to_thread(context.call_tool, frame["tool"], frame["arguments"]))
+                task = asyncio.create_task(asyncio.to_thread(
+                    context.call_tool, frame["tool"], frame["arguments"],
+                    operation_check=check_tool_operation))
                 try:
                     result = await asyncio.shield(task)
                 except asyncio.CancelledError:
+                    tool_cancelled.set()
                     await task
                     raise
                 if result.get("ok"):
@@ -192,6 +206,7 @@ async def run_adapter(context: SynthesisContext, provider: ProviderConfig,
             with os.fdopen(write_fd, "wb") as pipe:
                 write_fd = -1
                 pipe.write(key_bytes)
+            tool_deadline = time.monotonic() + provider.timeout_seconds
             await send({**envelope, "type": "start_turn", "request_id": request_id,
                         "provider": provider.public_dict(), "context_id": context.context_id,
                         "system_prompt": context.system_prompt(),

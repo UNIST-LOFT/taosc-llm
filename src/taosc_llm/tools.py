@@ -274,9 +274,11 @@ def _poc_log(context, dataset, args):
     return result
 
 
-def call_tool(context: SynthesisContext, name, args):
+def call_tool(context: SynthesisContext, name, args, *, operation_check=None):
     base = {"context_id": context.context_id}
     try:
+        if operation_check is not None:
+            operation_check()
         definitions = {item["name"]: item for item in tool_definitions()}
         if name not in definitions:
             raise ToolError("out_of_scope", "tool is not allowed")
@@ -285,7 +287,9 @@ def call_tool(context: SynthesisContext, name, args):
         if args.get("context_id") != context.context_id:
             raise ToolError("stale_context", "context ID mismatch")
         _validate(args, definitions[name]["parameters"])
-        with context.dataset.validation() as dataset:
+        scope = (context.dataset.validation() if operation_check is None
+                 else context.dataset.validation(check=operation_check))
+        with scope as dataset:
             if name == "get_patch_context":
                 if args.get("view", "context") == "poc_log":
                     result = _poc_log(context, dataset, args)
@@ -306,7 +310,10 @@ def call_tool(context: SynthesisContext, name, args):
                 candidate = _candidate(dataset, args["predicate"])
                 evaluation = evaluate_dataset(dataset, candidate.expression, workers=context.workers,
                     execute=name == "test_candidate", cache_dir=context.cache_dir or context.run_dir / "cache",
-                    replay_socket=context.replay_socket if name == "test_candidate" else None)
+                    replay_socket=context.replay_socket if name == "test_candidate" else None,
+                    operation_check=operation_check)
+                if operation_check is not None:
+                    operation_check()
                 result_id = context.reference(digest(canonical(evaluation)), kind="r")
                 context._results[result_id] = evaluation
                 result = _result(context, dataset, result_id)
