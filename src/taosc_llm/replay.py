@@ -514,8 +514,7 @@ def _evaluate_replay(dataset, candidate, *, socket_path, admission_timeout,
         results.append(_case_result(dataset, by_mutation[int(case["id"].split(":", 1)[1])], candidate))
     counts = {status: sum(item["status"] == status for item in results)
               for status in ("reject_same_crash", "not_rejected", "unavailable")}
-    status = ("reject_same_crash" if counts["reject_same_crash"] else
-              "unavailable" if counts["unavailable"] else "not_rejected")
+    status = "reject_same_crash" if counts["reject_same_crash"] else "not_rejected"
     return {
         "cases": results,
         "status": status,

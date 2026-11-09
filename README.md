@@ -394,9 +394,13 @@ Stdout contains one JSON result; diagnostics go to stderr. Common CLI exits:
 | 130 | Interrupted; local cleanup does not prove remote provider completion |
 
 `--warm` currently returns the ordinary evaluation status, not a guaranteed
-`warmed` status. Rejection takes precedence over unavailable cases; absent any
-rejection, any unavailable case (or no cases) makes the aggregate unavailable.
-`not_rejected` only means admitted observations did not reject this candidate.
+`warmed` status. A same-target crash takes precedence in the aggregate. Otherwise,
+a nonempty evaluated case set is `not_rejected`, even if some or all cases are
+`unavailable`; only an empty case set remains aggregate `unavailable`. Individual
+case statuses/reasons, unavailable counts and replay coverage remain unchanged.
+`not_rejected` means no observed target rejection, not complete coverage or proof
+that unavailable cases ran successfully. In particular, all-unavailable evidence
+is still incomplete despite an aggregate `not_rejected` / exit 0.
 These are host/CLI statuses. Model tools expose only bounded target-miss/regression
 feedback and a material evidence warning. Full private `report_summary` retains
 actual firing, paired transitions, capture gaps and oracle warnings. Offline

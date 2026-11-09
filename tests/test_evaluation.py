@@ -93,6 +93,39 @@ def dataset(tmp_path, monkeypatch):
     return Dataset(tmp_path)
 
 
+@pytest.mark.parametrize('observations,expected', [
+    (('normal', 'missing'), 'not_rejected'),
+    (('target', 'missing'), 'reject_same_crash'),
+    (('missing', 'missing'), 'not_rejected'),
+    ((), 'unavailable'),
+])
+def test_aggregate_rejection_preserves_case_availability(
+        dataset, tmp_path, observations, expected):
+    original = dataset.rows[0]
+    dataset.rows = [
+        {**original, 'id': f'system:{index}',
+         'capture': None if observation == 'missing' else
+             capture(dataset, normal=observation == 'normal')}
+        for index, observation in enumerate(observations)
+    ]
+    result = evaluation.evaluate_dataset(
+        dataset, 'rax != 0', execute=False, include_poc=False,
+        cache_dir=tmp_path / 'cache')
+    assert result['status'] == expected
+    assert result['verified'] is False
+    assert result['summary'] == {
+        'total': len(observations),
+        'reject_same_crash': observations.count('target'),
+        'not_rejected': observations.count('normal'),
+        'unavailable': observations.count('missing'),
+    }
+    for row, observation in zip(result['cases'], observations):
+        if observation == 'missing':
+            assert row['status'] == 'unavailable'
+            assert row['reason'] == 'capture-unavailable'
+            assert row['branches'] is None
+
+
 def test_complete_equal_vector_reuses_real_same_crash(dataset, tmp_path):
     dataset.rows[0]['capture'] = capture(dataset, values=(0, 0), branches=(0, 0))
     result = evaluation.evaluate_dataset(dataset, 'rax != 0', execute=False, cache_dir=tmp_path / 'cache')
@@ -150,7 +183,8 @@ def test_owned_cache_reused_offline_and_environment_invalidates(dataset, tmp_pat
     assert second['cases'][0]['source'] == 'cache'
     dataset.execution_environment = lambda: {'BINARY': 'harmless', 'TEST_CMD': 'different'}
     third = evaluation.evaluate_dataset(dataset, 'rax != 0', cache_dir=root, execute=False)
-    assert third['status'] == 'unavailable'
+    assert third['status'] == 'not_rejected'
+    assert third['cases'][0]['status'] == 'unavailable'
     assert len(calls) == 1
 
 
@@ -163,7 +197,8 @@ def test_cached_capture_tampering_is_not_hidden_by_earlier_result(dataset, tmp_p
     Path(first['cases'][0]['capture']['path']).write_bytes(b'tampered after evaluation')
     monkeypatch.setattr(evaluation, 'execute_capture', lambda *args: pytest.fail('offline target execution'))
     second = evaluation.evaluate_dataset(dataset, '0', execute=False, cache_dir=cache)
-    assert second['status'] == 'unavailable'
+    assert second['status'] == 'not_rejected'
+    assert second['cases'][0]['status'] == 'unavailable'
     assert second['cases'][0]['reason'] == 'capture-hash-mismatch'
     assert second['cases'][0]['branches'] is None
 
@@ -190,7 +225,8 @@ def test_function_same_crash_offline_only_and_no_divergence_inference(dataset, t
     result = evaluation.evaluate_dataset(dataset, 'rax != 0', cache_dir=tmp_path / 'cache')
     assert result['status'] == 'reject_same_crash'
     result = evaluation.evaluate_dataset(dataset, '1', cache_dir=tmp_path / 'cache')
-    assert result['status'] == 'unavailable'
+    assert result['status'] == 'not_rejected'
+    assert result['cases'][0]['status'] == 'unavailable'
     assert result['cases'][0]['first_divergence'] == 0
 
 
@@ -198,14 +234,16 @@ def test_unavailable_oracle_is_not_rejection_or_success(dataset, tmp_path):
     dataset.rows[0]['capture'] = capture(dataset)
     dataset.rows[0]['capture']['outcome']['oracle'] = 'unavailable'
     result = evaluation.evaluate_dataset(dataset, '0', execute=False, cache_dir=tmp_path / 'cache')
-    assert result['status'] == 'unavailable'
+    assert result['status'] == 'not_rejected'
+    assert result['cases'][0]['status'] == 'unavailable'
     assert result['cases'][0]['reason'] == 'oracle-unavailable'
 
 
 def test_representative_mirror_mismatch_not_reused(dataset, tmp_path):
     dataset.rows[0]['capture'] = capture(dataset, values=(1,), branches=(1,), descriptor='p0')
     result = evaluation.evaluate_dataset(dataset, '1', execute=False, cache_dir=tmp_path / 'cache')
-    assert result['status'] == 'unavailable'
+    assert result['status'] == 'not_rejected'
+    assert result['cases'][0]['status'] == 'unavailable'
     assert result['cases'][0]['reason'] == 'representative-evaluator-mismatch'
 
 
@@ -214,7 +252,8 @@ def test_branch_two_is_unavailable_not_safe_original_branch(dataset, tmp_path):
     candidate = parse_candidate('ERM generic', 'rax / 0')
     dataset.rows[0]['capture'] = capture(dataset, branches=(2,), descriptor=candidate.descriptor)
     result = evaluation.evaluate_dataset(dataset, 'rax / 0', execute=False, cache_dir=tmp_path / 'cache')
-    assert result['status'] == 'unavailable'
+    assert result['status'] == 'not_rejected'
+    assert result['cases'][0]['status'] == 'unavailable'
     assert result['cases'][0]['branches'] == [2]
     assert result['cases'][0]['reason'] == 'predicate-trap'
 
@@ -258,7 +297,8 @@ def test_late_journal_commit_requires_tracer_identity_and_preserves_producer(dat
     dataset.rows[0]['source'] = {'case_id': 0, 'filename': 'input'}
     root = tmp_path / 'cache'
     first = evaluation.evaluate_dataset(dataset, '0', execute=False, cache_dir=root)
-    assert first['status'] == 'unavailable'
+    assert first['status'] == 'not_rejected'
+    assert first['cases'][0]['status'] == 'unavailable'
     header = {'version': 1, 'channel': 'baseline', 'candidates': 'none',
               'brpatches.json': sha256(dataset.artifact('brpatches.json')), 'binradar.env': None,
               'context': {'original_sha256': sha256(dataset.artifact('harmless.orig')), 'qemu_sha256': qemu}}
@@ -271,12 +311,14 @@ def test_late_journal_commit_requires_tracer_identity_and_preserves_producer(dat
     journal = channel / '0.jsonl'
     journal.write_text(json.dumps(input_row) + '\n' + json.dumps(trace))
     partial = evaluation.evaluate_dataset(dataset, '0', execute=False, cache_dir=root)
-    assert partial['status'] == 'unavailable'
+    assert partial['status'] == 'not_rejected'
+    assert partial['cases'][0]['status'] == 'unavailable'
     with journal.open('a') as stream:
         stream.write('\n')
     before = journal.read_bytes()
     final = evaluation.evaluate_dataset(dataset, '0', execute=False, cache_dir=root)
-    assert final['status'] == ('reject_same_crash' if qemu else 'unavailable')
+    assert final['status'] == ('reject_same_crash' if qemu else 'not_rejected')
+    assert final['cases'][0]['status'] == ('reject_same_crash' if qemu else 'unavailable')
     assert final['cases'][0]['source'] == ('cache' if qemu else 'unavailable')
     assert journal.read_bytes() == before
 
@@ -353,7 +395,8 @@ def test_absolute_capture_descriptor_must_match_dataset_family(dataset, tmp_path
         committed = capture(dataset, branches=(1,), descriptor=descriptor)
     dataset.rows[0]['capture'] = committed
     result = evaluation.evaluate_dataset(dataset, predicate, execute=False, cache_dir=tmp_path / 'cache')
-    assert result['status'] == 'unavailable'
+    assert result['status'] == 'not_rejected'
+    assert result['cases'][0]['status'] == 'unavailable'
     assert result['cases'][0]['reason'] == 'capture-descriptor-family-mismatch'
 
 
@@ -463,7 +506,8 @@ def test_representative_pool_retains_every_non_descriptor_identity(dataset, tmp_
         monkeypatch.setattr(evaluation, 'sha256', lambda path:
                             'e' * 64 if Path(path) == Path(evaluation.__file__) else original_sha256(path))
     second = evaluation.evaluate_dataset(dataset, expressions[1], execute=False, cache_dir=cache)
-    assert second['status'] == 'unavailable'
+    assert second['status'] == 'not_rejected'
+    assert second['cases'][0]['status'] == 'unavailable'
     assert second['cases'][0]['branches'] is None
 
 
@@ -507,7 +551,8 @@ def test_damaged_durable_representative_never_becomes_success(dataset, tmp_path,
         record['capture_digest'] = evaluation._digest(record['capture'])
     record_path.write_text(json.dumps(record))
     second = evaluation.evaluate_dataset(dataset, expressions[1], execute=False, cache_dir=cache)
-    assert second['status'] == 'unavailable'
+    assert second['status'] == 'not_rejected'
+    assert second['cases'][0]['status'] == 'unavailable'
     assert second['cases'][0]['branches'] is None
 
 
@@ -534,10 +579,12 @@ def test_unusable_real_execution_is_not_published_as_representative(dataset, tmp
     monkeypatch.setattr(evaluation, 'execute_capture', run)
     cache = tmp_path / 'cache'
     first = evaluation.evaluate_dataset(dataset, expressions[0], cache_dir=cache)
-    assert first['status'] == 'unavailable'
+    assert first['status'] == 'not_rejected'
+    assert first['cases'][0]['status'] == 'unavailable'
     assert first['cases'][0]['source'] == 'executed'
     second = evaluation.evaluate_dataset(dataset, expressions[1], execute=False, cache_dir=cache)
-    assert second['status'] == 'unavailable'
+    assert second['status'] == 'not_rejected'
+    assert second['cases'][0]['status'] == 'unavailable'
     assert second['cases'][0]['branches'] is None
     root = cache / 'evaluation-v2' / evaluation._digest(dataset.dataset_id)
     assert not list(root.glob('*.representatives.json'))

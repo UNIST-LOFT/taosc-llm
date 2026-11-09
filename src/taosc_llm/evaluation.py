@@ -456,7 +456,7 @@ def _replay_evaluate(dataset, candidate, *, case_ids, socket_path, operation_che
         counts = {status: sum(item['status'] == status for item in result['cases'])
                   for status in ('reject_same_crash', 'not_rejected', 'unavailable')}
         result['status'] = ('reject_same_crash' if counts['reject_same_crash'] else
-                            'unavailable' if not result['cases'] or counts['unavailable']
+                            'unavailable' if not result['cases']
                             else 'not_rejected')
         result['summary'] = {'total': len(result['cases']), **counts}
     result.update(dataset_id=dataset.dataset_id,
@@ -577,8 +577,10 @@ def _evaluate(dataset, candidate, descriptor, *, case_ids, workers, execute, cac
         item['report'] = _project_case(dataset, case, item, metadata=metadata, descriptor=descriptor)
     counts = {status: sum(c['status'] == status for c in results)
               for status in ('reject_same_crash', 'not_rejected', 'unavailable')}
+    # Availability remains case-level evidence, not a candidate rejection.
+    # Even all-unavailable cases are nonrejecting; an empty selection is not.
     status = ('reject_same_crash' if counts['reject_same_crash'] else
-              'unavailable' if not results or counts['unavailable'] else 'not_rejected')
+              'unavailable' if not results else 'not_rejected')
     result = {'dataset_id': dataset.dataset_id, 'candidate_id': _digest({'base': base_identity, 'descriptor': descriptor}),
               'predicate': candidate.expression if candidate is not None else None,
               'descriptor': descriptor, 'status': status, 'verified': False,

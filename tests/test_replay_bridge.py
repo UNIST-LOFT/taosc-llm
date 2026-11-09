@@ -414,7 +414,9 @@ def test_outcome_mapping_matches_the_existing_evaluation_vocabulary(
         server.close()
     assert [case["status"] for case in result["cases"]] == [status, status]
     assert {case["reason"] for case in result["cases"]} == {reason}
-    assert result["status"] == status
+    assert result["status"] == ("reject_same_crash" if status == "reject_same_crash" else "not_rejected")
+    assert result["summary"]["unavailable"] == (2 if status == "unavailable" else 0)
+    assert result["replay"]["coverage"] == ("partial" if status == "unavailable" else "complete")
     assert status_requests(server) == [{"op": "status"}]
     assert evaluate_requests(server)[0]["patches"] == [
         {"id": 1, "predicate": "(rax <= 0) == 0"}]
@@ -550,6 +552,10 @@ def test_evaluation_keeps_concrete_cases_on_their_own_path(run_dir, dataset, tmp
     assert executed == ["system:0"]
     assert {case["case_id"]: case["source"] for case in result["cases"]} == {
         "system:0": "unavailable", "function:2": "executed"}
+    assert result["status"] == "not_rejected"
+    assert result["summary"] == {
+        "total": 2, "reject_same_crash": 0, "not_rejected": 1, "unavailable": 1}
+    assert result["verified"] is False
     assert result["replay"]["mutations"] == 1
 
 
@@ -561,7 +567,8 @@ def test_evaluation_without_replay_keeps_function_cases_offline(run_dir, dataset
                         lambda *a: pytest.fail("offline function case executed"))
     result = evaluation.evaluate_dataset(dataset, "1",
                                          cache_dir=tmp_path / "cache")
-    assert result["status"] == "unavailable"
+    assert result["status"] == "not_rejected"
+    assert result["cases"][0]["status"] == "unavailable"
     assert result["cases"][0]["source"] != "executed"
 
 
