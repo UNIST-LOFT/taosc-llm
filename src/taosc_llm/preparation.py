@@ -120,7 +120,14 @@ def _mutation_cases(root: Path, workdir: Path, run: Path, binary: str, artifacts
               "input_sha256": artifacts["poc"]["sha256"]}
     if any(context.get(key) != value for key, value in checks.items()):
         raise ValueError("mutation capture context artifact/configuration/POC identity mismatch")
-    evidence = run / "binradar.br"
+    evidence_record = _copy(run / "binradar.br", root, "sources/mutation-evidence.br")
+    artifacts["mutation-evidence.br"] = evidence_record
+    evidence = root / evidence_record["path"]
+    frames = list(binradar_evidence.read_binradar(evidence))
+    if not frames or any(not frame.timeout_excluded for frame in frames):
+        raise ValueError(
+            "mutation evidence lacks authenticated timeout exclusion; regenerate "
+            "the BinRadar mutation run with the current tracer and prepare a new dataset")
     reference = binradar_baseline.read_mutation_reference(evidence)
     request = binradar_feedback.FeedbackExportRequest(str(workdir), str(run), binary, "", "", 0,
               lambda _: None, (), poc_memcheck_policy=binradar_verifier.MEMCHECK_POLICY)
@@ -129,7 +136,7 @@ def _mutation_cases(root: Path, workdir: Path, run: Path, binary: str, artifacts
     parser.add_schema(binradar_feedback._FEEDBACK_SCHEMA)
     parser.add_schema(binradar_feedback._MUTATION_SCHEMA)
     committed = {(frame.iteration, group.representative): group
-                 for frame in binradar_evidence.read_binradar(evidence) for group in frame.groups}
+                 for frame in frames for group in frame.groups}
     cases = []
     for snapshot, sidecar in pairs:
         # Freeze before reading so an external producer cannot change validated evidence underneath us.
@@ -157,7 +164,8 @@ def _mutation_cases(root: Path, workdir: Path, run: Path, binary: str, artifacts
                    "fault_image": data["fault-image"], "fault_offset": data["fault-image-offset"]}
         same_crash = bool(data["same-fault"]) if reference is not None else None
         capture = {**brch, "artifact_sha256": checks["artifact"], "branches": branches,
-                   "outcome": outcome, "same_crash": same_crash, "complete": True, "descriptor": "p0",
+                   "outcome": outcome, "same_crash": same_crash, "timeout_excluded": True,
+                   "complete": True, "descriptor": "p0",
                    "sidecar": metadata, "oracle": "selected-artifact-attempt1", "patch_id": 0}
         cases.append({"id": f"function:{iteration}", "domain": "function", "input_path": None,
                       "input_sha256": None, "source": {"kind": "committed-mutation", "run": str(run),

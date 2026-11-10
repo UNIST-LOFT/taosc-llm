@@ -68,7 +68,8 @@ def make_dataset(root, *, count=2, patch_format="ERM generic", binradar_run=None
                       "source": {"run": "/private/source-run", "case_id": index}, "observation": {},
                       "capture": {"path": "state.brch", "sha256": digest(capture.read_bytes()),
                                   "artifact_sha256": artifacts["fixture.brcached"]["sha256"], "branches": [0],
-                                  "outcome": {}, "same_crash": None, "complete": True, "descriptor": "p0"}})
+                                  "outcome": {}, "same_crash": None, "timeout_excluded": True,
+                                  "complete": True, "descriptor": "p0"}})
     case_path = root / "cases.jsonl"
     case_path.write_text("".join(json.dumps(c) + "\n" for c in cases))
     manifest = {"schema_version": 2, "binary": "fixture", "patch_format": patch_format,

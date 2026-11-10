@@ -137,8 +137,14 @@ uv run --project utils/taosc-llm taosc-llm \
   do not pass it directly to a raw `socket.connect()` without resolving it.
 - The service must report `ready` or `evaluating`. Its `retained_mutations` and
   returned IDs must match the frozen **useful subset**: normal observations or
-  authenticated target crashes. Other committed crashes remain offline evidence;
-  they are not missing native plans. Offline divergence remains unavailable.
+  authenticated target crashes, certified timeout-free by canonical v4 iteration
+  flag `TIMEOUT_EXCLUDED`. Deadline-killed attempts are excluded even when crash
+  provenance was salvaged. Unflagged old mutation runs/prepared function datasets
+  require regeneration; never retrofit flags or reuse their candidate caches.
+  System-only datasets are unaffected. Other committed crashes remain offline
+  evidence; they are not missing native plans. Offline divergence remains
+  unavailable. Synthesis checks replay binding before original execution or any
+  provider request.
 - Concrete `system:*` cases keep their existing capture/cache/worker path and
   never use the mutation snapshot.
 - The model never sees the socket, and no tool schema accepts a path, endpoint or
@@ -146,7 +152,7 @@ uv run --project utils/taosc-llm taosc-llm \
   host configured the bridge; `evaluate_predicate` stays offline. The Python
   API's `execute=False` also prohibits all socket access, even with a configured
   endpoint; the CLI rejects `--offline` combined with `--replay-socket`.
-- Status mapping reuses the existing vocabulary: `target-crash` (the artifact's
+- Per-case target-oracle diagnostics keep the existing vocabulary: `target-crash` (the artifact's
   committed attempt-1 oracle) is `reject_same_crash`; `normal` and `other-crash`
   are `not_rejected`; cancellation, timeout, trap, unsupported external state and
   incomplete observation are `unavailable`. Every result keeps
@@ -331,16 +337,28 @@ pages. Neither saved-log addresses nor site values replace the configured target
 oracle. See [POC evidence](../../agent-docs/taosc-llm/PROMPTS_AND_EVIDENCE.md#original-poc-diagnostic-summary).
 Candidate proposals require evaluation of the exact expression. Context and
 `list_cases` show at most three crash/three normal examples. Evaluation feedback
-contains only missed target crashes and compatible normal→target regressions,
-with counts and at most three examples each. Other-location crashes are omitted.
-One concise coverage/control warning replaces unknown/unavailable lists; empty
-feedback is not repair proof. Optional register/mutation filters and similarity
+separates missed targets, normal→target/other-crash regressions, and normal→normal
+complete-vector branch regressions. Each group has counts and at most three
+examples. Quality feedback also exposes bounded other-crash, unavailable,
+original/neutral-gap and unproven-repair examples; none counts as success. Optional register/mutation filters and similarity
 select more small examples, never an exhaustive case page. Hashes/audit metadata
 stay private; model IDs are short scoped handles. Static `function` views default
 to available facets; select a facet/address for local CFG/value-flow evidence. Strict response parsing, native builds and actual evaluation feedback
 feed bounded refinement rounds (`--max-rounds` 1–16, default 4, provider-only);
-manual mode rejects provider options instead of ignoring them. Abstention stops
-without a candidate. No final BinRadar verification is run.
+manual mode rejects provider options instead of ignoring them. Only
+`evaluation.quality.status=improved` stops as `not_rejected`: at least one actual
+repair, all remaining cases preserved normal, and no regression or evidence gap.
+Other outcomes feed another bounded round. The selected incumbent must retain
+all established repairs and observed normal executions, and cannot add a new
+crash regression or target miss. Among admissible proposals, fewer crash
+regressions, target misses, branch regressions, unresolved cases, then more
+repairs determine selection in that order; ties retain the incumbent. This
+prevents losing evidence from masquerading as improvement. `selected_round`
+identifies the retained proposal/build/evaluation, even if later attempts are
+worse. At the budget limit, retain its truthful quality status and
+`termination=round_limit`; without an evaluated candidate use
+`refinement_exhausted`. Explicit abstention stops without a candidate. No final
+BinRadar verification is run.
 
 Provider routing, credential-file syntax, isolated SDK setup, per-operation
 bounds and externally managed scheduling are specified in
@@ -373,8 +391,10 @@ that result and a tool-free review request. It evaluates its prompts, tool calls
 evidence interpretation and workflow; it cannot change the candidate or host verdict.
 The final run directory contains private `session-feedback.md`, with separate
 status/usage/request/settlement metadata in `run.json.session_feedback`. Review gets
-one model response and a fresh configured timeout, not another synthesis loop.
-Failure is recorded separately and leaves the settled result intact. Manual mode
+one model response, at most `min(TAOSC_LLM_MAX_TOKENS, 4096)` output tokens,
+and a fresh configured timeout, not another synthesis loop. The request asks for
+at most 600 words/eight bullets and reviews the retained candidate, not an
+unselected last attempt. Failure is recorded separately and leaves the settled result intact. Manual mode
 rejects the flag. It is disabled by default and consumes an additional provider
 request when used; this self-review is not independent correctness verification.
 
@@ -387,25 +407,27 @@ Stdout contains one JSON result; diagnostics go to stderr. Common CLI exits:
 
 | Exit | Meaning |
 |---|---|
-| 0 | `prepared`, `built`, `abstained`, `not_rejected` (or `warmed` if returned); not repair success |
-| 2 | `reject_same_crash` |
-| 3 | `unavailable` |
+| 0 | `prepared`, `built`, `abstained`, non-rejected neutral warming, or candidate quality `improved`; never FINAL proof |
+| 2 | `reject_same_crash`, quality `rejected` (including other crash), or `regressed` |
+| 3 | `unavailable`, quality `incomplete` or `unproven` |
 | 1 | Other terminal failure, including exhausted refinement or infrastructure/parser/build error |
 | 130 | Interrupted; local cleanup does not prove remote provider completion |
 
-`--warm` currently returns the ordinary evaluation status, not a guaranteed
-`warmed` status. A same-target crash takes precedence in the aggregate. Otherwise,
-a nonempty evaluated case set is `not_rejected`, even if some or all cases are
-`unavailable`; only an empty case set remains aggregate `unavailable`. Individual
-case statuses/reasons, unavailable counts and replay coverage remain unchanged.
-`not_rejected` means no observed target rejection, not complete coverage or proof
-that unavailable cases ran successfully. In particular, all-unavailable evidence
-is still incomplete despite an aggregate `not_rejected` / exit 0.
-These are host/CLI statuses. Model tools expose only bounded target-miss/regression
-feedback and a material evidence warning. Full private `report_summary` retains
-actual firing, paired transitions, capture gaps and oracle warnings. Offline
-predictions are not actual activity; omitted other-location crashes are not normal
-termination.
+`evaluation.status` remains the target-only diagnostic: any same-target crash
+rejects, otherwise a nonempty case set is `not_rejected`, including unavailable
+cases; an empty set is `unavailable`. Do not aggregate this field as repair
+success. The separate `evaluation.quality` carries status, orthogonal counts and
+reasons. Original-target/neutral-normal disagreement is `baseline_gaps`, not an
+improvement. Other crashes, unavailable evidence and unproven repair remain
+separate from `improved`/`preserved_normal`; facet counts can overlap.
+Candidate evaluation CLI exits and provider/manual terminal outcomes use this
+quality verdict. An all-unavailable candidate now exits 3, not 0. `--warm` is
+acquisition rather than candidate assessment and keeps the target-only exit
+policy; its JSON status is not guaranteed to be `warmed`.
+Full private `report_summary` retains actual firing, paired transitions, capture
+gaps and oracle warnings; offline predictions are not actual activity. See the
+[quality classification contract](../../agent-docs/taosc-llm/PROMPTS_AND_EVIDENCE.md#capture-and-outcome-interpretation)
+for exact eligibility and bounded model-facing failure evidence.
 With `--replay-socket`, a result also carries a `replay` block (endpoint,
 coverage, mutation count, unavailable count). The endpoint never enters the
 model projection or a tool result, and it is not a patch field.
@@ -597,6 +619,10 @@ socket for offline reuse rather than naming a dead endpoint.
   cache/                         # shared warm/synthesis evidence cache
   result/                        # existing manual/Pi or no-LLM result contract
 ```
+
+The runner summary copies synthesis `quality` and `selected_round`, so batch
+accounting can distinguish improved candidates, regressions and evidence gaps
+without treating a built artifact or target-only non-rejection as success.
 
 A supplied `--concrete-run` is read-only and suppresses concrete setup/generation.
 A supplied `--binradar-run` suppresses cached/mutation setup and generation; its

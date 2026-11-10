@@ -569,7 +569,7 @@ def _evaluate(dataset, candidate, descriptor, *, case_ids, workers, execute, cac
             # The executor drains already-running native children under their
             # existing caps; queued work cannot admit any further execution.
             raise
-    from .evidence import _project_case, summarize_reports
+    from .evidence import _project_case, summarize_quality, summarize_reports
     results = [evaluated[case['id']] for case in cases]
     for case, item in zip(cases, results):
         if operation_check is not None:
@@ -586,6 +586,7 @@ def _evaluate(dataset, candidate, descriptor, *, case_ids, workers, execute, cac
               'descriptor': descriptor, 'status': status, 'verified': False,
               'cases': results, 'summary': {'total': len(results), **counts},
               'evaluation_mode': 'host' if execute else 'offline',
+              'quality': summarize_quality(item['report'] for item in results),
               'report_summary': summarize_reports(item['report'] for item in results)}
     if replay_result is not None:
         result['replay'] = replay_result['replay']

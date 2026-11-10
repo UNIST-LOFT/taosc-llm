@@ -38,6 +38,39 @@ def test_search_returns_bounded_matching_examples_not_population(tmp_path):
     assert missing["crash"] == missing["non_crash"] == []
 
 
+@pytest.mark.parametrize("args", [
+    {"filters": {"candidate_outcome": "normal"}},
+    {"filters": {"candidate_outcome": "target_crash"}},
+    {"filters": {"activation": "fired"}},
+    {"filters": {"activation": "not_fired"}},
+    {"same_as": {"case_id": "function:0", "features": ["candidate_outcome"]}},
+])
+@pytest.mark.parametrize("count", [0, 2])
+def test_candidate_search_requires_returned_result_even_for_empty_population(tmp_path, args, count):
+    context = context_for(tmp_path, count)
+    response = query(context, "list_cases", **args)
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_arguments"
+    assert "result_id" in response["error"]["message"]
+    assert "evaluate_predicate" in response["error"]["message"]
+    assert "test_candidate" in response["error"]["message"]
+    assert "crash" not in response and "non_crash" not in response
+
+
+def test_candidate_search_uses_returned_result_and_neutral_search_uses_prepared_p0(tmp_path):
+    context = context_for(tmp_path, 2)
+    baseline = query(context, "list_cases", filters={"baseline_outcome": "normal"})
+    assert baseline["ok"] and {row["case_id"] for row in baseline["non_crash"]} == {"function:0", "function:1"}
+    evaluation = query(context, "evaluate_predicate", predicate="0")
+    assert evaluation["ok"]
+    result = query(context, "list_cases", result_id=evaluation["result_id"],
+                   filters={"candidate_outcome": "normal", "activation": "not_fired"})
+    assert result["ok"] and {row["case_id"] for row in result["non_crash"]} == {"function:0", "function:1"}
+    similar = query(context, "list_cases", result_id=evaluation["result_id"],
+                    same_as={"case_id": "function:0", "features": ["candidate_outcome"]})
+    assert similar["ok"] and [row["case_id"] for row in similar["non_crash"]] == ["function:1"]
+
+
 def test_search_similar_known_branch_pattern_excludes_reference(tmp_path):
     context = context_for(tmp_path, 4)
     response = query(context, "list_cases", domain="function",
@@ -84,7 +117,7 @@ def test_non_equivalent_capture_is_not_candidate_search_evidence(tmp_path):
     assert "activation" not in detail["case"] and "states" not in detail
 
 
-def test_feedback_finds_late_counterexample_without_success_or_missing_rows(tmp_path):
+def test_feedback_finds_late_target_failure_and_unavailable_evidence(tmp_path):
     dataset = make_dataset(tmp_path / "dataset", count=70, concrete_run=None)
     manifest = dict(dataset.manifest)
     manifest["oracles"] = {"mutation_reference": {"address": 4096, "source": "guest-signal", "image": None, "offset": None}}
@@ -110,8 +143,8 @@ def test_feedback_finds_late_counterexample_without_success_or_missing_rows(tmp_
     result = query(context, "get_candidate_result", result_id="many")
     assert result["ok"] and result["missed_target_crashes"]["count"] == 1
     assert [case["case_id"] for case in result["missed_target_crashes"]["examples"]] == ["function:68"]
-    assert "function:69" not in json.dumps(result)
-    assert "function:0" not in json.dumps(result)
+    assert result["quality"]["counts"]["unavailable"] == 1
+    assert [case["case_id"] for case in result["quality"]["examples"]["unavailable"]] == ["function:69"]
     assert "cases" not in result and "summary" not in result
     assert query(context, "list_cases", filters={"candidate_outcome": "other_crash"})["error"]["code"] == "invalid_arguments"
 

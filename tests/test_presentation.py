@@ -21,11 +21,16 @@ def report(number, *, domain='system', candidate='target_crash', neutral='target
            original='target_crash', compatible=True, applicable=True, activity='not_fired', writes=()):
     return {'case_id': f'{domain}:{number}', 'domain': domain,
             'original_baseline': {'outcome': original, 'applicable': applicable},
-            'neutral_baseline': {'outcome': neutral, 'compatible_control': compatible},
+            'neutral_baseline': {'outcome': neutral, 'compatible_control': compatible,
+                                 'artifact_sha256': 'a' * 64, 'capture': {'status': 'complete'}},
             'candidate': {'outcome': candidate, 'artifact_sha256': 'a' * 64,
+                          'capture': {'status': 'complete' if activity != 'unknown' else 'unavailable'},
                           'observed_fault': {'address': '0xbad', 'image': 'b' * 64}},
             'activation': {'status': activity, 'original_hits': None, 'repair_hits': None, 'trap_hits': None},
-            'oracle': {'oracle_id': 'private-oracle', 'artifact_sha256': 'c' * 64},
+            'oracle': {'oracle_id': 'private-oracle', 'artifact_sha256': 'c' * 64,
+                       'evaluation_artifact_sha256': 'a' * 64, 'target': {'address': '0x21'}},
+            'branch_comparison': {'status': 'equal', 'basis': 'actual_complete_vectors',
+                                  'neutral_hits': 1, 'candidate_hits': 1},
             'warnings': [],
             'mutation': {'status': 'available' if writes else 'unavailable', 'writes': list(writes)}}
 
@@ -59,15 +64,9 @@ def test_examples_bound_each_population_and_choose_domain_mutation_diversity(dat
 
 
 @pytest.mark.parametrize('candidate', ['other_crash', 'unknown'])
-def test_evaluated_excluded_outcomes_never_fall_back_to_good_old_baselines(dataset, candidate):
+def test_initial_samples_never_fall_back_to_good_old_baselines(dataset, candidate):
     records = case_records(dataset, evaluation_for(dataset, [report(0, candidate=candidate)]))
     assert sample_cases(dataset, records) == {'crash': [], 'non_crash': []}
-    response = feedback(dataset, evaluation_for(dataset, [report(0, candidate=candidate)]))
-    assert response['missed_target_crashes'] == {'count': 0, 'examples': []}
-    assert response['regressions'] == {'count': 0, 'examples': []}
-    assert ('warning' in response) == (candidate == 'unknown')
-    assert candidate not in json.dumps(response)
-    assert 'system:0' not in json.dumps(response)
 
 
 @pytest.mark.parametrize('neutral', ['other_crash', 'unknown'])
@@ -94,31 +93,62 @@ def test_feedback_counts_full_population_and_partitions_same_artifact_regression
     reports += [report(40, original='normal', neutral='unknown', compatible=False),
                 report(41, domain='function', original='normal', neutral='unknown',
                        applicable=False, compatible=False)]
-    # Engine warnings for other crashes must not promote them to regressions.
-    ignored = report(60, neutral='normal', candidate='other_crash')
-    ignored['warnings'] = ['normal_control_to_candidate_crash']
-    reports += [ignored, report(61, candidate='normal'), report(62, candidate='unknown')]
+    reports += [report(60, neutral='normal', candidate='other_crash'),
+                report(61, candidate='normal'), report(62, candidate='unknown')]
     response = feedback(dataset, evaluation_for(dataset, reports))
     assert response['missed_target_crashes']['count'] == 10
-    assert response['regressions']['count'] == 5
+    assert response['regressions']['count'] == 6
     assert len(response['missed_target_crashes']['examples']) == 3
     assert len(response['regressions']['examples']) == 3
     assert all(row['neutral_baseline'] == 'normal' for row in response['regressions']['examples'])
+    quality = response['quality']
+    assert quality['status'] == 'regressed'
+    assert quality['counts']['other_crashes'] == 1
+    other = quality['examples']['other_crashes'][0]
+    assert (other['case_id'], other['outcome'], other['category']) == ('system:60', 'other_crash', 'crash_regression')
+    assert quality['counts']['unavailable'] == 1
+    assert quality['counts']['unproven'] == 1
     assert isinstance(response['warning'], str)
     public = json.dumps(response)
-    assert all(f'system:{number}' not in public for number in (60, 61, 62))
-    assert 'other_crash' not in public and 'unknown' not in public
+    assert '0xbad' not in public and '/private/' not in public
+    assert all(char * 64 not in public for char in 'abcd')
     assert 'outcomes' not in response and 'report_summary' not in response
+
+
+def test_feedback_exposes_bounded_exact_branch_counterexamples_and_gap_counts(dataset):
+    reports = [report(i, neutral='normal', original='normal', candidate='normal', activity='fired')
+               for i in range(8)]
+    difference = {'status': 'different', 'basis': 'actual_complete_vectors', 'neutral_hits': 2,
+                  'candidate_hits': 1, 'first_difference': 1, 'neutral_branch': 0, 'candidate_branch': None}
+    for row in reports:
+        row['branch_comparison'] = difference
+    reports += [report(20, candidate='normal', activity='fired', compatible=False),
+                report(21, candidate='unknown', activity='unknown')]
+    response = feedback(dataset, evaluation_for(dataset, reports))
+    assert response['quality']['status'] == 'regressed'
+    assert response['branch_regressions']['count'] == 8
+    assert len(response['branch_regressions']['examples']) == 3
+    for example in response['branch_regressions']['examples']:
+        assert example['category'] == 'branch_regression'
+        assert example['outcome'] == example['neutral_baseline'] == 'normal'
+        assert example['branch_difference'] == {key: value for key, value in difference.items() if key != 'status'}
+    assert response['quality']['counts']['baseline_gaps'] == 1
+    assert response['quality']['counts']['unavailable'] == 1
+    assert response['quality']['counts']['improved'] == 0
+    assert all(len(examples) <= 3 for examples in response['quality']['examples'].values())
 
 
 def test_normal_unknown_activity_and_nonreproducing_control_have_one_warning(dataset):
     row = report(0, candidate='normal', neutral='normal', activity='unknown')
     row['warnings'] = ['control_does_not_reproduce_target']
     response = feedback(dataset, evaluation_for(dataset, [row]))
-    assert set(response) == {'missed_target_crashes', 'regressions', 'warning'}
     assert response['missed_target_crashes']['count'] == response['regressions']['count'] == 0
+    assert response['branch_regressions']['count'] == 0
+    assert response['quality']['status'] == 'incomplete'
+    assert response['quality']['counts']['unavailable'] == 1
+    assert response['quality']['counts']['baseline_gaps'] == 1
+    assert response['quality']['counts']['improved'] == 0
     assert isinstance(response['warning'], str)
-    assert 'system:0' not in json.dumps(response)
     assert not any(key in response for key in ('repaired', 'success', 'verified', 'activation'))
 
 
@@ -139,7 +169,9 @@ def test_explicit_detail_is_allowlisted_and_does_not_invent_activity(dataset):
     assert result['original_baseline'] == 'target_crash'
     assert result['mutation']['writes'] == writes
     assert result['mutation']['basis'] == 'ordered_input_writes_not_full_state'
-    assert set(result) == {'case_id', 'original_baseline', 'mutation'}
+    assert result['neutral_baseline'] == 'other_crash'
+    assert result['quality']['category'] == 'unavailable'
+    assert set(result) == {'case_id', 'original_baseline', 'neutral_baseline', 'quality', 'mutation'}
     assert 'ffffffffffffffff' in json.dumps(result)  # Real bytes are not provenance digests.
 
 

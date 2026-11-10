@@ -34,23 +34,25 @@ def tool_definitions():
     mutation_filter = obj({"kind": identifier, "size": {"type": "integer", "minimum": 1, "maximum": 1048576},
         "value": identifier, "target_extent": {"type": "integer", "minimum": 0, "maximum": 1048576}})
     outcomes = ("target_crash", "normal")
-    filters = obj({"candidate_outcome": choice(outcomes), "baseline_outcome": choice(outcomes),
-        "activation": choice(("fired", "not_fired", "zero_hits", "trapped")),
+    filters = obj({"candidate_outcome": {**choice(outcomes), "description": "Requires result_id; actual candidate outcome, not offline prediction."},
+        "baseline_outcome": {**choice(outcomes), "description": "Authenticated same-case neutral p0 outcome on the prepared/cached artifact; not the original POC outcome. Unknown evidence does not match."},
+        "activation": {**choice(("fired", "not_fired", "zero_hits", "trapped")), "description": "Requires result_id; authenticated actual candidate capture only."},
         "register": register_filter, "mutation": mutation_filter})
-    same_as = obj({"case_id": identifier, "features": {"type": "array", "minItems": 1,
+    same_as = obj({"case_id": {**identifier, "description": "Reference case in the selected prepared/result population; excluded from matches."},
+        "features": {"type": "array", "minItems": 1, "description": "Explicit feature names only; unknown reference evidence is an error. candidate_outcome requires result_id.",
         "maxItems": len(SIMILAR_FEATURES), "uniqueItems": True, "items": choice(SIMILAR_FEATURES)}}, ("case_id", "features"))
     specs = [
         ("get_patch_context", "Context is already inline. Request poc_log only for detailed POC diagnostics.",
          {"view": choice(("context", "poc_log")), "cursor": cursor}, []),
-        ("get_function_analysis", "Read a frozen procedure. Use facet/address for local CFG or dataflow; instruction windows count instructions. References require a site.",
-         {"procedure_id": identifier, "view": choice(("function", "instructions", "decompilation", "references")),
-          "facet": choice(FUNCTION_FACETS), "address": {"type": "string", "minLength": 1, "maxLength": 20},
+        ("get_function_analysis", "Read a frozen procedure using its canonical procedure_id from context.analysis.procedures, not a role or address. view=function lists available facets; select facet there for local CFG or value flow. Instruction windows count instructions. view=references requires site=patch or destination.",
+         {"procedure_id": {**identifier, "description": "Exact procedure_id returned in context.analysis.procedures (for example procedure:0x1000)."}, "view": choice(("function", "instructions", "decompilation", "references")),
+          "facet": {**choice(FUNCTION_FACETS), "description": "Only with view=function; omit to inspect availability first."}, "address": {"type": "string", "minLength": 1, "maxLength": 20},
           "site": choice(("patch", "destination")), "window": obj({
               "address": {"type": "string", "minLength": 1, "maxLength": 20},
               "before": {"type": "integer", "minimum": 0, "maximum": 100},
               "after": {"type": "integer", "minimum": 0, "maximum": 100}}, ("address",)),
           "cursor": cursor}, ["procedure_id", "view"]),
-        ("list_cases", "Up to three target-crash and three normal examples. Optional filters find comparable cases; this is not an exhaustive listing.",
+        ("list_cases", "Up to three target-crash and three normal examples, not an exhaustive listing. Candidate-outcome/activation filters and candidate_outcome similarity require a returned result_id. baseline_outcome means the same-case neutral p0 outcome, not original POC. same_as uses explicit known features and excludes its reference case.",
          {"domain": choice(("system", "function", "all")), "result_id": identifier,
           "filters": filters, "same_as": same_as}, []),
         ("get_case", "Inspect one case and its captured registers; state_id reads captured stack bytes.",
@@ -140,6 +142,12 @@ def _case_examples(context, dataset, args):
     from .cases import case_records, select_cases
     from .presentation import sample_cases
     evaluation = _known_result(context, args["result_id"]) if args.get("result_id") else None
+    if evaluation is None:
+        candidate_filters = set(args.get("filters", {})) & {"candidate_outcome", "activation"}
+        candidate_similarity = "candidate_outcome" in args.get("same_as", {}).get("features", [])
+        if candidate_filters or candidate_similarity:
+            raise ToolError("invalid_arguments", "candidate_outcome and activation require result_id; "
+                            "call evaluate_predicate or test_candidate, then use its returned result_id")
     try:
         records = select_cases(dataset, case_records(dataset, evaluation), args.get("domain", "all"),
                                args.get("filters", {}), args.get("same_as"))

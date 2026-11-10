@@ -204,6 +204,41 @@ def rewrite_cases(dataset, rows):
     return load_dataset(dataset.root)
 
 
+@pytest.mark.parametrize("proof", [None, False])
+def test_old_prepared_function_evidence_rejected_before_cached_or_live_reuse(
+        dataset, run_dir, monkeypatch, proof):
+    monkeypatch.setattr(replay, "status", lambda *a, **k: pytest.fail("unproven socket access"))
+    cases = dataset.cases("function")
+    capture = {**cases[0]["capture"], "same_crash": True,
+               "outcome": {"outcome": "crash"}}
+    if proof is None:
+        capture.pop("timeout_excluded")
+    else:
+        capture["timeout_excluded"] = proof
+    cases[0] = {**cases[0], "capture": capture}
+    with pytest.raises(ValueError, match="authenticated timeout exclusion; regenerate"):
+        rewrite_cases(dataset, cases)
+
+
+@pytest.mark.parametrize("outcome", ["timeout", "cancelled"])
+def test_explicit_timeout_cannot_become_successful_function_evidence(dataset, outcome):
+    cases = dataset.cases("function")
+    cases[0] = {**cases[0], "capture": {**cases[0]["capture"],
+                "outcome": {"outcome": outcome}, "same_crash": True}}
+    with pytest.raises(ValueError, match="authenticated timeout exclusion; regenerate"):
+        rewrite_cases(dataset, cases)
+
+
+def test_timeout_outcome_with_salvaged_same_crash_is_never_retained(dataset):
+    from types import SimpleNamespace
+
+    timeout, valid = dataset.cases("function")
+    timeout = {**timeout, "capture": {**timeout["capture"],
+               "outcome": {"outcome": "timeout"}, "same_crash": True}}
+    source = SimpleNamespace(cases=lambda domain: [timeout, valid])
+    assert [case["id"] for case in replay.retained_cases(source)] == [valid["id"]]
+
+
 def test_dataset_without_binradar_run_cannot_replay(tmp_path):
     dataset = make_dataset(tmp_path / "dataset")
     with pytest.raises(replay.ReplayError, match="no binradar run"):

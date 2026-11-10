@@ -113,6 +113,11 @@ def test_aggregate_rejection_preserves_case_availability(
         cache_dir=tmp_path / 'cache')
     assert result['status'] == expected
     assert result['verified'] is False
+    assert result['quality']['counts']['total'] == len(observations)
+    assert result['quality']['counts']['improved'] == 0
+    if not observations or all(observation == 'missing' for observation in observations):
+        assert result['quality']['status'] == 'incomplete'
+        assert result['quality']['counts']['unavailable'] == len(observations)
     assert result['summary'] == {
         'total': len(observations),
         'reject_same_crash': observations.count('target'),

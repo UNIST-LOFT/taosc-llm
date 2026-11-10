@@ -1,4 +1,4 @@
-"""Allowlisted outcome, control and activation evidence; never a repair verdict."""
+"""Authenticated outcomes, controls, actual activation and candidate quality."""
 from __future__ import annotations
 
 from collections import Counter
@@ -209,6 +209,10 @@ def _observation(dataset, case, record, *, artifact, source, metadata, descripto
     if reason in ('same-crash', 'observed-not-same-crash'):
         reason = {'target_crash': 'target-crash', 'normal': 'observed-normal',
                   'other_crash': 'observed-other-crash', 'unknown': 'oracle-unavailable'}[category]
+    if (record.get('case_id', case['id']) != case['id']
+            or record.get('domain', case['domain']) != case['domain']):
+        category, reason, branches = 'unknown', 'observation-case-mismatch', None
+        capture_status = {'status': 'invalid', 'total_hits': None}
     result = {'outcome': category, 'reason': reason, 'applicable': True,
               'capture': capture_status, 'evidence_source': _reason(record.get('source'), source),
               'artifact_sha256': artifact, 'observed_fault': _fault(outcome),
@@ -311,6 +315,138 @@ def _offline_prediction(dataset, evaluated, metadata):
         return None
 
 
+_QUALITY_COUNTS = ('improved', 'preserved_normal', 'target_misses', 'crash_regressions',
+                   'branch_regressions', 'other_crashes', 'unavailable', 'baseline_gaps', 'unproven')
+
+
+def classify_quality(report):
+    """Classify authenticated observations, never reference-state predictions.
+
+    Facets are orthogonal: a crash regression can also be an other crash, and
+    missing/mismatched baseline evidence remains visible beside any failure.
+    The singular category chooses the most actionable failure, not a partition
+    used to sum the facets. Only improved/preserved_normal are success evidence.
+    """
+    neutral = report.get('neutral_baseline', {})
+    original = report.get('original_baseline', {})
+    candidate = report.get('candidate', {})
+    activation = report.get('activation', {}).get('status', 'unknown')
+    comparison = report.get('branch_comparison', {})
+    actual_comparison = comparison.get('basis') == 'actual_complete_vectors'
+    oracle = report.get('oracle', {})
+    artifact = oracle.get('evaluation_artifact_sha256')
+    compatible = (neutral.get('compatible_control') is True and artifact is not None
+                  and neutral.get('artifact_sha256') == artifact
+                  and candidate.get('artifact_sha256') == artifact)
+    baseline, outcome = neutral.get('outcome', 'unknown'), candidate.get('outcome', 'unknown')
+    actual = (candidate.get('capture', {}).get('status') in ('complete', 'zero_hits')
+              and activation in ('fired', 'not_fired', 'zero_hits'))
+    reasons, facets = [], []
+    baseline_gap = False
+    if not compatible or baseline not in ('normal', 'target_crash') or oracle.get('target') is None:
+        baseline_gap = True
+        reasons.append('compatible-target-or-normal-control-unavailable')
+    if original.get('applicable', True):
+        source = original.get('outcome', 'unknown')
+        if source == 'unknown':
+            baseline_gap = True
+            reasons.append('original-evidence-unavailable')
+        elif source != baseline:
+            baseline_gap = True
+            reasons.append('original-neutral-disagreement')
+    if baseline_gap:
+        facets.append('baseline_gaps')
+    crash_regression = compatible and baseline == 'normal' and outcome in ('target_crash', 'other_crash')
+    branch_regression = (compatible and baseline == outcome == 'normal' and actual
+                         and actual_comparison and comparison.get('status') == 'different')
+    if crash_regression:
+        facets.append('crash_regressions')
+        reasons.append('neutral-normal-to-candidate-crash')
+    elif outcome == 'target_crash':
+        facets.append('target_misses')
+        reasons.append('candidate-retains-target-crash')
+    if branch_regression:
+        facets.append('branch_regressions')
+        reasons.append('normal-complete-branch-vector-difference')
+    if outcome == 'other_crash':
+        facets.append('other_crashes')
+        reasons.append('candidate-other-crash')
+    unavailable = outcome == 'unknown' or not actual and activation != 'trapped'
+    if unavailable:
+        facets.append('unavailable')
+        reasons.append('candidate-outcome-or-complete-capture-unavailable')
+    if activation == 'trapped':
+        facets.append('unproven')
+        reasons.append('candidate-predicate-trapped')
+    observed_normal = compatible and baseline == outcome == 'normal' and actual
+    known_normal = observed_normal and not baseline_gap
+    if not facets:
+        if baseline == 'target_crash' and outcome == 'normal' and activation == 'fired':
+            facets.append('improved')
+        elif known_normal and actual_comparison and comparison.get('status') == 'equal':
+            facets.append('preserved_normal')
+        else:
+            facets.append('unproven')
+            reasons.append('normal-without-established-repair' if baseline == 'target_crash'
+                           else 'complete-branch-comparison-unavailable')
+    categories = (('crash_regressions', 'crash_regression'), ('branch_regressions', 'branch_regression'),
+                  ('target_misses', 'target_miss'), ('other_crashes', 'other_crash'),
+                  ('unavailable', 'unavailable'), ('baseline_gaps', 'baseline_gap'),
+                  ('unproven', 'unproven'), ('improved', 'improved'), ('preserved_normal', 'preserved_normal'))
+    category = next(category for facet, category in categories if facet in facets)
+    result = {'category': category, 'facets': facets, 'reasons': reasons,
+              'known_normal': known_normal, 'observed_normal': observed_normal}
+    if branch_regression:
+        result['branch_difference'] = {key: comparison[key] for key in
+            ('basis', 'first_difference', 'neutral_branch', 'candidate_branch', 'neutral_hits', 'candidate_hits')}
+    return result
+
+
+def summarize_quality(reports):
+    """One public verdict, preserving orthogonal failure/gap denominators."""
+    qualities = [report.get('quality') or classify_quality(report) for report in reports]
+    counts = {'total': len(qualities), **{key: sum(key in quality['facets'] for quality in qualities)
+                                        for key in _QUALITY_COUNTS}}
+    status = ('regressed' if counts['crash_regressions'] or counts['branch_regressions'] else
+              'rejected' if counts['target_misses'] or counts['other_crashes'] else
+              'incomplete' if counts['unavailable'] or counts['baseline_gaps'] or not qualities else
+              'unproven' if counts['unproven'] or not counts['improved'] else 'improved')
+    reasons = sorted({reason for quality in qualities for reason in quality['reasons']})
+    if not qualities:
+        reasons.append('no-evaluated-cases')
+    elif not counts['improved']:
+        reasons.append('no-established-target-repair')
+    return {'status': status, 'counts': counts, 'reasons': reasons}
+
+
+def quality_case_sets(evaluation):
+    """Private exact case sets for refinement and evidence-preserving selection."""
+    result = {key: set() for key in (*_QUALITY_COUNTS, 'known_normals', 'observed_normals')}
+    for item in evaluation.get('cases', []):
+        report = item['report']
+        quality = report.get('quality') or classify_quality(report)
+        for facet in quality['facets']:
+            result[facet].add(item['case_id'])
+        for flag in ('known_normal', 'observed_normal'):
+            if quality.get(flag):
+                result[flag + 's'].add(item['case_id'])
+    return {key: frozenset(value) for key, value in result.items()}
+
+
+def _branch_comparison(neutral, candidate):
+    if neutral is None or candidate is None or 2 in neutral or 2 in candidate:
+        return {'status': 'unavailable'}
+    result = {'status': 'equal' if neutral == candidate else 'different',
+              'basis': 'actual_complete_vectors', 'neutral_hits': len(neutral), 'candidate_hits': len(candidate)}
+    if neutral != candidate:
+        index = next((index for index, (left, right) in enumerate(zip(neutral, candidate)) if left != right),
+                     min(len(neutral), len(candidate)))
+        result.update(first_difference=index,
+                      neutral_branch=neutral[index] if index < len(neutral) else None,
+                      candidate_branch=candidate[index] if index < len(candidate) else None)
+    return result
+
+
 def project_case(dataset, case, evaluated=None, *, descriptor=None, predicate=None):
     """Project a case; legacy results may supply their overall candidate identity."""
     with dataset.validation() as validated:
@@ -370,7 +506,8 @@ def _project_case(dataset, case, evaluated, *, metadata=None, descriptor=None):
     if neutral_compatible and neutral['outcome'] == 'normal' and candidate['outcome'] in ('target_crash', 'other_crash'):
         warnings.append('normal_control_to_candidate_crash')
     prediction = _offline_prediction(dataset, evaluated, metadata)
-    return {'case_id': case['id'], 'domain': case['domain'], 'oracle': oracle,
+    report = {'case_id': case['id'], 'domain': case['domain'], 'oracle': oracle,
+            'branch_comparison': _branch_comparison(neutral_branches, branches),
             **({'offline_prediction': prediction} if prediction is not None else {}),
             'original_baseline': original, 'neutral_baseline': neutral, 'candidate': candidate,
             'activation': activation,
@@ -380,6 +517,8 @@ def _project_case(dataset, case, evaluated, *, metadata=None, descriptor=None):
                            'fired_and_target_to_normal': activation['status'] == 'fired' and neutral_transition == 'target_crash->normal'},
             'warnings': warnings, 'mutation': _mutation(dataset, case),
             'evidence_source': candidate['evidence_source']}
+    report['quality'] = classify_quality(report)
+    return report
 
 
 def summarize_reports(reports):

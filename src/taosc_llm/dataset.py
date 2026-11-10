@@ -137,6 +137,14 @@ class PreparedDataset:
                 raise ValueError("invalid scoped case id/domain binding")
             if case["input_path"] is not None:
                 self._verify({"path": case["input_path"], "sha256": case["input_sha256"]})
+            if case["domain"] == "function" and (
+                    not isinstance(case["capture"], dict)
+                    or case["capture"].get("timeout_excluded") is not True
+                    or case["capture"].get("outcome", {}).get("outcome")
+                    in ("timeout", "cancelled")):
+                raise ValueError(
+                    "function evidence lacks authenticated timeout exclusion; regenerate "
+                    "the BinRadar mutation run and prepare a new dataset (old caches are not reusable)")
             if case["capture"] is not None:
                 self.snapshots(case["capture"])
 

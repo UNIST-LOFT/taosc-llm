@@ -410,7 +410,8 @@ class Experiment:
         self.record["synthesis_result"] = str(output)
         self.record["result_directory"] = str(self.root / "result")
         self.record["synthesis"] = {key: result[key] for key in (
-            "status", "termination", "coverage", "predicate", "publication_status", "budgets", "result_record")
+            "status", "termination", "coverage", "predicate", "quality", "selected_round",
+            "publication_status", "budgets", "result_record")
                                    if key in result}
         return code
 

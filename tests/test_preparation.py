@@ -141,13 +141,14 @@ def test_rejects_mismatched_setup_identity(tmp_path, defect):
     assert not (tmp_path / "dataset").exists()
 
 
-def _frame(payload):
-    header = struct.pack("<HH", 4, 0)
+def _frame(payload, *, timeout_excluded=True):
+    header = struct.pack("<HH", 4, int(timeout_excluded))
     checksum = zlib.crc32(payload, zlib.crc32(header))
     return struct.pack("<I", len(payload)) + header + payload + struct.pack("<I", checksum & 0xffffffff)
 
 
-def mutation_inputs(tmp_path, work, *, torn=False, oracle=True, unknown=False):
+def mutation_inputs(tmp_path, work, *, torn=False, oracle=True, unknown=False,
+                    timeout_excluded=True):
     run = tmp_path / "mutation"
     directory = run / "binradar-feedback"
     directory.mkdir(parents=True)
@@ -162,8 +163,10 @@ def mutation_inputs(tmp_path, work, *, torn=False, oracle=True, unknown=False):
         return struct.pack("<IBBHQII", 0, 2 if crash else 1, 1 if missing else 0, 1 if crash else 0,
                            0x1234 if crash else 0, 0 if missing else 1, 1) + (b"\0" if missing else b"\0\0")
     evidence = struct.pack("<8sHHI", b"BRDATAB1", 4, 3, 0)
-    evidence += _frame(struct.pack("<II", 1, 1) + group(oracle))
-    second = _frame(struct.pack("<II", 2, 1) + group(oracle, unknown))
+    evidence += _frame(struct.pack("<II", 1, 1) + group(oracle),
+                       timeout_excluded=timeout_excluded)
+    second = _frame(struct.pack("<II", 2, 1) + group(oracle, unknown),
+                    timeout_excluded=timeout_excluded)
     (run / "binradar.br").write_bytes(evidence + (second[:-2] if torn else second))
     stem = "iteration-00000002-patch-00000000"
     cwe = (work / "patch-format").read_text().strip() == "ERM CWE-805"
@@ -197,6 +200,48 @@ def test_imports_committed_mutation_and_typed_oracle(tmp_path, family):
     assert capture["branches"] == [0]
     assert len(dataset.snapshots(capture)) == 1
     assert dataset.manifest["oracles"]["mutation_reference"]["address"] == 0x1234
+
+
+@pytest.mark.parametrize("oracle", [False, True])
+def test_legacy_committed_crash_or_normal_cannot_authorize_timeout_eligibility(tmp_path, oracle):
+    config, work, concrete = preparation_inputs(tmp_path)
+    mutation = mutation_inputs(tmp_path, work, oracle=oracle, timeout_excluded=False)
+    with pytest.raises(ValueError, match="authenticated timeout exclusion; regenerate"):
+        prepare_dataset(config, work, concrete, mutation, output=tmp_path / "dataset")
+    assert not (tmp_path / "dataset").exists()
+
+
+def test_discarded_timeout_pair_does_not_hide_later_valid_target_mutation(tmp_path):
+    from taosc_llm.replay import retained_cases
+    from binradar import binradar_evidence
+
+    config, work, concrete = preparation_inputs(tmp_path)
+    mutation = mutation_inputs(tmp_path, work)
+    evidence_path = mutation / "binradar.br"
+    raw = evidence_path.read_bytes()
+    length = struct.unpack_from("<I", raw, 16)[0]
+    baseline_end = 16 + 8 + length + 4
+    later_payload = bytearray(raw[baseline_end + 8:-4])
+    struct.pack_into("<I", later_payload, 0, 4)
+    evidence_path.write_bytes(raw[:baseline_end] + _frame(later_payload))
+    directory = mutation / "binradar-feedback"
+    # The timeout's old staged/split pair is deliberately left as an orphan.
+    # Only canonical committed attempt 4 can authorize a new case.
+    for suffix in ("brch", "sbsv"):
+        old = directory / f"iteration-00000002-patch-00000000.{suffix}"
+        new = directory / f"iteration-00000004-patch-00000000.{suffix}"
+        if suffix == "brch":
+            new.write_bytes(old.read_bytes())
+        else:
+            new.write_text(old.read_text().replace("iteration 2", "iteration 4")
+                           .replace("iteration-00000002", "iteration-00000004"))
+    dataset = prepare_dataset(config, work, concrete, mutation, output=tmp_path / "dataset")
+    assert [case["id"] for case in dataset.cases("function")] == ["function:4"]
+    assert [case["id"] for case in retained_cases(dataset)] == ["function:4"]
+    assert dataset.case("function:4")["capture"]["timeout_excluded"] is True
+    frozen = dataset.artifact("mutation-evidence.br")
+    assert [frame.iteration for frame in binradar_evidence.read_binradar(frozen)] == [1, 4]
+    assert all(frame.timeout_excluded for frame in binradar_evidence.read_binradar(frozen))
 
 
 @pytest.mark.parametrize("family", ["ERM generic", "ERM CWE-805"])

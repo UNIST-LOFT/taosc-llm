@@ -15,6 +15,7 @@ const mode = __MODE__;
 const streamEnd = __STREAM_END__;
 const reasoningEffort = __REASONING_EFFORT__;
 let count = 0;
+let synthesisMaxTokens;
 const encode = x => new TextEncoder().encode(x);
 let expireDeadlines;
 if (mode === 'feedback-deadline') {
@@ -60,6 +61,10 @@ globalThis.fetch = async (input, init) => {
   if (body.reasoning_effort !== (reasoningEffort ?? undefined)) throw Error('reasoning effort changed or omitted');
   count++;
   const reviewing = JSON.stringify(body.messages.at(-1)).includes('Host review phase:');
+  if (!reviewing) synthesisMaxTokens ??= body.max_tokens;
+  if (body.max_tokens !== (reviewing ? Math.min(synthesisMaxTokens, 4096) : synthesisMaxTokens)) {
+    throw Error('wrong synthesis/review HTTP output budget');
+  }
   if (reviewing) {
     if (body.tools !== undefined) throw Error('review offered executable tools');
     if (!JSON.stringify(body.messages).includes('Offline transport fixture only.')) throw Error('original proposal history missing');
@@ -163,6 +168,54 @@ globalThis.fetch = async (input, init) => {
 '''
 
 
+@pytest.mark.parametrize("error_code", ["timeout", "cancelled", None])
+def test_closed_tool_result_pipe_preserves_only_valid_terminal(tmp_path, monkeypatch, error_code):
+    import sys
+    from taosc_llm.bridge import AdapterError
+    from test_context_tools import make_dataset
+
+    context = prepare_context(make_dataset(tmp_path / "dataset"), run_dir=tmp_path / "run")
+    calls = []
+
+    def drained_tool(current, name, arguments, *, operation_check=None):
+        calls.append(name)
+        return {"context_id": current.context_id, "ok": False,
+                "error": {"code": "backend_error", "message": "operation stopped"}}
+
+    monkeypatch.setattr(type(context), "call_tool", drained_tool)
+    # A worker terminal can precede host tool settlement. Close its input first
+    # so the bridge's late tool_result write deterministically hits a dead pipe.
+    worker = tmp_path / "closed-pipe.py"
+    worker.write_text('''import json, os, sys
+start = json.loads(sys.stdin.readline())
+os.close(0)
+envelope = {key: start[key] for key in ("protocol_version", "run_id")}
+def emit(frame):
+    print(json.dumps({**envelope, **frame}), flush=True)
+emit({"request_id": "tool-1", "type": "tool_request", "context_id": start["context_id"],
+      "tool": "get_patch_context", "arguments": {"context_id": start["context_id"]}})
+code = ''' + repr(error_code) + '''
+if code is not None:
+    emit({"request_id": start["request_id"], "type": "turn_failed", "error_code": code,
+          "remote_settled": True, "request_count": 1, "retry_after_seconds": None, "http_status": None})
+sys.exit(1)
+''')
+    provider = ProviderConfig(api_key="offline-closed-pipe", base_url="https://example.invalid/v1", model="offline")
+    journal = tmp_path / "turn.jsonl"
+    operation = run_adapter(context, provider, [sys.executable, str(worker)], "offline", journal)
+    if error_code is None:
+        with pytest.raises(AdapterError, match="missing or oversized adapter frame"):
+            asyncio.run(operation)
+    else:
+        terminal = asyncio.run(operation)
+        assert terminal["type"] == "turn_failed" and terminal["error_code"] == error_code
+        assert terminal["remote_settled"] is True
+    assert calls == ["get_patch_context"]
+    frames = [record["frame"] for record in native_records(journal)]
+    assert not any(frame["type"] == "tool_result" for frame in frames)
+    assert context._results == {}
+
+
 @pytest.fixture
 def adapter_context(tmp_path):
     root = os.environ.get("TAOSC_LLM_PI_SDK_ROOT")
@@ -174,7 +227,7 @@ def adapter_context(tmp_path):
 
 def operation(adapter_context, tmp_path, mode, *, journal=None,
               api_key="offline-secret-for-transport", stream_end="eof", reasoning_effort=None,
-              on_complete=None, timeout_seconds=30):
+              on_complete=None, timeout_seconds=30, max_tokens=65536):
     context, root = adapter_context
     journal = journal if journal is not None else tmp_path / "turn.jsonl"
     preload = tmp_path / "provider.mjs"
@@ -186,7 +239,7 @@ def operation(adapter_context, tmp_path, mode, *, journal=None,
     command[1:1] = ["--import", str(preload)]
     provider = ProviderConfig(api_key=api_key, base_url="https://example.invalid/v1",
                               model="offline-exact-model", timeout_seconds=timeout_seconds,
-                              reasoning_effort=reasoning_effort)
+                              max_tokens=max_tokens, reasoning_effort=reasoning_effort)
     result = asyncio.run(run_adapter(context, provider, command, "offline", journal,
                                     on_complete=on_complete))
     assert provider.api_key not in journal.read_text()
@@ -675,7 +728,8 @@ def test_pi_unfinished_transport_remains_unsettled(adapter_context, tmp_path, mo
     assert result["remote_settled"] is False
 
 
-def test_feedback_uses_original_session_and_separate_accounting(adapter_context, tmp_path):
+@pytest.mark.parametrize("max_tokens", [1024, 4096, 65536])
+def test_feedback_uses_original_session_and_separate_accounting(adapter_context, tmp_path, max_tokens):
     callbacks = []
 
     async def host_outcome(proposal):
@@ -684,7 +738,11 @@ def test_feedback_uses_original_session_and_separate_accounting(adapter_context,
         assert any("Offline transport fixture only." in json.dumps(record) for record in records)
         return 'Host review phase: final host result {"status":"unavailable"}. Return Markdown, no tools.'
 
-    result, _ = operation(adapter_context, tmp_path, "tools", on_complete=host_outcome)
+    result, _ = operation(adapter_context, tmp_path, "tools", on_complete=host_outcome, max_tokens=max_tokens)
+    frames = [record["frame"] for record in native_records(tmp_path / "turn.jsonl")]
+    assert next(frame for frame in frames if frame["type"] == "start_turn")["provider"]["max_tokens"] == max_tokens
+    assert next(frame for frame in frames if frame["type"] == "host_outcome")["review_max_tokens"] == min(max_tokens, 4096)
+    assert result["provider_metadata"]["max_tokens"] == max_tokens
     assert len(callbacks) == 1
     assert result["type"] == "turn_complete" and result["request_count"] == 3
     assert result["usage"]["totalTokens"] == 54
@@ -710,6 +768,8 @@ def test_nonfinal_round_releases_original_session_without_review(adapter_context
     assert "session_feedback" not in result
     frames = [entry["frame"] for entry in native_records(tmp_path / "turn.jsonl")]
     assert frames[-1]["type"] == "feedback_complete" and frames[-1]["request_count"] == 0
+    outcome = next(frame for frame in frames if frame["type"] == "host_outcome")
+    assert outcome["review_prompt"] is None and outcome["review_max_tokens"] is None
     assert "Host review phase:" not in (tmp_path / "turn.pi.jsonl").read_text()
 
 

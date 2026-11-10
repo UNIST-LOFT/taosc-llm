@@ -511,7 +511,8 @@ async function run(frame, options, keyPromise) {
         }
         modelTurns++;
         insist(model.provider === PROVIDER_ID && model.id === p.model && model.baseUrl === p.base_url, 'model_mismatch');
-        return chat.streamSimple(model, context, { ...opts, env: {}, fetch: guardedFetch, maxTokens: p.max_tokens, maxRetries: 0,
+        return chat.streamSimple(model, context, { ...opts, env: {}, fetch: guardedFetch,
+          maxTokens: reviewPhase ? Math.min(p.max_tokens, 4096) : p.max_tokens, maxRetries: 0,
           timeoutMs: p.timeout_seconds * 1000, cacheRetention: 'none', reasoning: reasoningEffort,
           onPayload(payload) {
             // Only an explicit provider effort enables the OpenAI reasoning field.
@@ -637,9 +638,10 @@ function receive(frame, options, keyPromise) {
   }
   insist(frame.run_id === start.run_id);
   if (frame.type === 'host_outcome') {
-    exactKeys(frame, ['protocol_version', 'run_id', 'request_id', 'type', 'review_prompt']);
+    exactKeys(frame, ['protocol_version', 'run_id', 'request_id', 'type', 'review_prompt', 'review_max_tokens']);
     insist(start.session_feedback && outcomeWaiter && !failure && !usedIds.has(frame.request_id));
     insist(frame.review_prompt === null || (text(frame.review_prompt) && Buffer.byteLength(frame.review_prompt) <= 65536));
+    insist(frame.review_max_tokens === (frame.review_prompt === null ? null : Math.min(start.provider.max_tokens, 4096)));
     usedIds.add(frame.request_id);
     outcomeWaiter.resolve(frame);
     // Reject duplicate host outcomes before the awaiting continuation runs.

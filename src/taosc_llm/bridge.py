@@ -18,6 +18,12 @@ from .provider import ProviderConfig
 from .native import kill_process, native_environment
 
 MAX_FRAME = 4 * 1024 * 1024
+SESSION_REVIEW_MAX_TOKENS = 4096
+
+
+def review_max_tokens(provider: ProviderConfig) -> int:
+    """Keep optional review output separate from the synthesis token budget."""
+    return min(provider.max_tokens, SESSION_REVIEW_MAX_TOKENS)
 
 
 class AdapterError(RuntimeError):
@@ -132,6 +138,7 @@ async def run_adapter(context: SynthesisContext, provider: ProviderConfig,
         async def conversation():
             nonlocal inspected
             assert process is not None and process.stdout is not None
+            tool_transport_closed = False
             while True:
                 frame = receive(await process.stdout.readline())
                 if frame["type"] in ("turn_complete", "turn_failed"):
@@ -145,7 +152,7 @@ async def run_adapter(context: SynthesisContext, provider: ProviderConfig,
                     if process.returncode != (0 if frame["type"] == "turn_complete" else 1):
                         raise AdapterError("adapter exit disagrees with terminal frame")
                     return result
-                if (frame["type"] != "tool_request" or set(frame) != {
+                if (tool_transport_closed or frame["type"] != "tool_request" or set(frame) != {
                         *envelope, "request_id", "type", "context_id", "tool", "arguments"}
                         or frame["request_id"] in seen or frame["context_id"] != context.context_id):
                     raise AdapterError("invalid or repeated adapter tool request")
@@ -171,7 +178,14 @@ async def run_adapter(context: SynthesisContext, provider: ProviderConfig,
                         checked.add(frame["arguments"]["predicate"])
                     elif frame["tool"] not in ("evaluate_predicate", "test_candidate", "get_candidate_result"):
                         inspected = True
-                await send({**envelope, "type": "tool_result", "request_id": frame["request_id"], "result": result})
+                try:
+                    await send({**envelope, "type": "tool_result", "request_id": frame["request_id"], "result": result})
+                except (BrokenPipeError, ConnectionResetError):
+                    # Node can time out and close stdin while host work drains.
+                    # Its queued terminal is authoritative; do not replace timeout
+                    # or cancellation with a late tool-result write failure. No
+                    # retry or further tool work is allowed on this transport.
+                    tool_transport_closed = True
 
         async def cancel_and_drain():
             assert process is not None and process.stdout is not None
@@ -227,7 +241,8 @@ async def run_adapter(context: SynthesisContext, provider: ProviderConfig,
                 feedback_id = uuid.uuid4().hex
                 try:
                     await send({**envelope, "type": "host_outcome", "request_id": feedback_id,
-                                "review_prompt": prompt})
+                                "review_prompt": prompt,
+                                "review_max_tokens": review_max_tokens(provider) if prompt is not None else None})
                     assert process.stdout is not None
                     frame = receive(await asyncio.wait_for(process.stdout.readline(), provider.timeout_seconds + 20))
                     record("adapter", frame)

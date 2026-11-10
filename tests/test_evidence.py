@@ -230,6 +230,134 @@ def test_missing_oracle_does_not_convert_crash_to_other_crash(dataset):
     assert report['transition']['neutral_paired'] is False
 
 
+def test_quality_requires_actual_repair_and_matching_target_baselines(dataset):
+    case = dataset.rows[0]
+    neutral = capture(dataset)
+    case['observation'] = neutral['outcome']
+    descriptor = parse_candidate(dataset.patch_format, '1').descriptor
+    candidate = capture(dataset, branches=(1,), values=(1,), descriptor=descriptor, normal=True)
+    row = {**observed(candidate, same=False), 'neutral_baseline': observed(neutral)}
+    report = project_case(dataset, case, row)
+    assert report['quality']['category'] == 'improved'
+    from taosc_llm.evidence import quality_case_sets, summarize_quality
+    assert summarize_quality([report])['status'] == 'improved'
+    sets = quality_case_sets({'cases': [{'case_id': case['id'], 'report': report}]})
+    assert sets['improved'] == {case['id']}
+    assert not sets['known_normals']
+    # Same normal candidate, but the neutral does not reproduce the original.
+    row['neutral_baseline'] = observed(capture(dataset, normal=True), same=False)
+    mismatch = project_case(dataset, case, row)
+    assert 'baseline_gaps' in mismatch['quality']['facets']
+    assert 'improved' not in mismatch['quality']['facets']
+    assert summarize_quality([mismatch])['status'] == 'regressed'  # actual normal branch divergence remains visible
+    assert 'original-neutral-disagreement' in mismatch['quality']['reasons']
+    sets = quality_case_sets({'cases': [{'case_id': case['id'], 'report': mismatch}]})
+    assert sets['observed_normals'] == sets['branch_regressions'] == sets['baseline_gaps'] == {case['id']}
+    assert not sets['known_normals'] and not sets['improved']
+
+
+@pytest.mark.parametrize(('neutral_branches', 'candidate_branches', 'values', 'difference'), [
+    ((0, 0, 0), (0, 1), (0, 1), (1, 0, 1, 3, 2)),
+    ((0, 0), (0,), (0,), (1, 0, None, 2, 1)),
+    ((0,), (0, 1), (0, 1), (1, None, 1, 1, 2)),
+])
+def test_normal_complete_vector_differences_have_exact_counterexamples(
+        dataset, neutral_branches, candidate_branches, values, difference):
+    case = dataset.rows[0]
+    neutral = capture(dataset, branches=neutral_branches, values=(0,) * len(neutral_branches), normal=True)
+    case['observation'] = neutral['outcome']
+    candidate = capture(dataset, branches=candidate_branches, values=values, normal=True,
+                        descriptor=parse_candidate(dataset.patch_format, 'rax != 0').descriptor)
+    report = project_case(dataset, case, {**observed(candidate, same=False),
+                                         'neutral_baseline': observed(neutral, same=False)})
+    quality = report['quality']
+    assert quality['category'] == 'branch_regression'
+    assert quality['known_normal'] is quality['observed_normal'] is True
+    assert quality['branch_difference'] == dict(zip(
+        ('first_difference', 'neutral_branch', 'candidate_branch', 'neutral_hits', 'candidate_hits'), difference),
+        basis='actual_complete_vectors')
+    from taosc_llm.evidence import quality_case_sets, summarize_quality
+    assert summarize_quality([report])['status'] == 'regressed'
+    sets = quality_case_sets({'cases': [{'case_id': case['id'], 'report': report}]})
+    assert sets['branch_regressions'] == sets['known_normals'] == sets['observed_normals'] == {case['id']}
+
+
+@pytest.mark.parametrize('kind', ['predicted', 'partial', 'invalid', 'wrong-artifact',
+                                  'unmatched-control', 'wrong-case', 'wrong-domain', 'wrong-control-case'])
+def test_inference_or_incompatible_capture_never_establishes_branch_regression(dataset, kind):
+    case = dataset.rows[0]
+    neutral = capture(dataset, normal=True)
+    case['observation'] = neutral['outcome']
+    descriptor = parse_candidate(dataset.patch_format, '1').descriptor
+    candidate = capture(dataset, branches=(1,), values=(1,), descriptor=descriptor, normal=True)
+    row = {**observed(candidate, same=False), 'neutral_baseline': observed(neutral, same=False)}
+    if kind == 'predicted':
+        row.update(capture=None, offline_reference=neutral, offline_branches=[1], first_divergence=0)
+    elif kind == 'partial':
+        candidate['complete'] = False
+    elif kind == 'invalid':
+        candidate['sha256'] = '0' * 64
+    elif kind == 'wrong-artifact':
+        candidate['artifact_sha256'] = '0' * 64
+    elif kind == 'wrong-case':
+        row['case_id'] = 'system:99'
+    elif kind == 'wrong-domain':
+        row['domain'] = 'function'
+    elif kind == 'wrong-control-case':
+        row['neutral_baseline']['case_id'] = 'system:99'
+    else:
+        neutral['artifact_sha256'] = '0' * 64
+    report = project_case(dataset, case, row)
+    assert 'branch_regressions' not in report['quality']['facets']
+    assert 'improved' not in report['quality']['facets']
+    assert report['branch_comparison']['status'] == 'unavailable'
+
+
+@pytest.mark.parametrize(('neutral_normal', 'candidate_kind', 'predicate', 'category', 'facets'), [
+    (False, 'normal', '0', 'unproven', {'unproven'}),
+    (False, 'normal', 'rax / 0', 'unproven', {'unproven'}),
+    (False, 'other', '1', 'other_crash', {'other_crashes'}),
+    (False, 'target', '1', 'target_miss', {'target_misses'}),
+    (True, 'other', '1', 'crash_regression', {'crash_regressions', 'other_crashes'}),
+    (True, 'target', '1', 'crash_regression', {'crash_regressions'}),
+    (True, 'normal', '0', 'preserved_normal', {'preserved_normal'}),
+])
+def test_quality_separates_target_misses_other_faults_traps_and_unproven_normals(
+        dataset, neutral_normal, candidate_kind, predicate, category, facets):
+    case = dataset.rows[0]
+    neutral = capture(dataset, normal=neutral_normal)
+    case['observation'] = neutral['outcome']
+    descriptor = parse_candidate(dataset.patch_format, predicate).descriptor
+    branch = 2 if '/' in predicate else 0 if predicate == '0' else 1
+    candidate = capture(dataset, values=(1,), branches=(branch,), descriptor=descriptor,
+                        normal=candidate_kind == 'normal')
+    if candidate_kind == 'other':
+        candidate['outcome']['fault_addr'] = 44
+    report = project_case(dataset, case, {**observed(candidate, same=candidate_kind == 'target'),
+                                         'neutral_baseline': observed(neutral, same=not neutral_normal)})
+    assert report['quality']['category'] == category
+    assert set(report['quality']['facets']) == facets
+
+
+def test_all_baseline_gaps_and_all_preserved_normals_are_not_repair_success(dataset):
+    from taosc_llm.evidence import summarize_quality
+    case = dataset.rows[0]
+    neutral = capture(dataset, normal=True)
+    descriptor = parse_candidate(dataset.patch_format, '0').descriptor
+    candidate = capture(dataset, normal=True, descriptor=descriptor)
+    row = {**observed(candidate, same=False), 'neutral_baseline': observed(neutral, same=False)}
+    case['observation'] = capture(dataset)['outcome']
+    mismatch = project_case(dataset, case, row)
+    quality = summarize_quality([mismatch])
+    assert quality['status'] == 'incomplete'
+    assert quality['counts']['baseline_gaps'] == 1
+    assert quality['counts']['improved'] == 0
+    case['observation'] = neutral['outcome']
+    preserved = project_case(dataset, case, row)
+    assert summarize_quality([preserved])['status'] == 'unproven'
+    assert summarize_quality([])['status'] == 'incomplete'
+
+
 def test_mutation_write_provenance_is_ordered_authenticated_and_not_state(dataset, tmp_path):
     committed = capture(dataset, same=True)
     case = {**dataset.rows[0], 'id': 'function:7', 'domain': 'function', 'capture': committed}

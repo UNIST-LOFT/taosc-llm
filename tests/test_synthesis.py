@@ -266,9 +266,12 @@ def test_feedback_follows_final_host_outcome_only(tmp_path, monkeypatch, outcome
 
     def evaluate(*args, **kwargs):
         return {"status": outcome, "evaluation_mode": "host", "private_path": "private-host-path",
+                "quality": {"status": "improved" if outcome == "not_rejected" else "incomplete",
+                            "counts": {}, "reasons": []},
                 "report_summary": {"domains": {}}, "cases": [{"case_id": "function:0", "source": "raw-provider-secret",
                     "report": {"case_id": "function:0", "domain": "function",
-                               "candidate": {"outcome": "unknown"}}}]}
+                               "candidate": {"outcome": "unknown"},
+                               "activation": {"status": "unknown"}}}]}
 
     monkeypatch.setattr(synthesis, "run_adapter", model)
     monkeypatch.setattr(synthesis, "build_candidate", build)
@@ -282,29 +285,6 @@ def test_feedback_follows_final_host_outcome_only(tmp_path, monkeypatch, outcome
     assert path.stat().st_mode & 0o777 == 0o600
     assert "final_text" not in result["session_feedback"]
     assert all("session_feedback" not in attempt for attempt in result["attempts"])
-
-
-def test_review_uses_only_minimal_target_feedback(tmp_path):
-    context = prepare_context(make_dataset(tmp_path / "dataset", count=12), run_dir=tmp_path / "runs")
-    provider = ProviderConfig(api_key="offline-only", base_url="https://example.invalid/v1", model="offline")
-    cases = [{"case_id": f"function:{index}", "report": {
-        "case_id": f"function:{index}", "domain": "function",
-        "candidate": {"outcome": "target_crash" if index == 11 else
-                       "other_crash" if index == 10 else "unknown"},
-        "activation": {"status": "fired" if index == 11 else "unknown"},
-        "oracle_reference": {"sha256": "private-oracle-digest"}}}
-        for index in range(12)]
-    evaluated = {"status": "reject_same_crash", "cases": cases,
-                 "report_summary": {"private-summary": True}, "source": "private-source-path"}
-    prompt = synthesis._review_prompt(context, {"status": "refinement_exhausted"},
-        {"round": 2, "status": "reject_same_crash", "evaluation": evaluated}, provider)
-    payload = json.loads(prompt.split("Final host result:\n", 1)[1])
-    assert payload["feedback"]["missed_target_crashes"]["count"] == 1
-    assert payload["feedback"]["missed_target_crashes"]["examples"][0]["case_id"] == "function:11"
-    assert payload["host_run_status"] == "refinement_exhausted"
-    for private in ("schema_sha256", "report_summary", "private-summary", "private-source-path",
-                    "private-oracle-digest", "function:10", '"reports"'):
-        assert private not in prompt
 
 
 def test_feedback_failure_is_separate_from_abstention(tmp_path, monkeypatch):
@@ -428,7 +408,8 @@ def test_refinement_uses_same_minimal_feedback_as_review(tmp_path, monkeypatch):
                      "activation": {"status": "not_fired"}}},
                     {"case_id": "function:1", "report": {
                      "case_id": "function:1", "domain": "function",
-                     "candidate": {"outcome": "other_crash"}}}]}
+                     "candidate": {"outcome": "other_crash"},
+                     "activation": {"status": "unknown"}}}]}
     calls = []
 
     async def model(current, *args):
@@ -442,7 +423,7 @@ def test_refinement_uses_same_minimal_feedback_as_review(tmp_path, monkeypatch):
         assert retrieved["ok"] and retrieved["missed_target_crashes"]["count"] == 1
         assert feedback["result_id"].startswith("r") and len(feedback["result_id"]) < 10
         public = json.dumps(feedback)
-        for forbidden in ("report_summary", "private-summary-digest", "function:1", "case_results"):
+        for forbidden in ("report_summary", "private-summary-digest", "case_results"):
             assert forbidden not in public
         return terminal(current, proposal(current, decision="abstain", predicate=None), [])
 
@@ -457,6 +438,63 @@ def test_refinement_uses_same_minimal_feedback_as_review(tmp_path, monkeypatch):
     assert result["status"] == "abstained" and len(calls) == 2
     # Full evaluator evidence remains in the private run, not the next model prompt.
     assert result["rounds"][0]["evaluation"] == evaluated
+
+
+def quality_round(*, repaired=(), normals=(), branches=(), misses=(), missing=()):
+    """Private classifier outputs at the refinement boundary, not fake captures."""
+    rows = []
+    for ids, facet in ((repaired, "improved"), (normals, "preserved_normal"),
+                       (branches, "branch_regressions"), (misses, "target_misses"),
+                       (missing, "unavailable")):
+        for identifier in ids:
+            normal = facet in ("preserved_normal", "branch_regressions")
+            rows.append({"case_id": identifier, "report": {"quality": {
+                "facets": [facet], "known_normal": normal, "observed_normal": normal}}})
+    return {"evaluation": {"cases": rows}}
+
+
+@pytest.mark.parametrize("change,accepted,reason", [
+    ({"repaired": ("target",), "normals": ("n1",), "branches": ("n2",)}, True, "quality-improved"),
+    ({"repaired": (), "normals": ("n1", "n2")}, False, "preservation-failed"),
+    ({"repaired": ("target",), "normals": ("n1",), "missing": ("n2",)}, False, "preservation-failed"),
+    ({"repaired": ("target",), "normals": ("n1",), "misses": ("n2",)}, False, "preservation-failed"),
+    ({"repaired": ("target",), "branches": ("n1", "n2")}, False, "no-quality-improvement"),
+])
+def test_incumbent_reduces_regressions_without_losing_repairs_or_evidence(change, accepted, reason):
+    previous = quality_round(repaired=("target",), branches=("n1", "n2"))
+    selected, diagnostic = synthesis._select_candidate(previous, quality_round(**change))
+    assert selected is accepted
+    assert diagnostic["reason"] == reason
+    if change.get("missing"):
+        assert diagnostic["lost_normal_evidence"] == {"count": 1, "case_ids": ["n2"]}
+    if not change["repaired"]:
+        assert diagnostic["lost_improvements"] == {"count": 1, "case_ids": ["target"]}
+
+
+def test_nonreproducing_normal_branch_regression_cannot_be_hidden():
+    previous = quality_round(branches=("mismatch",))
+    previous["evaluation"]["cases"][0]["report"]["quality"]["known_normal"] = False
+    selected, diagnostic = synthesis._select_candidate(previous, quality_round(missing=("mismatch",)))
+    assert selected is False
+    assert diagnostic["lost_normal_evidence"]["case_ids"] == ["mismatch"]
+
+
+def test_replay_binding_fails_before_provider_or_original_execution(tmp_path, monkeypatch):
+    context = prepare_context(make_dataset(tmp_path / "dataset"), run_dir=tmp_path / "result",
+                              replay_socket=tmp_path / "unrelated.sock")
+    provider = ProviderConfig(api_key="offline-only", base_url="https://example.invalid/v1", model="offline")
+    monkeypatch.setattr(synthesis, "adapter_command", lambda _: ["not-executed"])
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid replay binding must fail before provider or target execution")
+
+    monkeypatch.setattr(synthesis, "poc_observation", forbidden)
+    monkeypatch.setattr(synthesis, "_model_round", forbidden)
+    from taosc_llm.replay import ReplayError
+    with pytest.raises(ReplayError):
+        asyncio.run(synthesis.synthesize_context(context, provider))
+    saved = json.loads((context.run_dir / "run.json").read_text())
+    assert saved["status"] == "infrastructure_error" and saved["rounds"] == []
 
 
 

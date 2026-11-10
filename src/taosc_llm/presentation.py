@@ -8,7 +8,7 @@ from __future__ import annotations
 from binradar.binradar_taosc_predicates import REGISTER_TO_VAR
 
 from .cases import case_order, case_records, relevant_registers
-from .evidence import project_case
+from .evidence import classify_quality, project_case, summarize_quality
 
 
 _VISIBLE = frozenset(('target_crash', 'normal'))
@@ -52,9 +52,12 @@ def compact_case(dataset, report, *, predicate=None):
     """
     result = {'case_id': report['case_id']}
     for role in ('original_baseline', 'neutral_baseline', 'candidate'):
-        outcome = _outcome(report.get(role, {}))
-        if outcome is not None:
+        observation = report.get(role, {})
+        outcome = observation.get('outcome') if observation.get('applicable', True) else None
+        if outcome in ('target_crash', 'normal', 'other_crash'):
             result[role] = outcome
+    quality = report.get('quality') or classify_quality(report)
+    result['quality'] = {key: quality[key] for key in ('category', 'reasons', 'branch_difference') if key in quality}
     activation = report.get('activation', {})
     if activation.get('status') in ('fired', 'not_fired', 'zero_hits', 'trapped'):
         result['activation'] = {key: activation[key] for key in
@@ -152,46 +155,52 @@ def sample_cases(dataset, records, *, predicate=None):
             for key, group in groups.items()}
 
 
-def feedback(dataset, evaluation):
-    """All-record failure counts, bounded counterexamples, one material warning.
+def _counterexample(dataset, record, predicate):
+    report = record['report']
+    quality = report.get('quality') or classify_quality(report)
+    result = _example(dataset, record, predicate)
+    # An explicit failure counterexample is not an initial normal/crash sample.
+    # Other faults and unknown outcomes must stay visible, without fault PCs.
+    result.update(basis='candidate', outcome=report['candidate']['outcome'],
+                  category=quality['category'])
+    neutral = report.get('neutral_baseline', {})
+    if neutral.get('compatible_control') is True:
+        result['neutral_baseline'] = neutral.get('outcome', 'unknown')
+    if quality['reasons']:
+        result['reasons'] = quality['reasons']
+    if 'branch_difference' in quality:
+        result['branch_difference'] = quality['branch_difference']
+    return result
 
-    Categories are disjoint. A normal original observation cannot establish a
-    same-artifact regression, especially for function mutations where originals
-    are not applicable.
+
+def feedback(dataset, evaluation):
+    """Public quality counts and at most three examples per failure/gap facet.
+
+    Crash regressions and target misses are disjoint. Other crashes and baseline
+    gaps are orthogonal facets; counts must not be summed into a population.
+    Raw reports, capture identities and observed fault addresses remain private.
     """
     records = case_records(dataset, evaluation)
-    missed, regressions = [], []
-    incomplete = control_gap = False
+    groups = {key: [] for key in ('target_misses', 'crash_regressions', 'branch_regressions',
+                                  'other_crashes', 'unavailable', 'baseline_gaps', 'unproven')}
     for record in records:
-        report = record['report']
-        candidate = report.get('candidate', {})
-        neutral = report.get('neutral_baseline', {})
-        if candidate.get('outcome') == 'other_crash':
-            continue
-        if candidate.get('outcome') == 'target_crash':
-            regression = (neutral.get('applicable', True)
-                          and neutral.get('compatible_control') is True
-                          and neutral.get('outcome') == 'normal')
-            (regressions if regression else missed).append(record)
-        # Other-location observations are not disclosed, including in counts.
-        # They also cannot silently turn an incomplete evaluation into success.
-        incomplete |= (candidate.get('outcome') not in _VISIBLE
-                       or report.get('activation', {}).get('status') == 'unknown')
-        control_gap |= (neutral.get('compatible_control') is not True
-                        or (report.get('original_baseline', {}).get('outcome') == 'target_crash'
-                            and neutral.get('outcome') != 'target_crash'))
+        quality = record['report'].get('quality') or classify_quality(record['report'])
+        for facet in quality['facets']:
+            if facet in groups:
+                groups[facet].append(record)
     predicate = evaluation.get('predicate')
-    result = {key: {'count': len(group), 'examples': [
-        _example(dataset, record, predicate) for record in _representatives(group)]}
-              for key, group in (('missed_target_crashes', missed), ('regressions', regressions))}
-    if not records or incomplete or control_gap:
-        limitations = []
-        if not records or incomplete:
-            limitations.append('incomplete candidate coverage or activation')
-        if control_gap:
-            limitations.append('unmatched or nonreproducing neutral controls')
-        result['warning'] = ('Limited evidence: ' + '; '.join(limitations)
-                             + '. Normal observations do not establish repair.')
+    def examples(group):
+        return [_counterexample(dataset, record, predicate) for record in _representatives(group)]
+    quality = summarize_quality(record['report'] for record in records)
+    quality['examples'] = {key: examples(groups[key]) for key in
+                          ('other_crashes', 'unavailable', 'baseline_gaps', 'unproven') if groups[key]}
+    result = {'quality': quality}
+    for public, private in (('missed_target_crashes', 'target_misses'),
+                            ('regressions', 'crash_regressions'), ('branch_regressions', 'branch_regressions')):
+        result[public] = {'count': len(groups[private]), 'examples': examples(groups[private])}
+    if not records or any(groups[key] for key in ('unavailable', 'baseline_gaps', 'unproven')):
+        result['warning'] = ('Limited evidence: missing candidate evidence, unmatched controls or unproven repair. '
+                             'Normal observations alone do not establish repair.')
     return result
 
 

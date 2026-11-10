@@ -236,16 +236,22 @@ def dataset_socket(dataset) -> Path:
 def retained_cases(dataset) -> list[dict]:
     """Select the native committed-useful subset without losing offline evidence.
 
-    Native snapshot_modify_memory fails before publishing a valid exit when a
-    plan cannot apply, and generation discards patch-zero site misses before
-    committing captures. Consequently the imported committed mutation pairs
-    already guarantee applied/site-observed. snapshot_replay_commit_plan further
-    keeps only normal exits or authenticated target crashes; other crashes are
-    valid frozen evidence, but have no retained plan.
+    Import requires the canonical frame's CRC-covered timeout-exclusion proof;
+    old committed crash captures alone cannot distinguish timeout salvage.
+    Native application failures, patch-zero site misses and all timeout attempts
+    are discarded before commit. Of the remaining cases, only normal exits and
+    authenticated target crashes have retained plans; other crashes stay offline.
     """
-    return [case for case in dataset.cases("function")
+    cases = dataset.cases("function")
+    if any((case.get("capture") or {}).get("timeout_excluded") is not True
+           for case in cases):
+        raise ReplayError(
+            "function evidence lacks authenticated timeout exclusion; regenerate "
+            "the BinRadar mutation run and prepare a new dataset")
+    return [case for case in cases
             if (case.get("capture") or {}).get("outcome", {}).get("outcome") == "normal"
-            or (case.get("capture") or {}).get("same_crash") is True]
+            or ((case.get("capture") or {}).get("outcome", {}).get("outcome") == "crash"
+                and (case.get("capture") or {}).get("same_crash") is True)]
 
 
 def validate_dataset(dataset, socket_path, *, operation_check=None) -> tuple[Path, list[dict], dict]:

@@ -36,10 +36,18 @@ def _run(label: str, operation) -> int:
             result = operation()
         print(json.dumps(result, allow_nan=False))
         status = result.get("status")
-        if status == "reject_same_crash":
+        if status in ("reject_same_crash", "rejected", "regressed"):
             return 2
         if status == "unavailable":
             return 3
+        quality = result.get("quality")
+        # Neutral warming is acquisition, not candidate-success accounting.
+        warming = label == "taosc-llm-evaluate" and result.get("predicate") is None
+        if status == "not_rejected" and quality is not None and not warming:
+            if quality["status"] in ("rejected", "regressed"):
+                return 2
+            if quality["status"] != "improved":
+                return 3
         return 0 if status in ("prepared", "built", "abstained", "not_rejected", "warmed") else 1
     except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as error:
         print(f"{label}: {error}", file=sys.stderr)
