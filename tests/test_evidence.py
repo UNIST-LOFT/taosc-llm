@@ -249,7 +249,7 @@ def test_quality_requires_actual_repair_and_matching_target_baselines(dataset):
     mismatch = project_case(dataset, case, row)
     assert 'baseline_gaps' in mismatch['quality']['facets']
     assert 'improved' not in mismatch['quality']['facets']
-    assert summarize_quality([mismatch])['status'] == 'regressed'  # actual normal branch divergence remains visible
+    assert summarize_quality([mismatch])['status'] == 'incomplete'  # branch divergence does not erase the gap
     assert 'original-neutral-disagreement' in mismatch['quality']['reasons']
     sets = quality_case_sets({'cases': [{'case_id': case['id'], 'report': mismatch}]})
     assert sets['observed_normals'] == sets['branch_regressions'] == sets['baseline_gaps'] == {case['id']}
@@ -277,7 +277,7 @@ def test_normal_complete_vector_differences_have_exact_counterexamples(
         ('first_difference', 'neutral_branch', 'candidate_branch', 'neutral_hits', 'candidate_hits'), difference),
         basis='actual_complete_vectors')
     from taosc_llm.evidence import quality_case_sets, summarize_quality
-    assert summarize_quality([report])['status'] == 'regressed'
+    assert summarize_quality([report])['status'] == 'unproven'  # normal-only cases do not establish repair
     sets = quality_case_sets({'cases': [{'case_id': case['id'], 'report': report}]})
     assert sets['branch_regressions'] == sets['known_normals'] == sets['observed_normals'] == {case['id']}
 
@@ -337,6 +337,71 @@ def test_quality_separates_target_misses_other_faults_traps_and_unproven_normals
                                          'neutral_baseline': observed(neutral, same=not neutral_normal)})
     assert report['quality']['category'] == category
     assert set(report['quality']['facets']) == facets
+
+
+@pytest.mark.parametrize(('extra', 'expected'), [
+    (None, 'improved_with_regressions'),
+    ('target', 'rejected'),
+    ('other', 'rejected'),
+    ('normal-to-target', 'rejected'),
+    ('normal-to-other', 'rejected'),
+    ('crash-and-gap', 'rejected'),
+    ('crash-and-trap', 'rejected'),
+    ('crash-without-complete-capture', 'rejected'),
+    ('unavailable', 'incomplete'),
+    ('baseline-gap', 'incomplete'),
+    ('trapped', 'unproven'),
+    ('nonrepair', 'unproven'),
+    ('no-repair', 'unproven'),
+])
+def test_soft_branches_require_repair_and_never_override_crashes_or_evidence_gaps(dataset, extra, expected):
+    from taosc_llm.evidence import summarize_quality
+
+    def actual(number, *, neutral_normal=False, candidate_kind='normal', predicate='1', gap=False, complete=True):
+        neutral = capture(dataset, normal=neutral_normal)
+        case = {**dataset.rows[0], 'id': f'system:{number}',
+                'observation': capture(dataset)['outcome'] if gap else neutral['outcome']}
+        control = observed(neutral, same=not neutral_normal)
+        if candidate_kind == 'unknown':
+            row = {'neutral_baseline': control, 'reason': 'capture-unavailable'}
+        else:
+            descriptor = parse_candidate(dataset.patch_format, predicate).descriptor
+            branch = 2 if '/' in predicate else 0 if predicate == '0' else 1
+            candidate = capture(dataset, branches=(branch,), values=(1,), descriptor=descriptor,
+                                normal=candidate_kind == 'normal')
+            if candidate_kind == 'other':
+                candidate['outcome']['fault_addr'] = 44
+            candidate['complete'] = complete
+            row = {**observed(candidate, same=candidate_kind == 'target'), 'neutral_baseline': control}
+        return project_case(dataset, case, row)
+
+    reports = [actual(0), actual(1, neutral_normal=True), actual(2, neutral_normal=True, predicate='0')]
+    assert [row['quality']['category'] for row in reports] == [
+        'improved', 'branch_regression', 'preserved_normal']
+    if extra == 'no-repair':
+        reports.pop(0)
+    elif extra is not None:
+        options = {
+            'target': {'candidate_kind': 'target'},
+            'other': {'candidate_kind': 'other'},
+            'normal-to-target': {'neutral_normal': True, 'candidate_kind': 'target'},
+            'normal-to-other': {'neutral_normal': True, 'candidate_kind': 'other'},
+            'crash-and-gap': {'neutral_normal': True, 'candidate_kind': 'other', 'gap': True},
+            'crash-and-trap': {'candidate_kind': 'target', 'predicate': 'rax / 0'},
+            'crash-without-complete-capture': {'candidate_kind': 'target', 'complete': False},
+            'unavailable': {'candidate_kind': 'unknown'},
+            'baseline-gap': {'neutral_normal': True, 'gap': True},
+            'trapped': {'predicate': 'rax / 0'},
+            'nonrepair': {'predicate': '0'},
+        }
+        reports.append(actual(3, **options[extra]))
+    quality = summarize_quality(reports)
+    assert quality['status'] == expected
+    assert quality['counts']['branch_regressions'] == (2 if extra == 'baseline-gap' else 1)
+    assert quality['counts']['improved'] == (0 if extra == 'no-repair' else 1)
+    assert quality['counts']['preserved_normal'] == 1
+    if extra == 'no-repair':
+        assert 'no-established-target-repair' in quality['reasons']
 
 
 def test_all_baseline_gaps_and_all_preserved_normals_are_not_repair_success(dataset):

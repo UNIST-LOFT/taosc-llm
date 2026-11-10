@@ -192,13 +192,19 @@ def feedback(dataset, evaluation):
     def examples(group):
         return [_counterexample(dataset, record, predicate) for record in _representatives(group)]
     quality = summarize_quality(record['report'] for record in records)
+    quality['objectives'] = {
+        'hard': ('Block all candidate crashes, including target and other crashes. '
+                 'Incomplete or unproven evidence never establishes repair success.'),
+        'soft': ('Minimize and report authenticated normal-to-normal branch-vector regressions. '
+                 'Residual branch regressions alone do not reject an otherwise established repair.')}
     quality['examples'] = {key: examples(groups[key]) for key in
                           ('other_crashes', 'unavailable', 'baseline_gaps', 'unproven') if groups[key]}
     result = {'quality': quality}
     for public, private in (('missed_target_crashes', 'target_misses'),
                             ('regressions', 'crash_regressions'), ('branch_regressions', 'branch_regressions')):
         result[public] = {'count': len(groups[private]), 'examples': examples(groups[private])}
-    if not records or any(groups[key] for key in ('unavailable', 'baseline_gaps', 'unproven')):
+    if quality['status'] in ('incomplete', 'unproven') or any(
+            groups[key] for key in ('unavailable', 'baseline_gaps', 'unproven')):
         result['warning'] = ('Limited evidence: missing candidate evidence, unmatched controls or unproven repair. '
                              'Normal observations alone do not establish repair.')
     return result

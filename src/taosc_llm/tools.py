@@ -295,6 +295,11 @@ def call_tool(context: SynthesisContext, name, args, *, operation_check=None):
         if args.get("context_id") != context.context_id:
             raise ToolError("stale_context", "context ID mismatch")
         _validate(args, definitions[name]["parameters"])
+        if name in ("evaluate_predicate", "test_candidate"):
+            # A rejected expression cannot read evidence, publish a result or
+            # execute a target. Successful parsing grants no trust: below we
+            # still authenticate the whole dataset and parse its bound family.
+            _candidate(context.dataset, args["predicate"])
         scope = (context.dataset.validation() if operation_check is None
                  else context.dataset.validation(check=operation_check))
         with scope as dataset:

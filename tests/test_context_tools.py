@@ -134,6 +134,28 @@ def test_each_tool_revalidates_after_an_earlier_success(context, name, args):
     assert result['error']['code'] == 'backend_error'
 
 
+@pytest.mark.parametrize("name", ["evaluate_predicate", "test_candidate"])
+def test_invalid_predicate_fails_before_dataset_io_but_valid_predicate_authenticates(context, monkeypatch, name):
+    from taosc_llm import evaluation
+
+    def forbidden_evaluation(*args, **kwargs):
+        pytest.fail("unauthenticated candidate reached evaluation")
+
+    monkeypatch.setattr(evaluation, "evaluate_dataset", forbidden_evaluation)
+    before_results = dict(context._results)
+    before_evidence = set(context._evidence_ids)
+    # A malformed candidate has no evidence/target authority and needs only the
+    # canonical family parser, even if the prepared source is now unavailable.
+    context.dataset.artifact("fixture.orig").unlink()
+    result = query(context, name, predicate="rax[")
+    assert result["error"]["code"] == "invalid_predicate"
+    # Successful parsing must still authenticate every record before evaluation.
+    result = query(context, name, predicate="0")
+    assert result["error"]["code"] == "backend_error"
+    assert context._results == before_results
+    assert set(context._evidence_ids) == before_evidence
+
+
 def test_parallel_tool_evaluation_does_not_share_validation_scope(context, monkeypatch):
     original = context.dataset
     validation = type(original).validation

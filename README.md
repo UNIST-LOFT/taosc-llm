@@ -352,20 +352,33 @@ select more small examples, never an exhaustive case page. Hashes/audit metadata
 stay private; model IDs are short scoped handles. Static `function` views default
 to available facets; select a facet/address for local CFG/value-flow evidence. Strict response parsing, native builds and actual evaluation feedback
 feed bounded refinement rounds (`--max-rounds` 1–16, default 4, provider-only);
-manual mode rejects provider options instead of ignoring them. Only
-`evaluation.quality.status=improved` stops as `not_rejected`: at least one actual
-repair, all remaining cases preserved normal, and no regression or evidence gap.
-Other outcomes feed another bounded round. The selected incumbent must retain
-all established repairs and observed normal executions, and cannot add a new
-crash regression or target miss. Among admissible proposals, fewer crash
-regressions, target misses, branch regressions, unresolved cases, then more
-repairs determine selection in that order; ties retain the incumbent. This
-prevents losing evidence from masquerading as improvement. `selected_round`
-identifies the retained proposal/build/evaluation, even if later attempts are
-worse. At the budget limit, retain its truthful quality status and
-`termination=round_limit`; without an evaluated candidate use
-`refinement_exhausted`. Explicit abstention stops without a candidate. No final
-BinRadar verification is run.
+manual mode rejects provider options instead of ignoring them. The primary goal
+is blocking all crashes without missing or unproven evidence. The secondary goal
+is minimizing authenticated normal→normal branch-vector differences, not rejecting
+an otherwise established repair merely because differences remain.
+`evaluation.quality.status=improved` ends immediately as `not_rejected` with
+`termination=quality_met`. `improved_with_regressions` also maps to `not_rejected`
+and exit 0, but continues refinement while the budget and new candidates permit.
+Neither verdict proves general equivalence or a global minimum.
+
+The selected incumbent must retain all established repairs and observed normal
+executions, and cannot add a newly crashing case (target, other or normal→crash).
+Among admissible proposals, fewer crashing cases, fewer unresolved cases, fewer
+branch regressions, then more repairs determine selection in that order; ties
+retain the incumbent. This prevents losing evidence from masquerading as
+improvement. `selected_round` binds the retained proposal/build/evaluation even
+if later attempts are worse.
+
+Each new round receives the full validated prior proposal, including rationale
+and assumptions, bounded host results, the incumbent and remaining round budget.
+Previously admitted result IDs remain inspectable. Two consecutive evaluated
+rounds with the same canonical predicate and unchanged aggregate and case-level
+quality stop with `termination=repeated_result`; matching counts alone do not
+suffice. Otherwise the configured limit (default four rounds) ends with
+`termination=round_limit`. Both retain the incumbent's actual quality and report
+residual branches normally; crashes and evidence gaps do not become success.
+Without an evaluated candidate use `refinement_exhausted`. Explicit abstention
+stops without a candidate. No final BinRadar verification is run.
 
 Provider routing, credential-file syntax, isolated SDK setup, per-operation
 bounds and externally managed scheduling are specified in
@@ -414,8 +427,8 @@ Stdout contains one JSON result; diagnostics go to stderr. Common CLI exits:
 
 | Exit | Meaning |
 |---|---|
-| 0 | `prepared`, `built`, `abstained`, non-rejected neutral warming, or candidate quality `improved`; never FINAL proof |
-| 2 | `reject_same_crash`, quality `rejected` (including other crash), or `regressed` |
+| 0 | `prepared`, `built`, `abstained`, non-rejected neutral warming, or candidate quality `improved` / `improved_with_regressions`; never FINAL proof |
+| 2 | `reject_same_crash` or quality `rejected` (including other crash) |
 | 3 | `unavailable`, quality `incomplete` or `unproven` |
 | 1 | Other terminal failure, including exhausted refinement or infrastructure/parser/build error |
 | 130 | Interrupted; local cleanup does not prove remote provider completion |

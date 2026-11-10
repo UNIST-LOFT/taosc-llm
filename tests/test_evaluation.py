@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import hashlib
+import json
 from pathlib import Path
 import threading
 import time
@@ -129,6 +130,66 @@ def test_aggregate_rejection_preserves_case_availability(
             assert row['status'] == 'unavailable'
             assert row['reason'] == 'capture-unavailable'
             assert row['branches'] is None
+
+
+@pytest.mark.parametrize(('extra', 'expected_quality', 'expected_diagnostic', 'exit_code'), [
+    ('normal', 'improved_with_regressions', 'not_rejected', 0),
+    ('other', 'rejected', 'not_rejected', 2),
+    ('target', 'rejected', 'reject_same_crash', 2),
+    ('unavailable', 'incomplete', 'not_rejected', 3),
+    ('baseline-gap', 'incomplete', 'not_rejected', 3),
+    ('no-repair', 'unproven', 'not_rejected', 3),
+])
+def test_candidate_quality_keeps_target_diagnostic_and_soft_branch_cli_outcome(
+        dataset, tmp_path, monkeypatch, extra, expected_quality, expected_diagnostic, exit_code, capsys):
+    from taosc_llm.cli import _run
+
+    template = dataset.rows[0]
+    dataset.rows = []
+    for index in range(3):
+        normal = index != 0 or extra == 'no-repair'
+        neutral = capture(dataset, values=(1,), normal=normal)
+        dataset.rows.append({**template, 'id': f'system:{index}', 'capture': neutral,
+                             'observation': neutral['outcome']})
+    if extra == 'baseline-gap':
+        dataset.rows[2]['observation'] = capture(dataset)['outcome']
+
+    def execute(ds, case, descriptor, directory):
+        if case['id'] == 'system:2' and extra == 'unavailable':
+            raise evaluation.ExecutionUnavailable('capture-unavailable')
+        crash = case['id'] == 'system:2' and extra in ('target', 'other')
+        candidate = capture(ds, values=(1,), branches=(1,), descriptor=descriptor, normal=not crash)
+        if crash and extra == 'other':
+            candidate['outcome']['fault_addr'] = 44
+        return candidate
+
+    monkeypatch.setattr(evaluation, 'execute_capture', execute)
+    result = evaluation.evaluate_dataset(dataset, 'rax != 0', include_poc=False, cache_dir=tmp_path / 'cache')
+    assert result['status'] == expected_diagnostic
+    assert result['quality']['status'] == expected_quality
+    assert result['quality']['counts']['branch_regressions'] >= 1
+    assert result['quality']['counts']['improved'] == (0 if extra == 'no-repair' else 1)
+    assert _run('taosc-llm-evaluate', lambda: result) == exit_code
+    assert json.loads(capsys.readouterr().out)['quality']['status'] == expected_quality
+
+
+@pytest.mark.parametrize(('status', 'expected'), [
+    ('improved', 0), ('improved_with_regressions', 0),
+    ('rejected', 2), ('incomplete', 3), ('unproven', 3),
+])
+@pytest.mark.parametrize('label', ['taosc-llm', 'taosc-llm-evaluate'])
+def test_cli_candidate_quality_exit_status(status, expected, label, capsys):
+    from taosc_llm.cli import _run
+    result = {'status': 'not_rejected', 'predicate': 'rax != 0', 'quality': {'status': status}}
+    assert _run(label, lambda: result) == expected
+    assert json.loads(capsys.readouterr().out) == result
+
+
+def test_cli_neutral_warming_is_not_candidate_success_accounting(capsys):
+    from taosc_llm.cli import _run
+    result = {'status': 'not_rejected', 'predicate': None, 'quality': {'status': 'unproven'}}
+    assert _run('taosc-llm-evaluate', lambda: result) == 0
+    assert json.loads(capsys.readouterr().out) == result
 
 
 def test_complete_equal_vector_reuses_real_same_crash(dataset, tmp_path):

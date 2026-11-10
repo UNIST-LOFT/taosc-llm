@@ -1,14 +1,15 @@
 """Request-local authentication boundaries; inert prepared inputs only."""
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
+import hashlib
 import os
 import threading
 
 import pytest
 
 from taosc_llm import analysis
-from taosc_llm.dataset import load_dataset
+from taosc_llm.dataset import canonical, load_dataset, sha256
 from taosc_llm.preparation import prepare_dataset
 from test_preparation import mutation_inputs, preparation_inputs
 
@@ -80,6 +81,97 @@ def test_scope_rejects_parent_directory_symlink_escape(dataset, tmp_path):
             pytest.fail("symlinked analysis directory admitted")
 
 
+@pytest.mark.parametrize("kind", ["input", "analysis", "capture", "artifact"])
+def test_scope_preserves_internal_parent_links_and_rechecks_them_next_operation(dataset, tmp_path, kind):
+    path = owned_path(dataset, kind)
+    parent = path.parent
+    inside = dataset.root / ("relocated-" + parent.name)
+    parent.rename(inside)
+    parent.symlink_to(inside.name, target_is_directory=True)
+    with dataset.validation() as view:
+        assert view.case("system:0")["domain"] == "system"
+        assert view.snapshots(view.case("function:2")["capture"])[0].branch == 0
+        assert view.execution_environment()["BINARY"] == "fixture"
+    # Identical bytes cannot authenticate an escaped directory in a new scope,
+    # even after its internal alias and shared sibling ancestry were trusted.
+    outside = tmp_path / ("outside-" + parent.name)
+    inside.rename(outside)
+    parent.unlink()
+    parent.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="immutable root"):
+        with dataset.validation():
+            pytest.fail("previous operation's ancestry was trusted")
+
+
+@pytest.mark.parametrize("replacement", ["directory", "ancestor", "internal-link", "canonical-target", "root"])
+def test_unseen_capture_rechecks_current_ancestry_in_same_operation(dataset, tmp_path, replacement):
+    parent = dataset.root / "fresh-captures"
+    target = dataset.root / "fresh-target"
+    if replacement in ("internal-link", "canonical-target"):
+        target.mkdir()
+        parent.symlink_to(target.name, target_is_directory=True)
+    else:
+        parent.mkdir()
+    nested = parent / "nested"
+    nested.mkdir()
+    with dataset.validation() as view:
+        original = view.case("function:2")["capture"]
+        raw = view.capture_bytes(original)
+        first_path = nested / "first.brch"
+        next_path = nested / "next.brch"
+        first_path.write_bytes(raw)
+        next_path.write_bytes(raw)
+        first = {**original, "path": str(first_path.relative_to(dataset.root))}
+        unseen = {**original, "path": str(next_path.relative_to(dataset.root))}
+        assert view.snapshots(first)
+        outside = tmp_path / "escaped-captures"
+        if replacement == "internal-link":
+            target.rename(outside)
+            parent.unlink()
+            parent.symlink_to(outside, target_is_directory=True)
+        else:
+            moved = {"directory": nested, "ancestor": parent,
+                     "canonical-target": target, "root": dataset.root}[replacement]
+            moved.rename(outside)
+            moved.symlink_to(outside, target_is_directory=True)
+        # Matching BRCH bytes and an authenticated sibling must never waive
+        # confinement for a path that this operation has not read before.
+        with pytest.raises(ValueError, match="immutable root"):
+            view.snapshots(unseen)
+
+
+def test_scope_preserves_ancestor_links_that_return_inside_root(dataset, tmp_path):
+    inside = dataset.root / "returned"
+    inside.mkdir()
+    payload = inside / "payload"
+    payload.write_bytes(b"owned artifact")
+    outside = tmp_path / "outside-hop"
+    outside.mkdir()
+    (outside / "back").symlink_to(inside, target_is_directory=True)
+    (dataset.root / "hop").symlink_to(outside, target_is_directory=True)
+    manifest = deepcopy(dataset.manifest)
+    manifest["artifacts"]["returned"] = {"path": "hop/back/payload", "sha256": sha256(payload)}
+    manifest.pop("dataset_id")
+    manifest["dataset_id"] = hashlib.sha256(canonical(manifest)).hexdigest()
+    revision = replace(dataset, manifest=manifest)
+    # Existing bound_path semantics inspect the final resolved containment, not
+    # an unnecessarily stronger ban on every intermediate symlink target.
+    assert revision.artifact("returned").read_bytes() == b"owned artifact"
+    with revision.validation() as view:
+        assert view.artifact("returned").read_bytes() == b"owned artifact"
+
+
+@pytest.mark.parametrize("kind", ["input", "analysis", "cases", "env", "capture", "sidecar", "artifact"])
+def test_scope_rejects_leaf_symlinks_even_to_identical_internal_bytes(dataset, kind):
+    path = owned_path(dataset, kind)
+    inside = path.with_name(path.name + ".original")
+    path.rename(inside)
+    path.symlink_to(inside.name)
+    with pytest.raises(ValueError, match="immutable root"):
+        with dataset.validation():
+            pytest.fail("internal leaf symlink admitted")
+
+
 def test_scope_rejects_replaced_root_even_with_identical_files(dataset, tmp_path):
     root = dataset.root
     moved = tmp_path / "moved"
@@ -88,6 +180,21 @@ def test_scope_rejects_replaced_root_even_with_identical_files(dataset, tmp_path
     with pytest.raises(ValueError, match="root"):
         with dataset.validation():
             pytest.fail("replaced dataset root admitted")
+
+
+@pytest.mark.parametrize("failure", [FileNotFoundError, PermissionError])
+def test_scope_requires_accessible_proc_descriptor_paths(dataset, monkeypatch, failure):
+    original = os.readlink
+
+    def unavailable(path, *args, **kwargs):
+        if str(path).startswith("/proc/self/fd/"):
+            raise failure("proc descriptor paths unavailable")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "readlink", unavailable)
+    with pytest.raises(ValueError, match="requires accessible Linux /proc/self/fd"):
+        with dataset.validation():
+            pytest.fail("validation continued without kernel path authentication")
 
 
 @pytest.mark.parametrize("error_exit", [False, True])
@@ -161,6 +268,23 @@ def test_shared_view_returns_independent_containers_and_immutable_states(dataset
             assert view.snapshots(capture)[0].branch == 0
         with ThreadPoolExecutor(max_workers=4) as workers:
             list(workers.map(read, range(8)))
+
+
+def test_public_case_copies_do_not_mutate_authenticated_inventory(dataset):
+    with dataset.validation() as view:
+        expected = view.case("function:2")
+        rows = view.cases("function")
+        row = next(item for item in rows if item["id"] == "function:2")
+        row["capture"]["branches"].clear()
+        row["capture"]["sidecar"]["sha256"] = "0" * 64
+        row["source"]["iteration"] = -1
+        rows.clear()
+        assert view.case("function:2") == expected
+        copied = view.case("function:2")
+        copied["capture"]["branches"].append(2)
+        copied["source"].clear()
+        assert next(item for item in view.cases("function") if item["id"] == "function:2") == expected
+        assert view.snapshots(expected["capture"])[0].branch == 0
 
 
 def test_independent_thread_scopes_do_not_share_lifetime_or_mutable_data(dataset):

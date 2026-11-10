@@ -102,7 +102,7 @@ def test_feedback_counts_full_population_and_partitions_same_artifact_regression
     assert len(response['regressions']['examples']) == 3
     assert all(row['neutral_baseline'] == 'normal' for row in response['regressions']['examples'])
     quality = response['quality']
-    assert quality['status'] == 'regressed'
+    assert quality['status'] == 'rejected'
     assert quality['counts']['other_crashes'] == 1
     other = quality['examples']['other_crashes'][0]
     assert (other['case_id'], other['outcome'], other['category']) == ('system:60', 'other_crash', 'crash_regression')
@@ -125,7 +125,7 @@ def test_feedback_exposes_bounded_exact_branch_counterexamples_and_gap_counts(da
     reports += [report(20, candidate='normal', activity='fired', compatible=False),
                 report(21, candidate='unknown', activity='unknown')]
     response = feedback(dataset, evaluation_for(dataset, reports))
-    assert response['quality']['status'] == 'regressed'
+    assert response['quality']['status'] == 'incomplete'
     assert response['branch_regressions']['count'] == 8
     assert len(response['branch_regressions']['examples']) == 3
     for example in response['branch_regressions']['examples']:
@@ -136,6 +136,48 @@ def test_feedback_exposes_bounded_exact_branch_counterexamples_and_gap_counts(da
     assert response['quality']['counts']['unavailable'] == 1
     assert response['quality']['counts']['improved'] == 0
     assert all(len(examples) <= 3 for examples in response['quality']['examples'].values())
+
+
+@pytest.mark.parametrize(('extra', 'expected'), [
+    (None, 'improved_with_regressions'),
+    ('target_crash', 'rejected'),
+    ('other_crash', 'rejected'),
+    ('unknown', 'incomplete'),
+    ('baseline_gap', 'incomplete'),
+    ('trapped', 'unproven'),
+    ('no_repair', 'unproven'),
+])
+def test_feedback_distinguishes_hard_crash_blocking_from_soft_branch_objective(dataset, extra, expected):
+    reports = [report(i, neutral='normal', original='normal', candidate='normal', activity='fired')
+               for i in range(8)]
+    for row in reports:
+        row['branch_comparison'] = {
+            'status': 'different', 'basis': 'actual_complete_vectors', 'first_difference': 0,
+            'neutral_branch': 0, 'candidate_branch': 1, 'neutral_hits': 1, 'candidate_hits': 1}
+    if extra != 'no_repair':
+        reports.append(report(20, candidate='normal', activity='fired'))
+    if extra in ('target_crash', 'other_crash', 'unknown'):
+        reports.append(report(21, candidate=extra, activity='unknown' if extra == 'unknown' else 'fired'))
+    elif extra == 'baseline_gap':
+        reports.append(report(21, candidate='normal', activity='fired', compatible=False))
+    elif extra == 'trapped':
+        reports.append(report(21, candidate='normal', activity='trapped'))
+    response = feedback(dataset, evaluation_for(dataset, reports))
+    assert response['quality']['status'] == expected
+    objectives = response['quality']['objectives']
+    assert 'Block all candidate crashes' in objectives['hard']
+    assert 'target and other crashes' in objectives['hard']
+    assert 'Incomplete or unproven' in objectives['hard']
+    assert 'Minimize and report' in objectives['soft']
+    assert 'alone do not reject' in objectives['soft']
+    assert response['branch_regressions']['count'] == 8
+    assert len(response['branch_regressions']['examples']) == 3
+    assert all(example['branch_difference']['first_difference'] == 0
+               for example in response['branch_regressions']['examples'])
+    assert ('warning' in response) == (extra in ('unknown', 'baseline_gap', 'trapped', 'no_repair'))
+    public = json.dumps(response)
+    assert '0xbad' not in public and '/private/' not in public
+    assert all(char * 64 not in public for char in 'abcd')
 
 
 def test_normal_unknown_activity_and_nonreproducing_control_have_one_warning(dataset):

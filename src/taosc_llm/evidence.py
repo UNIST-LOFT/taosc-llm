@@ -325,7 +325,8 @@ def classify_quality(report):
     Facets are orthogonal: a crash regression can also be an other crash, and
     missing/mismatched baseline evidence remains visible beside any failure.
     The singular category chooses the most actionable failure, not a partition
-    used to sum the facets. Only improved/preserved_normal are success evidence.
+    used to sum the facets. Only improved establishes repair; authenticated normal
+    branch differences are a soft objective, not an alternative repair claim.
     """
     neutral = report.get('neutral_baseline', {})
     original = report.get('original_baseline', {})
@@ -403,14 +404,14 @@ def classify_quality(report):
 
 
 def summarize_quality(reports):
-    """One public verdict, preserving orthogonal failure/gap denominators."""
+    """Reject crashes before evidence gaps; soften branches only after proven repair."""
     qualities = [report.get('quality') or classify_quality(report) for report in reports]
     counts = {'total': len(qualities), **{key: sum(key in quality['facets'] for quality in qualities)
                                         for key in _QUALITY_COUNTS}}
-    status = ('regressed' if counts['crash_regressions'] or counts['branch_regressions'] else
-              'rejected' if counts['target_misses'] or counts['other_crashes'] else
+    status = ('rejected' if counts['target_misses'] or counts['crash_regressions'] or counts['other_crashes'] else
               'incomplete' if counts['unavailable'] or counts['baseline_gaps'] or not qualities else
-              'unproven' if counts['unproven'] or not counts['improved'] else 'improved')
+              'unproven' if counts['unproven'] or not counts['improved'] else
+              'improved_with_regressions' if counts['branch_regressions'] else 'improved')
     reasons = sorted({reason for quality in qualities for reason in quality['reasons']})
     if not qualities:
         reasons.append('no-evaluated-cases')

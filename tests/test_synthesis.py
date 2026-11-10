@@ -79,7 +79,7 @@ def test_parser_and_real_build_failure_are_feedback_then_abstention(tmp_path, mo
             assert json.loads(latest['invalid_proposal'])['predicate'] == 'rax &&'
             return terminal(current, proposal(current), ["rax < 0"])
         assert latest['error']['kind'] == 'build_rejected'
-        assert latest['predicate'] == 'rax < 0'
+        assert latest['proposal']['predicate'] == 'rax < 0'
         assert 'final_text' not in latest and 'invalid_proposal' not in latest
         return terminal(current, proposal(current, decision="abstain", predicate=None), [])
     monkeypatch.setattr(synthesis, "_model_round", model)
@@ -440,17 +440,20 @@ def test_refinement_uses_same_minimal_feedback_as_review(tmp_path, monkeypatch):
     assert result["rounds"][0]["evaluation"] == evaluated
 
 
-def quality_round(*, repaired=(), normals=(), branches=(), misses=(), missing=()):
+def quality_round(*, repaired=(), normals=(), branches=(), misses=(), missing=(), others=(), gaps=(),
+                  predicate="rax < 0"):
     """Private classifier outputs at the refinement boundary, not fake captures."""
     rows = []
     for ids, facet in ((repaired, "improved"), (normals, "preserved_normal"),
                        (branches, "branch_regressions"), (misses, "target_misses"),
-                       (missing, "unavailable")):
+                       (missing, "unavailable"), (others, "other_crashes"), (gaps, "baseline_gaps")):
         for identifier in ids:
             normal = facet in ("preserved_normal", "branch_regressions")
             rows.append({"case_id": identifier, "report": {"quality": {
-                "facets": [facet], "known_normal": normal, "observed_normal": normal}}})
-    return {"evaluation": {"cases": rows}}
+                "facets": [facet], "known_normal": normal, "observed_normal": normal, "reasons": []}}})
+    from taosc_llm.evidence import summarize_quality
+    return {"proposal": {"predicate": predicate},
+            "evaluation": {"cases": rows, "quality": summarize_quality(row["report"] for row in rows)}}
 
 
 @pytest.mark.parametrize("change,accepted,reason", [
@@ -477,6 +480,51 @@ def test_nonreproducing_normal_branch_regression_cannot_be_hidden():
     selected, diagnostic = synthesis._select_candidate(previous, quality_round(missing=("mismatch",)))
     assert selected is False
     assert diagnostic["lost_normal_evidence"]["case_ids"] == ["mismatch"]
+
+
+def test_other_crash_repair_outweighs_additional_normal_branch_changes():
+    previous = quality_round(repaired=("target",), others=("other",), branches=("n1",), normals=("n2",))
+    candidate = quality_round(repaired=("target", "other"), branches=("n1", "n2"))
+    selected, diagnostic = synthesis._select_candidate(previous, candidate)
+    assert selected is True and diagnostic["reason"] == "quality-improved"
+
+
+def test_fewer_branch_changes_cannot_introduce_an_other_crash():
+    previous = quality_round(repaired=("target",), missing=("unknown",), branches=("n1", "n2"))
+    candidate = quality_round(repaired=("target",), others=("unknown",), normals=("n1", "n2"))
+    selected, diagnostic = synthesis._select_candidate(previous, candidate)
+    assert selected is False
+    assert diagnostic["new_crash_failures"] == {"count": 1, "case_ids": ["unknown"]}
+
+
+def test_fewer_branch_changes_cannot_replace_complete_evidence_with_a_gap():
+    previous = quality_round(repaired=("target",), branches=("n1",), normals=("n2",))
+    candidate = quality_round(repaired=("target",), normals=("n1",), gaps=("n2",))
+    selected, diagnostic = synthesis._select_candidate(previous, candidate)
+    assert selected is False and diagnostic["reason"] == "preservation-failed"
+
+
+@pytest.mark.parametrize("candidate,repeated", [
+    ({"normals": ("n2",), "branches": ("n1",), "predicate": "rax  < 0"}, True),
+    ({"normals": ("n1",), "branches": ("n2",)}, False),
+    ({"normals": ("n1", "n2")}, False),
+    ({"normals": ("n2",), "branches": ("n1",), "predicate": "rax <= 0"}, False),
+    ({"normals": ("n2",), "missing": ("n1",)}, False),
+])
+def test_stagnation_requires_same_predicate_and_unchanged_case_quality(candidate, repeated):
+    previous = quality_round(repaired=("target",), normals=("n2",), branches=("n1",))
+    current = quality_round(repaired=("target",), **candidate)
+    # Fresh versus cached acquisition is not a change in observed quality.
+    previous["evaluation"]["evaluation_mode"] = "host"
+    current["evaluation"]["evaluation_mode"] = "offline"
+    assert synthesis._repeated_result("ERM generic", previous, current) is repeated
+
+
+def test_failed_build_breaks_consecutive_evaluated_result_streak():
+    evaluated = quality_round(repaired=("target",), branches=("normal",))
+    failed = {"proposal": evaluated["proposal"], "status": "build_rejected"}
+    assert synthesis._repeated_result("ERM generic", evaluated, failed) is False
+    assert synthesis._repeated_result("ERM generic", failed, evaluated) is False
 
 
 def test_replay_binding_fails_before_provider_or_original_execution(tmp_path, monkeypatch):

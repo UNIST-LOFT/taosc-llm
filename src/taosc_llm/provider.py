@@ -16,11 +16,11 @@ class ProviderConfig:
     api_key: str = field(repr=False)
     base_url: str = "https://ollama.com/v1"
     model: str = "deepseek-v4.1-flash:1017"
-    context_window: int = 300000
-    max_tokens: int = 65536
-    timeout_seconds: int = 1800
-    max_turns: int = 32
-    max_tool_calls: int = 64
+    context_window: int = 400000
+    max_tokens: int = 100000
+    timeout_seconds: int = 3600
+    max_turns: int = 128
+    max_tool_calls: int = 256
     reasoning_effort: str | None = None
 
     def __post_init__(self):

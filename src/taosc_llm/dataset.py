@@ -7,8 +7,10 @@ from dataclasses import dataclass
 from threading import RLock
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import stat
 
 from binradar import binradar_setup
 from binradar import binradar_taosc_predicates as predicates
@@ -127,7 +129,7 @@ class PreparedDataset:
             self._verify(record)
         self._verify(self.manifest["cases"])
         seen = set()
-        for case in self.cases():
+        for case in self._case_rows():
             if check is not None:
                 check()
             if case["id"] in seen or case["domain"] not in ("system", "function"):
@@ -148,13 +150,16 @@ class PreparedDataset:
             if case["capture"] is not None:
                 self.snapshots(case["capture"])
 
+    def _case_rows(self) -> list[dict]:
+        # Internal readers must not mutate these rows or expose them to callers.
+        path = self._verify(self.manifest["cases"])
+        with path.open() as stream:
+            return [json.loads(line) for line in stream if line.strip()]
+
     def cases(self, domain: str = "all") -> list[dict]:
         if domain not in ("all", "system", "function"):
             raise ValueError("invalid case domain")
-        path = self._verify(self.manifest["cases"])
-        with path.open() as stream:
-            rows = [json.loads(line) for line in stream if line.strip()]
-        return [row for row in rows if domain == "all" or row["domain"] == domain]
+        return [row for row in self._case_rows() if domain == "all" or row["domain"] == domain]
 
     def case(self, case_id: str) -> dict:
         if not isinstance(case_id, str) or not re.fullmatch(r"(?:system|function):[0-9]+", case_id):
@@ -350,9 +355,29 @@ class _ValidatedDataset(PreparedDataset):
             raise ValueError("dataset path must be root-relative")
         if relative not in self._paths:
             path = self.root / relative
-            resolved = path.resolve()
-            if not resolved.is_relative_to(self.root) or path.is_symlink():
-                raise ValueError("dataset path escapes immutable root")
+            # Let the kernel resolve current ancestry for every unseen path.
+            # Python's Path.resolve() lstats every absolute ancestor for every
+            # sibling; caching those ancestors would miss mid-operation link
+            # replacement before an as-yet unauthenticated sibling is read.
+            try:
+                fd = os.open(path, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
+            except FileNotFoundError:
+                # Preserve non-strict path lookup and _verify's hash-mismatch
+                # error for missing records; no successful path trust is cached.
+                return bound_path(self.root, relative)
+            try:
+                try:
+                    resolved = Path(os.readlink(f"/proc/self/fd/{fd}"))
+                except OSError as exc:
+                    raise ValueError(
+                        "dataset validation requires accessible Linux /proc/self/fd") from exc
+                # Intermediate links may leave and return inside the root, but
+                # leaf links are forbidden even when their bytes would match.
+                if (stat.S_ISLNK(os.fstat(fd).st_mode)
+                        or not resolved.is_relative_to(self.root)):
+                    raise ValueError("dataset path escapes immutable root")
+            finally:
+                os.close(fd)
             self._paths[relative] = path
         return self._paths[relative]
 
@@ -375,22 +400,27 @@ class _ValidatedDataset(PreparedDataset):
                 self._verified[key] = path
             return self._verified[key]
 
+    def _case_rows(self) -> list[dict]:
+        with self._lock:
+            self._ensure_active()
+            if self._rows is None:
+                rows = super()._case_rows()
+                object.__setattr__(self, "_rows", rows)
+                self._case_index.update((row["id"], row) for row in rows)
+            return self._rows
+
     def cases(self, domain: str = "all") -> list[dict]:
         with self._lock:
             if domain not in ("all", "system", "function"):
                 raise ValueError("invalid case domain")
-            if self._rows is None:
-                rows = super().cases()
-                object.__setattr__(self, "_rows", rows)
-                self._case_index.update((row["id"], row) for row in rows)
-            return deepcopy([row for row in self._rows if domain == "all" or row["domain"] == domain])
+            return deepcopy([row for row in self._case_rows() if domain == "all" or row["domain"] == domain])
 
     def case(self, case_id: str) -> dict:
         with self._lock:
             if not isinstance(case_id, str) or not re.fullmatch(r"(?:system|function):[0-9]+", case_id):
                 raise ValueError("invalid scoped case id")
             if self._rows is None:
-                self.cases()
+                self._case_rows()
             try:
                 return deepcopy(self._case_index[case_id])
             except KeyError as exc:
