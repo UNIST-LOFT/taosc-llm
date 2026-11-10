@@ -38,10 +38,16 @@ class _PrivateRunner(verifier.BinRadarQemuRunner):
     def get_qemu_stacktrace_command_for_binary(self, binary, input_file, patch_func_entry=0):
         command = super().get_qemu_stacktrace_command_for_binary(binary, input_file, patch_func_entry)
         command[0] = str(Path(command[0]).resolve())
+        # QEMU's get_libqasan_path selects this sibling before its compiled
+        # fallback. access(X_OK) can succeed under Landlock while the guest
+        # loader's later open is denied, silently dropping all preload hooks.
+        library = Path(command[0]).with_name('libqasan.so')
+        if not library.is_file() or not os.access(library, os.R_OK | os.X_OK):
+            raise ExecutionUnavailable('qasan-library-unavailable')
         launcher = str(files('taosc_llm').joinpath('_sandbox.py'))
         argv = [sys.executable, '-I', '-S', launcher, '--scratch', self.dir,
                 '--qemu-self-maps', '--timeout', str(max(1, math.ceil(self.exec_timeout)))]
-        for root in (*_SYSTEM_READ, command[0]):
+        for root in (*_SYSTEM_READ, command[0], library):
             argv.extend(('--read', str(root)))
         return [*argv, '--', *command]
 
@@ -147,6 +153,7 @@ def _execute(dataset, case: dict, descriptor: str, directory: Path, *, original=
         patch_id = str(patch_id) if built is not None else '0'
         environment = native_environment()
         environment.update(HOME=str(work), TMPDIR=str(work), LC_ALL='C',
+                           AFL_PATH=str(Path(paths.QASAN_QEMU_BIN).resolve().parent),
                            AFL_USE_QASAN='1', PATCH_ID=patch_id, TAOSC_PRED=descriptor,
                            BRCACHE_STACK_SIZE=str(runner.brcache_stack_size))
         ranges, _ = runner.e9_metadata_for_binary(str(binary))
@@ -160,6 +167,10 @@ def _execute(dataset, case: dict, descriptor: str, directory: Path, *, original=
             str(binary), patch_id, str(input_file),
             capture_cached=not original and built is None, base_env=environment)
         execution = runner.run_results
+        if execution is not None and any(
+                'libqasan.so' in line and 'cannot be preloaded' in line
+                for line in getattr(execution, 'stderr', '').splitlines()):
+            raise ExecutionUnavailable('qasan-preload-unavailable')
         if (execution is None or not execution.success or execution.timed_out
                 or probe is None or probe.exit_info not in ('ok', 'crash')):
             raise ExecutionUnavailable('execution-unavailable')
@@ -234,7 +245,10 @@ def execute_built(dataset, case: dict, build: dict, directory: Path, *,
 def execution_identity() -> dict:
     """Bind cache entries to the actual host tracer and evaluator implementations."""
     from binradar import binradar_taosc_predicates as predicates
-    return {'qemu': sha256(Path(paths.QASAN_QEMU_BIN)) if Path(paths.QASAN_QEMU_BIN).is_file() else None,
+    qemu = Path(paths.QASAN_QEMU_BIN).resolve()
+    library = qemu.with_name('libqasan.so')
+    return {'qemu': sha256(qemu) if qemu.is_file() else None,
+            'qasan_library': sha256(library) if library.is_file() else None,
             'predicates': sha256(Path(predicates.__file__)),
             'verifier': sha256(Path(verifier.__file__)),
             'execution': sha256(Path(__file__)), 'oracle': verifier.CONCRETE_ORACLE}

@@ -233,15 +233,35 @@ class Space:
         self._cache: OrderedDict[str, tuple[bytes, bytes]] = OrderedDict()
         self._cache_limit = max(32, min(4096, limits.max_atoms + limits.beam_width * limits.max_clauses))
         self.atoms: tuple[str, ...] = ()
+        self.revision = 0
         self.update(snapshots_by_case)
 
     def update(self, snapshots_by_case: dict[str, list[predicates.CachedSnapshot]]) -> None:
-        """Add/replace the supplied cases; invalidate all capture-derived caches."""
+        """Add/replace cases; retain caches only for identical prediction inputs."""
         updated = dict(self._snapshots)
+        changed = False
         for case, rows in snapshots_by_case.items():
             if self._check is not None:
                 self._check()
-            updated[case] = tuple(rows)
+            rows = tuple(rows)
+            prior = updated.get(case)
+            same = prior is not None and len(prior) == len(rows)
+            if same:
+                for index, (old, new) in enumerate(zip(prior, rows)):
+                    if self._check is not None and index % 256 == 0:
+                        self._check()
+                    # Captured branch/id authenticate outcomes, but are not
+                    # inputs to prediction. A new descriptor alone is not a
+                    # new predictive frontier.
+                    if (old.registers != new.registers or old.clamps != new.clamps
+                            or old.stack != new.stack):
+                        same = False
+                        break
+            if not same:
+                updated[case] = rows
+                changed = True
+        if self.revision and not changed:
+            return
         # Authenticated captures share frozen states. Evaluate each state object
         # once, while retaining every case's complete ordered index vector.
         flattened, positions, indices, captures = [], {}, {}, {}
@@ -280,6 +300,7 @@ class Space:
         self._flat = flattened
         self._environments = tuple(environments) if environments is not None else None
         self._cache.clear()
+        self.revision += 1
 
     def expression(self, clauses: tuple[Clause, ...]) -> str | None:
         if len(clauses) > self.limits.max_clauses:

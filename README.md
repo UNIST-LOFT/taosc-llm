@@ -222,7 +222,10 @@ Search uses ordered generic repair DNF; CWE-805 uses its ordered dual safe CNF
 against one same clamp. No new runtime grammar or independently reduced clamp
 OR is introduced. Bounded atom/beam exploration shortlists candidates using
 captured values; only actual execution or equal complete-vector reuse establishes
-coverage. Each introduced clause keeps its immutable marginal owner cases,
+coverage. One frontier considers all unresolved targets: an unavailable anchor
+cannot veto another case’s actual repair. Identical prediction states preserve
+caches; only a genuine new evidence revision reopens an exhausted frontier.
+Each introduced clause keeps its immutable marginal owner cases,
 prefix revision, expression and decisive-hit evidence. Refinement must preserve
 both that local obligation without later clauses and the current global owners;
 hiding normal cases behind unavailable evidence is not an improvement.
@@ -244,7 +247,11 @@ The evaluation-count cap still charges baseline/candidate operations before
 admission and persists across interruption. In-flight evaluation drains under
 existing per-execution limits. Finalization is separate from search admission,
 remains cancellable under native limits, and may finish after the search deadline;
-it does not reset spent search time. Search stop reasons distinguish goals, budgets, bounded exhaustion,
+it does not reset spent search time. A time/evaluation-budget stop may commit
+an already fully evaluated best draft after reauthenticating its evidence, owners
+and marginal witnesses, without admitting new evaluation. Cancellation never
+promotes a draft; positive branch regressions remain visible. Search stop reasons
+distinguish goals, budgets, bounded exhaustion,
 interruption and evidence gaps; no global optimum or out-of-corpus repair is
 claimed. `coverage=complete` means complete observations, not all targets repaired.
 

@@ -160,6 +160,27 @@ def test_prediction_cache_invalidates_on_replacement_and_new_captures():
     assert any("rbx" in atom for atom in space.atoms)
 
 
+def test_equal_predictive_states_retain_atoms_and_prediction_cache(monkeypatch):
+    rows = [snapshot(rax=0), snapshot(rax=2)]
+    space = Space(GENERIC, {"case": rows}, SearchLimits())
+    program = (("1 / rax",),)
+    expected = space.predict(program)
+    atoms_before, revision = space.atoms, space.revision
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("identical predictive evidence must not be recomputed")
+
+    monkeypatch.setattr("taosc_llm.no_llm.space.atoms", unexpected)
+    monkeypatch.setattr(predicates, "evaluate_cached_branch", unexpected)
+    # Complete separately allocated captures may differ in observed descriptor
+    # branch/id while retaining identical inputs to candidate prediction.
+    copied = [predicates.CachedSnapshot(9, 1, row.registers, row.clamps, row.stack) for row in rows]
+    space.update({"case": copied})
+    assert space.revision == revision
+    assert space.atoms is atoms_before
+    assert space.predict(program) == expected
+
+
 def test_capture_update_rebuilds_atom_boundaries_and_removes_invalid_stack_cells():
     limits = SearchLimits(max_atoms=512)
     generic = Space(GENERIC, {"case": [snapshot(rax=71)]}, limits)

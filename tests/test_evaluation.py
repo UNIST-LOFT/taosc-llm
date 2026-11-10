@@ -175,6 +175,39 @@ def test_missing_or_partial_capture_requires_independent_execution(dataset, tmp_
     assert row['report']['activation']['status'] == 'not_fired'
 
 
+@pytest.mark.parametrize('reason', ['qasan-library-unavailable', 'qasan-preload-unavailable'])
+def test_missing_qasan_runtime_cannot_be_a_normal_control(dataset, tmp_path, monkeypatch, reason):
+    dataset.rows[0]['observation'] = {
+        'exit': 'crash', 'concrete-oracle': 'qasan-main-v2',
+        'concrete-fault-valid': True, 'fault-addr': 33}
+    def unavailable(*args):
+        raise evaluation.ExecutionUnavailable(reason)
+    monkeypatch.setattr(evaluation, 'execute_capture', unavailable)
+    result = evaluation.evaluate_dataset(dataset, '0', cache_dir=tmp_path / 'cache')
+    row = result['cases'][0]
+    assert row['status'] == row['neutral_baseline']['status'] == 'unavailable'
+    assert row['reason'] == row['neutral_baseline']['reason'] == reason
+    assert row.get('outcome') is None
+    assert row['report']['neutral_baseline']['outcome'] == 'unknown'
+    assert result['quality']['counts']['improved'] == 0
+    assert result['quality']['status'] == 'incomplete'
+
+
+def test_qasan_library_change_invalidates_owned_neutral_cache(dataset, tmp_path, monkeypatch):
+    runtime = {'qemu': 'same-tracer', 'qasan_library': 'before', 'oracle': 'qasan-main-v2'}
+    monkeypatch.setattr(evaluation, 'execution_identity', lambda: dict(runtime))
+    monkeypatch.setattr(evaluation, 'execute_capture', lambda ds, case, descriptor, directory:
+                        capture(ds, descriptor=descriptor, normal=True))
+    root = tmp_path / 'cache'
+    first = evaluation.evaluate_dataset(dataset, '0', cache_dir=root)
+    assert first['cases'][0]['neutral_baseline']['outcome']['outcome'] == 'normal'
+    runtime['qasan_library'] = 'after'
+    second = evaluation.evaluate_dataset(dataset, '0', cache_dir=root, execute=False)
+    row = second['cases'][0]
+    assert row['status'] == row['neutral_baseline']['status'] == 'unavailable'
+    assert row.get('outcome') is None
+
+
 def test_owned_cache_reused_offline_and_environment_invalidates(dataset, tmp_path, monkeypatch):
     calls = []
     def run(ds, case, descriptor, directory):

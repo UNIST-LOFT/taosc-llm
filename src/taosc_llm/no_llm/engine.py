@@ -34,7 +34,8 @@ class SearchEngine:
         self.state: dict = {"clauses": [], "evaluation": backend.baseline_ref, "phase": "cover",
                       "blocked": [], "refine_index": 0, "refine_progress": False,
                       "draft": None, "revision": 0, "termination": None,
-                      "prediction_evidence": {}, "atoms": []}
+                      "prediction_evidence": {}, "prediction_revision": 0,
+                      "processed_evaluations": [], "atoms": []}
         for event in self.journal.events:
             if event["kind"] in ("checkpoint", "commit"):
                 self.state = self.journal.load(event["data"]["state"])
@@ -124,9 +125,18 @@ class SearchEngine:
         result = self.backend.evaluate(expression)
         score = Score.from_evaluation(self.population, result)
         reference = self.journal.store(result)
-        snapshots = self.backend.snapshots(result)
-        self.space.update(snapshots)
-        self.state["prediction_evidence"].update({case: reference for case in snapshots})
+        # At most one entry per admitted descriptor (bounded by the evaluation
+        # budget). Reusing an old outcome must not roll prediction state back to
+        # that descriptor's earlier capture or restart an exhausted frontier.
+        if result["descriptor"] not in self.state["processed_evaluations"]:
+            snapshots = self.backend.snapshots(result)
+            revision = self.space.revision
+            self.space.update(snapshots)
+            if self.space.revision != revision:
+                self.state["prediction_revision"] += 1
+                self.state["blocked"] = []
+            self.state["prediction_evidence"].update({case: reference for case in snapshots})
+            self.state["processed_evaluations"].append(result["descriptor"])
         return score, result, reference
 
     def _witnesses(self, prefix, factors, result, owners):
@@ -183,7 +193,10 @@ class SearchEngine:
         if prediction is None:
             return None
         fired, trapped = prediction
-        if draft["anchor"] not in fired or draft["anchor"] in trapped:
+        # Introduction searches the unresolved population together. An anchor
+        # with unavailable outcomes must not veto another case's actual repair.
+        # Refinement still retains its immutable owners below.
+        if not fired & targets:
             return None
         if not self._required() <= fired or trapped & self._required():
             return None
@@ -234,14 +247,26 @@ class SearchEngine:
         initial = [factors] if kind == "introduce" and self.family == "ERM generic" else []
         self.state["draft"] = {"kind": kind, "anchor": anchor, "index": index,
                                "beam": [factors], "queue": initial, "offset": 0, "depth": 0,
-                               "seen": [], "best": None}
+                               "seen": [], "best": None,
+                               "prediction_revision": self.state["prediction_revision"]}
         self._save()
 
     def _accept_introduction(self, best):
         current = self.backend.load(best["evaluation"])
         score = Score.from_evaluation(self.population, current)
-        self.backend.check_operation()
         prefix = _clauses(self.state["clauses"])
+        expected = parse_candidate(self.family, compose(self.family, prefix + (tuple(best["factors"]),)))
+        owners = new_owners(self.score, score)
+        if (current["descriptor"] != expected.descriptor or not owners
+                or owners != frozenset(best["owners"])
+                or not self._required() <= score.covered
+                or not self.score.known_normals <= score.known_normals
+                or score.target_failures & self.population.normals):
+            raise ValueError("draft introduction does not establish owners")
+        witnesses = self._witnesses(prefix, best["factors"], current, owners)
+        if witnesses is None or witnesses != best["witnesses"]:
+            raise ValueError("draft introduction does not establish owners")
+        self.backend.check_operation()
         self.state["clauses"].append({"id": self.state["revision"] + 1,
                                       "factors": best["factors"], "introduced_factors": best["factors"],
                                       "prefix": [list(row) for row in prefix],
@@ -285,7 +310,7 @@ class SearchEngine:
             if tested is not None:
                 score, result, reference = tested
                 owners = new_owners(self.score, score)
-                if (draft["anchor"] in owners and self._required() <= score.covered
+                if (owners and self._required() <= score.covered
                         and self.score.known_normals <= score.known_normals
                         and not (score.target_failures & self.population.normals)):
                     witnesses = self._witnesses(program, factors, result, owners)
@@ -321,11 +346,20 @@ class SearchEngine:
 
     def _end_draft(self):
         draft = self.state["draft"]
+        if draft["kind"] == "introduce" and draft["best"] is not None:
+            self._accept_introduction(draft["best"])
+            return
+        if draft["prediction_revision"] != self.state["prediction_revision"]:
+            # New representative states can change the bounded shortlist. Once
+            # every descriptor's evidence was consumed, cached outcomes cannot
+            # cause another restart. Revision and consumption survive resume.
+            self._start_draft(draft["kind"], draft["anchor"], index=draft["index"])
+            return
         if draft["kind"] == "introduce":
-            if draft["best"] is not None:
-                self._accept_introduction(draft["best"])
-                return
-            self.state["blocked"].append(draft["anchor"])
+            # Every unresolved target participated in this same bounded beam.
+            # Repeating it for each anchor would only reload cached outcomes and
+            # rebuild identical predictions, without adding search alternatives.
+            self.state["blocked"] = sorted(self.population.crashes - self.score.covered)
         else:
             self.state["refine_index"] += 1
         self.state["draft"] = None
@@ -358,7 +392,9 @@ class SearchEngine:
                     index = self.state["refine_index"]
                     owner = self.state["clauses"][index]["owners"][0]
                     self._start_draft("refine", owner, index=index)
-                elif self.state["refine_progress"]:
+                elif (self.state["refine_progress"]
+                      or (len(self.state["clauses"]) < self.limits.max_clauses
+                          and self.population.crashes - self.score.covered - set(self.state["blocked"]))):
                     self.state.update(phase="cover", blocked=[])
                     self._save()
                 else:
@@ -369,7 +405,21 @@ class SearchEngine:
                     self._save()
                     break
         except SearchStopped as stop:
-            self.state["termination"] = stop.reason
+            reason = stop.reason
+            draft = self.state["draft"]
+            if (reason in ("wall-time-reached", "evaluation-budget-reached")
+                    and draft is not None and draft["kind"] == "introduce" and draft["best"] is not None):
+                try:
+                    # Only authenticate/re-gate already completed evidence. The
+                    # backend still forbids new evaluation admission, and polls
+                    # cancellation throughout restoration and before commit.
+                    with self.backend.restoration():
+                        self._accept_introduction(draft["best"])
+                except SearchStopped as interrupted:
+                    reason = interrupted.reason
+                except KeyboardInterrupt:
+                    reason = "interrupted"
+            self.state["termination"] = reason
             self._save()
         except KeyboardInterrupt:
             self.state["termination"] = "interrupted"

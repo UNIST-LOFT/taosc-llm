@@ -104,8 +104,9 @@ class Backend:
     def restoration(self):
         """Authenticate saved evidence even when finalization exhausted time.
 
-        This permits no execution or commit admission and never replenishes a
-        budget. Cancellation and complete dataset/capture validation still apply.
+        This permits no new evaluation admission and never replenishes a budget.
+        The engine may re-gate and commit an already fully evaluated draft at a
+        budget boundary. Cancellation and complete capture validation still apply.
         """
         previous = self._restoring
         self._restoring = self.baseline_ref is not None
