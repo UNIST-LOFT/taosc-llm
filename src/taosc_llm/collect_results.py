@@ -24,7 +24,7 @@ from .collection_metrics import METRIC_FIELDS, collect_metrics
 
 
 ROW_FIELDS = (
-    "subject_id", "subject", "run", "run_directory", "mode", "lifecycle",
+    "subject", "run", "run_directory", "mode", "lifecycle",
     "exit_code", "run_error", "synthesis_status", "selected_round", "predicate",
     "termination", "legacy_quality", "publication_status", "verified",
     "binradar_verification", "evaluation_source", "collection_status", "collection_error",
@@ -36,7 +36,6 @@ _PAYLOAD = re.compile(r"payloads/([0-9a-f]{64})\.([A-Za-z0-9][A-Za-z0-9._-]{0,31
 
 @dataclass(frozen=True)
 class RunSpec:
-    subject_id: int
     subject: str
     directory: Path
     problem: str | None = None
@@ -86,18 +85,18 @@ def discover_runs(exp_file: str | Path, *, workdir: str = "workdir",
     pattern = re.compile(re.escape(run_prefix) + r"-([0-9]+)")
     found = []
     seen = set()
-    for subject_id, (subject, label) in enumerate(zip(subjects, labels), 1):
+    for subject, label in zip(subjects, labels):
         directory = subject / workdir
         try:
             if not directory.is_dir():
-                found.append(RunSpec(subject_id, label, directory, "missing_workdir",
+                found.append(RunSpec(label, directory, "missing_workdir",
                                      f"workdir not found: {directory}"))
                 continue
             patch_format = directory / "patch-format"
             if patch_format.is_file():
                 value = patch_format.read_text(encoding="utf-8").strip()
                 if value.startswith("Single "):
-                    found.append(RunSpec(subject_id, label, directory, "unsupported",
+                    found.append(RunSpec(label, directory, "unsupported",
                                          f"unsupported patch format: {value}"))
                     continue
             output = directory / "out"
@@ -111,15 +110,15 @@ def discover_runs(exp_file: str | Path, *, workdir: str = "workdir",
             if runs == "latest":
                 candidates = candidates[-1:]
             if not candidates:
-                found.append(RunSpec(subject_id, label, output, "missing_runs",
+                found.append(RunSpec(label, output, "missing_runs",
                                      f"no {run_prefix}-NUMERIC run directories: {output}"))
             for _, _, child in candidates:
                 identity = child.resolve()
                 if identity not in seen:
                     seen.add(identity)
-                    found.append(RunSpec(subject_id, label, child))
+                    found.append(RunSpec(label, child))
         except (OSError, ValueError, UnicodeError) as error:
-            found.append(RunSpec(subject_id, label, directory, "collection_error",
+            found.append(RunSpec(label, directory, "collection_error",
                                  f"{type(error).__name__}: {error}"))
     return found
 
@@ -295,7 +294,7 @@ def _collect_selected(row: dict, summary: dict, result_root: Path) -> None:
 def collect_run(spec: RunSpec) -> dict:
     """Reduce one selected evaluation to scalars; failures cannot erase other rows."""
     row = dict.fromkeys(COLUMNS)
-    row.update(subject_id=spec.subject_id, subject=spec.subject, run=spec.directory.name,
+    row.update(subject=spec.subject, run=spec.directory.name,
                run_directory=str(spec.directory), mode="unknown", lifecycle="unknown",
                collection_status="collected", collection_error=None)
     row.update(collect_metrics(None, candidate_present=False))
@@ -412,7 +411,7 @@ def summarize(rows: list[dict]) -> dict:
 
 def write_output(stream: TextIO, output_format: str, rows: list[dict], *,
                  include_subject_id: bool = True) -> None:
-    fields = tuple(key for key in COLUMNS if include_subject_id or key != "subject_id")
+    fields = tuple(key for key in COLUMNS if include_subject_id or key != "subject")
     summary = summarize(rows)
     if output_format in ("csv", "tsv"):
         writer = csv.DictWriter(stream, fieldnames=fields,
@@ -428,7 +427,8 @@ def write_output(stream: TextIO, output_format: str, rows: list[dict], *,
     else:
         stream.write("Observed-cohort target results; not universal repair or FINAL verification.\n")
         for row in rows:
-            stream.write(f"\n{row['subject']} / {row['run']}\n")
+            label = f"{row['subject']} / {row['run']}" if include_subject_id else row["run"]
+            stream.write(f"\n{label}\n")
             for key in fields:
                 stream.write(f"  {key}: {json.dumps(row[key], ensure_ascii=False)}\n")
         stream.write("\nSummary: " + json.dumps(summary, sort_keys=True) + "\n")
@@ -439,14 +439,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--exp", default="exp.list", help="experiment list; paths are relative to this file")
     parser.add_argument("--workdir", default="workdir")
     parser.add_argument("--run-prefix", default="taosc-llm-out")
-    parser.add_argument("--runs", choices=("all", "latest"), default="all",
+    parser.add_argument("--runs", choices=("all", "latest"), default="latest",
                         help="latest means highest numeric run, including failed runs")
     parser.add_argument("--mode", choices=("all", *_MODES), default="all")
     parser.add_argument("--format", choices=("log", "csv", "tsv", "json"), default="log")
     parser.add_argument("--output", help="output path, or - for stdout; default: exp-list-dir/logs/taosc-llm-results-TIMESTAMP.ext")
     parser.add_argument("--jobs", type=int, default=1,
                         help="collection processes (default 1; 0 = CPU/run count; each loads one report)")
-    parser.add_argument("-n", "--no-subject-id", action="store_true")
+    parser.add_argument("-n", "--no-subject-id", action="store_true",
+                        help="omit the textual subject column for side-by-side spreadsheet comparison")
     parser.add_argument("--run-dir", action="append", default=[],
                         help="saved run directory, repeatable; bypass experiment discovery")
     args = parser.parse_args(argv)
@@ -463,7 +464,7 @@ def main(argv: list[str] | None = None) -> int:
                 if path.resolve() in seen:
                     continue
                 seen.add(path.resolve())
-                specs.append(RunSpec(len(specs) + 1, str(path), path))
+                specs.append(RunSpec(str(path), path))
         else:
             specs = discover_runs(args.exp, workdir=args.workdir,
                                   run_prefix=args.run_prefix, runs=args.runs)

@@ -78,7 +78,7 @@ def manual(root, *, cases=None):
 
 
 def collect(root):
-    return collect_run(RunSpec(1, "package/subject", root))
+    return collect_run(RunSpec("package/subject", root))
 
 
 def store(root, value):
@@ -304,7 +304,7 @@ def test_malformed_missing_selected_and_duplicate_cases_keep_other_runs(tmp_path
     (missing / "result" / "candidates" / "1" / "evaluation.json").unlink()
     duplicate = manual(tmp_path / "duplicate", cases=[case(), case()])
     good = manual(tmp_path / "good")
-    specs = [RunSpec(i, path.name, path) for i, path in enumerate((malformed, missing, duplicate, good), 1)]
+    specs = [RunSpec(path.name, path) for path in (malformed, missing, duplicate, good)]
     rows = collect_all(specs)
     assert [row["collection_status"] for row in rows] == ["collection_error"] * 3 + ["collected"]
     assert rows[1]["target_status"] == "not_observed"
@@ -315,7 +315,7 @@ def test_malformed_missing_selected_and_duplicate_cases_keep_other_runs(tmp_path
 def test_parallel_collection_has_identical_order_and_rows(tmp_path):
     roots = [manual(tmp_path / name, cases=[case(outcome=outcome)]) for name, outcome in (
         ("z", "target_crash"), ("a", "other_crash"), ("m", "normal"))]
-    specs = [RunSpec(i, root.name, root) for i, root in enumerate(roots, 1)]
+    specs = [RunSpec(root.name, root) for root in roots]
     assert collect_all(specs, jobs=2) == collect_all(specs, jobs=1)
 
 
@@ -324,12 +324,42 @@ def test_tabular_columns_are_stable_and_quote_special_paths(tmp_path, output_for
     root = manual(tmp_path / 'run "quoted", with spaces')
     row = collect(root)
     stream = io.StringIO()
-    write_output(stream, output_format, [row], include_subject_id=False)
+    write_output(stream, output_format, [row])
     reader = csv.DictReader(io.StringIO(stream.getvalue()), delimiter=delimiter)
-    saved = list(reader)
-    assert len(saved) == 1
+    full = list(reader)
+    assert full[0]["subject"] == "package/subject"
+    assert "subject_id" not in reader.fieldnames
+    assert "subject_id" not in row
+
+    stream = io.StringIO()
+    write_output(stream, output_format, [row], include_subject_id=False)
+    reduced_reader = csv.DictReader(io.StringIO(stream.getvalue()), delimiter=delimiter)
+    saved = list(reduced_reader)
+    assert reduced_reader.fieldnames == [key for key in reader.fieldnames if key != "subject"]
+    assert saved == [{key: value for key, value in full[0].items() if key != "subject"}]
     assert saved[0]["run_directory"] == str(root)
     assert saved[0]["target_status"] == "target_absent"
+
+
+@pytest.mark.parametrize("output_format", ["json", "log"])
+def test_subject_omission_preserves_results_without_numeric_ids(tmp_path, output_format):
+    row = collect(manual(tmp_path / "saved"))
+    full = io.StringIO()
+    reduced = io.StringIO()
+    write_output(full, output_format, [row])
+    write_output(reduced, output_format, [row], include_subject_id=False)
+    if output_format == "json":
+        expected = json.loads(full.getvalue())
+        assert "subject_id" not in expected["rows"][0]
+        assert expected["rows"][0].pop("subject") == "package/subject"
+        assert json.loads(reduced.getvalue()) == expected
+    else:
+        assert "\npackage/subject / saved\n" in full.getvalue()
+        assert "subject_id:" not in full.getvalue()
+        assert "\nsaved\n" in reduced.getvalue()
+        assert "package/subject" not in reduced.getvalue()
+        assert "  subject:" not in reduced.getvalue()
+        assert full.getvalue().split("\nSummary: ")[1] == reduced.getvalue().split("\nSummary: ")[1]
 
 
 def test_explicit_output_avoids_default_logs_and_stdout_is_clean(tmp_path, capsys):

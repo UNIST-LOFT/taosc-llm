@@ -647,14 +647,21 @@ must be read with their comparable denominator: losing evidence is not progress.
 - Defaults follow the BinRadar collector's experiment-list convention:
   `--exp exp.list`, `--workdir workdir`, `--run-prefix taosc-llm-out`, `--format log`.
   List entries resolve relative to the list file, including paths with spaces.
-- `--runs all` is the default. Only exact `PREFIX-NUMERIC` directories are read,
+- `--runs latest` is the CLI default; `--runs all` includes every run.
+  Only exact `PREFIX-NUMERIC` directories are read,
   in numeric order. `--runs latest` means the highest run number, **including
   failed/interrupted runs**, not the latest successful run. `--mode` filters the
   collected rows afterward; unknown/error rows remain visible.
 - `--jobs 1` bounds memory to one selected evaluation. Explicit `--jobs N` uses
   ordered processes; `0` selects CPU/run count and may consume substantial memory.
-  `--format log|csv|tsv|json`, `-n/--no-subject-id`, and `--output -` are supported.
+  `--format log|csv|tsv|json` and `--output -` are supported.
   CSV/TSV have one row per run; JSON includes rows and separate summary counters.
+- `subject` contains the experiment-list identifier, e.g. `binutils/CVE-2017-14745`.
+  No numeric `subject_id` is generated. `-n/--no-subject-id` omits that textual
+  `subject` column/key (and the subject in log headings), allowing subsequent
+  experiments to be pasted to the right in a spreadsheet. Other columns, row
+  order and recorded artifact paths are unchanged; use matching subject/run
+  selections when comparing experiments side by side.
 - Default output is `<exp-list-dir>/logs/taosc-llm-results-UTC-TIMESTAMP.<format>`.
   Explicit output never creates that default directory. Stdout output contains
   only the requested format; diagnostics go to stderr.
@@ -677,8 +684,12 @@ Provider evaluations still describe the cached descriptor, not execution of the
 new fixed/selectable binaries. No-LLM `publication_status=matched` is saved local
 artifact parity, not FINAL. The collector never promotes either into verification.
 
-Validation: both collector test modules pass (98 tests). An isolated wheel-only
-installation was exercised from an external cwd, including the installed CLI,
+Validation: collector I/O tests pass (26 tests), including numeric-ID removal and
+textual subject omission in all four formats. The checkout CLI was also exercised
+against a saved journal with the default, `-n`, and `--no-subject-id` outputs in
+each format. Pass a real journal directory to `--run-dir`: symlinked journal aliases
+are rejected as `unsafe journal payload` by the existing containment check.
+An isolated wheel-only installation was exercised from an external cwd, including the installed CLI,
 checkout launcher, module entry and sequential/spawn-process equality on eight
 saved provider/no-LLM scenarios. These included target→other crash, residual target,
 baseline disagreement, failed-provider incumbent, abstention and legacy journals.
