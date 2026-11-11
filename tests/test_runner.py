@@ -2,12 +2,120 @@
 
 import json
 import socket
+import sys
 import tempfile
 from pathlib import Path
 
 import pytest
 
 from taosc_llm.runner import _directory_lock, main
+
+
+@pytest.fixture
+def child_contract(tmp_path, monkeypatch):
+    from taosc_llm import runner
+    warm = {"status": "reject_same_crash", "predicate": None, "verified": False,
+            "quality": {"status": "rejected"}, "summary": {"reject_same_crash": 1}}
+    synthesis = {"schema_version": 1, "engine": "taosc-llm-no-llm",
+                 "termination": "evidence-unavailable", "predicate": None, "coverage": "partial",
+                 "publication_status": "unavailable", "verified": False,
+                 "binradar_verification": "not_run", "score": {"target_failures": ["system:0"]},
+                 "population": {"unresolved": ["system:0"]}}
+    contract = {"warm": warm, "synthesis": synthesis, "warm_code": 0, "synthesis_code": 0}
+    def command(stage):
+        payload = contract[stage]
+        text = json.dumps(payload) if not isinstance(payload, str) else payload
+        return [sys.executable, "-c", f"print({text!r}); raise SystemExit({contract[stage + '_code']})"]
+    monkeypatch.setattr(runner, "_preflight", lambda args: None)
+    monkeypatch.setattr(runner, "_cli", lambda entry, *args: command("warm"))
+    monkeypatch.setattr(runner, "_python", lambda module, *args: command("synthesis"))
+    contract["arguments"] = ["--dataset", str(tmp_path / "dataset"), "--output", str(tmp_path / "run")]
+    return contract
+
+
+@pytest.mark.parametrize("mode", ["no-llm", "manual", "provider"])
+@pytest.mark.parametrize("outcome", ["residual", "no-candidate", "bounded-stop"])
+def test_runner_records_completed_scoped_outcomes_without_quality_exit(
+        tmp_path, capsys, child_contract, mode, outcome):
+    result = child_contract["synthesis"]
+    if mode != "no-llm":
+        result.update(status={"residual": "rejected", "no-candidate": "abstained",
+                              "bounded-stop": "refinement_exhausted"}[outcome],
+                      quality={"status": "unproven", "counts": {"other_crash": 1}})
+    else:
+        result["termination"] = {"residual": "bounded-search-exhausted", "no-candidate": "no-target-cases",
+                                 "bounded-stop": "wall-time-reached"}[outcome]
+    arguments = child_contract["arguments"] + ["--mode", mode]
+    if mode == "manual":
+        arguments += ["--predicate", "rax != 0"]
+    elif mode == "provider":
+        arguments += ["--provider-env", str(tmp_path / "provider.env")]
+    assert main(arguments) == 0
+    record = json.loads(capsys.readouterr().out)
+    assert record["status"] == "finished" and record["exit_code"] == 0
+    assert record["attempts"][-1]["status"] == "finished"
+    assert record["warm"]["status"] == "reject_same_crash"
+    assert record["warm"]["quality"]["status"] == "rejected"
+    assert record["synthesis"]["score"] == result["score"]
+    assert record["synthesis"]["publication_status"] == "unavailable"
+    assert record["synthesis"]["verified"] is False
+    assert record["synthesis"]["binradar_verification"] == "not_run"
+    assert json.loads(Path(record["synthesis_result"]).read_text()) == result
+    assert json.loads((tmp_path / "run" / "run.json").read_text()) == record
+
+
+@pytest.mark.parametrize("stage", ["warm", "synthesis"])
+@pytest.mark.parametrize("code,expected,status", [
+    (1, 1, "failed"), (2, 1, "failed"), (3, 1, "failed"), (130, 130, "interrupted"),
+])
+def test_runner_requires_current_child_exit_contract(capsys, child_contract, stage, code, expected, status):
+    child_contract[stage + "_code"] = code
+    assert main(child_contract["arguments"]) == expected
+    record = json.loads(capsys.readouterr().out)
+    assert record["status"] == status and record["exit_code"] == expected
+    assert record["attempts"][-1]["stages"][-1]["exit_code"] == code
+    assert "synthesis" not in record
+
+
+@pytest.mark.parametrize("stage", ["warm", "synthesis"])
+@pytest.mark.parametrize("invalid", ["empty", "malformed", "verified", "nonterminal"])
+def test_runner_zero_exit_does_not_establish_scoped_completion(capsys, child_contract, stage, invalid):
+    result = child_contract[stage]
+    if invalid == "empty":
+        child_contract[stage] = {}
+    elif invalid == "malformed":
+        child_contract[stage] = "not json"
+    elif invalid == "verified":
+        result["verified"] = True
+    elif stage == "warm":
+        result["status"] = "infrastructure_error"
+    else:
+        result["termination"] = "interrupted"
+    assert main(child_contract["arguments"]) == 1
+    record = json.loads(capsys.readouterr().out)
+    assert record["status"] == "failed"
+    assert "synthesis" not in record
+
+
+@pytest.mark.parametrize("status", ["prepared", "refining", "infrastructure_error", "cancelled"])
+def test_runner_zero_provider_exit_requires_completed_status(tmp_path, capsys, child_contract, status):
+    child_contract["synthesis"].update(status=status)
+    assert main(child_contract["arguments"] + [
+        "--mode", "provider", "--provider-env", str(tmp_path / "provider.env")]) == 1
+    record = json.loads(capsys.readouterr().out)
+    assert record["status"] == "failed"
+    assert "synthesis" not in record
+
+
+@pytest.mark.parametrize("status", ["reject_same_crash", "not_rejected", "unavailable"])
+def test_runner_warm_boundary_is_completed_evaluation(capsys, child_contract, status):
+    child_contract["warm"]["status"] = status
+    assert main(child_contract["arguments"] + ["--stop-after", "warm"]) == 0
+    record = json.loads(capsys.readouterr().out)
+    assert record["status"] == "finished"
+    assert record["warm"] == child_contract["warm"]
+    assert "synthesis" not in record
+    assert [stage["name"] for stage in record["attempts"][-1]["stages"]] == ["warm"]
 
 
 def subject(tmp_path, patch_format="ERM generic"):

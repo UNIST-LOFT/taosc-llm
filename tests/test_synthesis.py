@@ -56,15 +56,18 @@ def test_exact_candidate_must_have_been_evaluated(tmp_path, monkeypatch):
     async def model(current, *args):
         return terminal(current, proposal(current, predicate="rax < 0"), ["rax <= 0"])
     monkeypatch.setattr(synthesis, "_model_round", model)
-    result = asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=1))
-    assert result["status"] == "refinement_exhausted"
+    with pytest.raises(ValueError, match="exact predicate"):
+        asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=1))
+    result = json.loads((context.run_dir / "run.json").read_text())
+    assert result["status"] == "infrastructure_error"
+    assert result["error_type"] == "ValueError"
     assert result["rounds"][0]["status"] == "parse_rejected"
     assert "exact predicate" in result["rounds"][0]["reason"]
     assert not (tmp_path / "runs" / "candidates").exists()
     assert result["verified"] is False
 
 
-def test_parser_and_real_build_failure_are_feedback_then_abstention(tmp_path, monkeypatch):
+def test_parser_feedback_does_not_mask_real_build_failure(tmp_path, monkeypatch):
     context = prepare_context(make_dataset(tmp_path / "dataset"), run_dir=tmp_path / "runs")
     provider = ProviderConfig(api_key="offline-only", base_url="https://example.invalid/v1", model="offline")
     monkeypatch.setattr(synthesis, "adapter_command", lambda _: ["not-executed"])
@@ -78,17 +81,19 @@ def test_parser_and_real_build_failure_are_feedback_then_abstention(tmp_path, mo
             assert latest['error']['kind'] == 'parse_rejected'
             assert json.loads(latest['invalid_proposal'])['predicate'] == 'rax &&'
             return terminal(current, proposal(current), ["rax < 0"])
-        assert latest['error']['kind'] == 'build_rejected'
-        assert latest['proposal']['predicate'] == 'rax < 0'
-        assert 'final_text' not in latest and 'invalid_proposal' not in latest
-        return terminal(current, proposal(current, decision="abstain", predicate=None), [])
+        pytest.fail("a real build failure must stop before another provider round")
     monkeypatch.setattr(synthesis, "_model_round", model)
     # The real builder rejects the fixture's deliberately non-ELF identity bytes
-    # before any native tool/target runs; this is actual build feedback, not a verdict.
-    result = asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=3))
-    assert [r["status"] for r in result["rounds"]] == ["parse_rejected", "build_rejected", "abstained"]
-    assert result["status"] == "abstained" and result["verified"] is False
+    # before any native tool/target runs; this is an execution failure, not quality.
+    with pytest.raises((ValueError, RuntimeError, OSError)):
+        asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=3))
+    result = json.loads((context.run_dir / "run.json").read_text())
+    assert len(prompts) == 2
+    assert [r["status"] for r in result["rounds"]] == ["parse_rejected", "build_failed"]
+    assert result["rounds"][-1]["proposal"]["predicate"] == "rax < 0"
+    assert result["status"] == "infrastructure_error" and result["verified"] is False
     assert result["binradar_verification"] == "not_run"
+    assert "evaluation" not in result and "selected_round" not in result
 
 
 @pytest.mark.parametrize("error,status", [(RuntimeError("intentional benign abort"), "infrastructure_error"),
@@ -234,7 +239,7 @@ def test_blocking_tool_cancellation_waits_for_worker():
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("outcome", ["not_rejected", "unavailable", "abstained", "refinement_exhausted"])
+@pytest.mark.parametrize("outcome", ["not_rejected", "unavailable", "abstained"])
 def test_feedback_follows_final_host_outcome_only(tmp_path, monkeypatch, outcome):
     context = prepare_context(make_dataset(tmp_path / "dataset"), run_dir=tmp_path / "runs")
     provider = ProviderConfig(api_key="offline-only", base_url="https://example.invalid/v1", model="offline")
@@ -245,7 +250,7 @@ def test_feedback_follows_final_host_outcome_only(tmp_path, monkeypatch, outcome
     async def model(current, provider, command, run_id, journal, *, on_complete):
         # First round is invalid; it must settle/release without a review call.
         first = not settled
-        final = (proposal(current, predicate="rax &&") if first or outcome == "refinement_exhausted"
+        final = (proposal(current, predicate="rax &&") if first
                  else proposal(current, decision="abstain", predicate=None) if outcome == "abstained"
                  else proposal(current))
         response = terminal(current, final, ["rax < 0"])
@@ -435,7 +440,9 @@ def test_refinement_uses_same_minimal_feedback_as_review(tmp_path, monkeypatch):
     monkeypatch.setattr(synthesis, "build_candidate", build)
     monkeypatch.setattr(evaluation, "evaluate_dataset", lambda *args, **kwargs: evaluated)
     result = asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=2))
-    assert result["status"] == "abstained" and len(calls) == 2
+    assert result["status"] == "reject_same_crash" and len(calls) == 2
+    assert result["termination"] == "abstained" and result["selected_round"] == 1
+    assert result["evaluation"] == evaluated
     # Full evaluator evidence remains in the private run, not the next model prompt.
     assert result["rounds"][0]["evaluation"] == evaluated
 
@@ -522,9 +529,152 @@ def test_stagnation_requires_same_predicate_and_unchanged_case_quality(candidate
 
 def test_failed_build_breaks_consecutive_evaluated_result_streak():
     evaluated = quality_round(repaired=("target",), branches=("normal",))
-    failed = {"proposal": evaluated["proposal"], "status": "build_rejected"}
+    failed = {"proposal": evaluated["proposal"], "status": "build_failed"}
     assert synthesis._repeated_result("ERM generic", evaluated, failed) is False
     assert synthesis._repeated_result("ERM generic", failed, evaluated) is False
+
+
+@pytest.mark.parametrize("ending,termination,round_count", [
+    ("abstain", "abstained", 4),
+    ("malformed", "round_limit", 4),
+    ("worse", "round_limit", 4),
+    ("repeat", "repeated_result", 3),
+])
+def test_provider_retains_crash_repair_before_minimizing_residual_branches(
+        tmp_path, monkeypatch, ending, termination, round_count):
+    context = prepare_context(make_dataset(tmp_path / "dataset"), run_dir=tmp_path / "runs")
+    provider = ProviderConfig(api_key="offline-only", base_url="https://example.invalid/v1", model="offline")
+    monkeypatch.setattr(synthesis, "adapter_command", lambda _: ["not-executed"])
+    # Classifier boundary values exercise orchestration, not invented captures.
+    initial = quality_round(repaired=("target",), misses=("other",), normals=("n1", "n2"))
+    repaired = quality_round(repaired=("target", "other"), branches=("n1", "n2"), predicate="rax <= 0")
+    worse = quality_round(repaired=("target",), misses=("other",), normals=("n1", "n2"),
+                          predicate="rax < 1")
+    predicates = ["rax < 0", "rax <= 0", "rax <= 0" if ending == "repeat" else "rax < 1", "rax < 2"]
+    evaluated = [initial["evaluation"], repaired["evaluation"],
+                 repaired["evaluation"] if ending == "repeat" else worse["evaluation"], worse["evaluation"]]
+    model_calls = []
+    build_calls = []
+
+    async def model(current, *args):
+        index = len(model_calls)
+        model_calls.append(current)
+        if index == 3 and ending == "abstain":
+            return terminal(current, proposal(current, decision="abstain", predicate=None), [])
+        predicate = "rax &&" if index == 3 and ending == "malformed" else predicates[index]
+        return terminal(current, proposal(current, predicate=predicate), [predicate])
+
+    async def build(dataset, predicate, directory):
+        build_calls.append(predicate)
+        return {"status": "built", "verified": False, "predicate": predicate}
+
+    from taosc_llm import evaluation
+    monkeypatch.setattr(synthesis, "_model_round", model)
+    monkeypatch.setattr(synthesis, "build_candidate", build)
+    monkeypatch.setattr(evaluation, "evaluate_dataset", lambda *args, **kwargs: evaluated.pop(0))
+    monkeypatch.setattr(synthesis, "predicate_feedback", lambda dataset, value: {"quality": value["quality"]})
+    result = asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=4))
+    assert result["status"] == "not_rejected" and result["termination"] == termination
+    assert result["selected_round"] == 2 and result["proposal"]["predicate"] == "rax <= 0"
+    assert result["quality"] == repaired["evaluation"]["quality"]
+    assert result["quality"]["status"] == "improved_with_regressions"
+    assert result["quality"]["counts"]["improved"] == 2
+    assert result["quality"]["counts"]["branch_regressions"] == 2
+    assert len(model_calls) == round_count and len(result["rounds"]) == round_count
+    assert build_calls == predicates[:3 if ending in ("abstain", "malformed", "repeat") else 4]
+    assert result["rounds"][1]["selection"]["accepted"] is True
+    if ending != "repeat":
+        assert result["rounds"][2]["selection"]["reason"] == "preservation-failed"
+    assert result["build"]["predicate"] == "rax <= 0"
+    assert result["verified"] is False and result["binradar_verification"] == "not_run"
+    assert json.loads((context.run_dir / "run.json").read_text()) == result
+
+
+@pytest.mark.parametrize("cases,status,quality", [
+    ({"repaired": ("target",), "normals": ("normal",)}, "not_rejected", "improved"),
+    ({"repaired": ("target",), "branches": ("normal",)}, "not_rejected", "improved_with_regressions"),
+    ({"misses": ("target",)}, "rejected", "rejected"),
+    ({"others": ("other",)}, "rejected", "rejected"),
+    ({"missing": ("target",)}, "unavailable", "incomplete"),
+    ({"normals": ("normal",)}, "unavailable", "unproven"),
+])
+def test_manual_completed_quality_is_reported_without_runtime_error(tmp_path, monkeypatch, cases, status, quality):
+    dataset = make_dataset(tmp_path / "dataset")
+    evaluated = quality_round(**cases)["evaluation"]
+
+    async def build(*args):
+        return {"status": "built", "verified": False}
+
+    from taosc_llm import evaluation
+    monkeypatch.setattr(synthesis, "build_candidate", build)
+    monkeypatch.setattr(evaluation, "evaluate_dataset", lambda *args, **kwargs: evaluated)
+    result = synthesis.generate_manual(dataset, "0", output=tmp_path / "runs")
+    assert result["status"] == status and result["quality"]["status"] == quality
+    assert result["evaluation"] == evaluated and "error_type" not in result
+    assert result["verified"] is False and result["binradar_verification"] == "not_run"
+    assert json.loads((tmp_path / "runs" / "run.json").read_text()) == result
+
+
+@pytest.mark.parametrize("error", [ValueError("integrity failure"), RuntimeError("native build failed"),
+                                    OSError("storage failure")])
+def test_provider_build_failure_cannot_become_abstention_or_exhaustion(tmp_path, monkeypatch, error):
+    context = prepare_context(make_dataset(tmp_path / "dataset"), run_dir=tmp_path / "runs")
+    provider = ProviderConfig(api_key="offline-only", base_url="https://example.invalid/v1", model="offline")
+    monkeypatch.setattr(synthesis, "adapter_command", lambda _: ["not-executed"])
+    calls = []
+
+    async def model(current, *args):
+        calls.append(current)
+        return terminal(current, proposal(current), ["rax < 0"])
+
+    async def build(*args):
+        raise error
+
+    monkeypatch.setattr(synthesis, "_model_round", model)
+    monkeypatch.setattr(synthesis, "build_candidate", build)
+    with pytest.raises(type(error), match=str(error)):
+        asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=4))
+    result = json.loads((context.run_dir / "run.json").read_text())
+    assert len(calls) == 1 and result["status"] == "infrastructure_error"
+    assert result["error_type"] == type(error).__name__
+    assert result["rounds"][0]["status"] == "build_failed"
+    assert "evaluation" not in result and "quality" not in result
+    assert result["verified"] is False and result["binradar_verification"] == "not_run"
+
+
+@pytest.mark.parametrize("phase", ["provider", "build"])
+def test_real_failure_after_repair_is_not_masked_by_retained_incumbent(tmp_path, monkeypatch, phase):
+    context = prepare_context(make_dataset(tmp_path / "dataset"), run_dir=tmp_path / "runs")
+    provider = ProviderConfig(api_key="offline-only", base_url="https://example.invalid/v1", model="offline")
+    monkeypatch.setattr(synthesis, "adapter_command", lambda _: ["not-executed"])
+    evaluated = quality_round(repaired=("target",), branches=("normal",))["evaluation"]
+    calls = []
+
+    async def model(current, *args):
+        calls.append(current)
+        if len(calls) == 2 and phase == "provider":
+            raise RuntimeError("provider request failed")
+        predicate = "rax < 0" if len(calls) == 1 else "rax <= 0"
+        return terminal(current, proposal(current, predicate=predicate), [predicate])
+
+    async def build(dataset, predicate, directory):
+        if len(calls) == 2:
+            raise RuntimeError("native build failed")
+        return {"status": "built", "verified": False, "predicate": predicate}
+
+    from taosc_llm import evaluation
+    monkeypatch.setattr(synthesis, "_model_round", model)
+    monkeypatch.setattr(synthesis, "build_candidate", build)
+    monkeypatch.setattr(evaluation, "evaluate_dataset", lambda *args, **kwargs: evaluated)
+    monkeypatch.setattr(synthesis, "predicate_feedback", lambda dataset, value: {"quality": value["quality"]})
+    with pytest.raises(RuntimeError, match="provider request failed" if phase == "provider" else "native build failed"):
+        asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=4))
+    result = json.loads((context.run_dir / "run.json").read_text())
+    assert result["status"] == "infrastructure_error" and result["error_type"] == "RuntimeError"
+    assert len(calls) == 2 and result["selected_round"] == 1
+    assert result["quality"]["status"] == "improved_with_regressions"
+    assert result["evaluation"] == evaluated and result["build"]["predicate"] == "rax < 0"
+    assert result["verified"] is False and result["binradar_verification"] == "not_run"
 
 
 def test_replay_binding_fails_before_provider_or_original_execution(tmp_path, monkeypatch):

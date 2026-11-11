@@ -71,13 +71,6 @@ def main(argv=None) -> int:
         print(json.dumps(result, sort_keys=True, allow_nan=False))
         if result["termination"] == "interrupted":
             return 130
-        if (result["termination"] == "evidence-unavailable" or result.get("coverage") == "partial"
-                or result.get("publication_status") in ("partial", "unavailable")):
-            return 3
-        if (result["termination"] not in ("observed-goals-met", "no-target-cases")
-                or result.get("score", {}).get("target_failures")
-                or result.get("score", {}).get("branch_regressions")):
-            return 2
         return 0
     except KeyboardInterrupt:
         print("taosc-llm-no-llm: interrupted before search admission", file=sys.stderr)

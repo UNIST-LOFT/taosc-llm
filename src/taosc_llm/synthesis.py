@@ -240,39 +240,43 @@ async def synthesize_context(context: SynthesisContext, provider: ProviderConfig
                     round_result["proposal"] = proposal
                     if proposal["decision"] == "abstain":
                         abstained = True
-                        incumbent = None
-                        for key in ("build", "evaluation", "quality", "selected_round"):
-                            result.pop(key, None)
-                        result.update(status="abstained", proposal=proposal, termination="abstained")
+                        if incumbent is None:
+                            result.update(status="abstained", proposal=proposal, termination="abstained")
+                        else:
+                            result.update(status=_quality_outcome(incumbent["evaluation"]),
+                                          termination="abstained")
                         round_result["status"] = "abstained"
                     else:
                         candidate = run_dir / "candidates" / str(index + 1) / "build-workdir"
                         try:
                             build = await build_candidate(current.dataset, proposal['predicate'], candidate)
                         except (ValueError, RuntimeError, OSError) as error:
-                            round_result.update(status="build_rejected", reason=str(error))
-                        else:
-                            round_result["build"] = build
-                            write_record(candidate.parent / "build-result.json", build)
-                            from .evaluation import evaluate_dataset
-                            evaluation = await _blocking(evaluate_dataset, current.dataset, proposal["predicate"],
-                                workers=current.workers, execute=True,
-                                cache_dir=current.cache_dir or current.run_dir / "cache",
-                                replay_socket=current.replay_socket)
-                            write_record(candidate.parent / "evaluation.json", evaluation)
-                            result_id = hashlib.sha256(canonical(evaluation)).hexdigest()
-                            public_result_id = current.reference(result_id, kind="r")
-                            prior_results[public_result_id] = evaluation
-                            current._results[public_result_id] = evaluation
-                            round_result.update(result_id=result_id, evaluation=evaluation,
-                                                status=_quality_outcome(evaluation))
-                            selected, selection = _select_candidate(incumbent, round_result)
-                            round_result["selection"] = selection
-                            if selected:
-                                incumbent = round_result
-                                result.update(build=build, evaluation=evaluation, proposal=proposal,
-                                              quality=evaluation.get("quality"), selected_round=index + 1)
+                            round_result.update(status="build_failed", reason=str(error))
+                            raise
+                        round_result["build"] = build
+                        write_record(candidate.parent / "build-result.json", build)
+                        from .evaluation import evaluate_dataset
+                        evaluation = await _blocking(evaluate_dataset, current.dataset, proposal["predicate"],
+                            workers=current.workers, execute=True,
+                            cache_dir=current.cache_dir or current.run_dir / "cache",
+                            replay_socket=current.replay_socket)
+                        write_record(candidate.parent / "evaluation.json", evaluation)
+                        result_id = hashlib.sha256(canonical(evaluation)).hexdigest()
+                        public_result_id = current.reference(result_id, kind="r")
+                        prior_results[public_result_id] = evaluation
+                        current._results[public_result_id] = evaluation
+                        round_result.update(result_id=result_id, evaluation=evaluation,
+                                            status=_quality_outcome(evaluation))
+                        selected, selection = _select_candidate(incumbent, round_result)
+                        round_result["selection"] = selection
+                        if selected:
+                            incumbent = round_result
+                            result.update(build=build, evaluation=evaluation, proposal=proposal,
+                                          quality=evaluation.get("quality"), selected_round=index + 1)
                 if not abstained:
+                    if (incumbent is None and round_result["status"] == "parse_rejected"
+                            and index + 1 == max_rounds):
+                        raise ValueError(round_result["reason"])
                     minimized = (incumbent is not None
                                  and incumbent["evaluation"].get("quality", {}).get("status") == "improved")
                     repeated = (len(result["rounds"]) >= 2 and _repeated_result(
@@ -295,10 +299,8 @@ async def synthesize_context(context: SynthesisContext, provider: ProviderConfig
                                           result_id=current.reference(round_result["result_id"], kind="r"))
                         else:
                             update["error"] = {"kind": round_result["status"],
-                                "message": round_result["reason"][:512] if round_result["status"] == "parse_rejected"
-                                    else "Candidate build failed; host retains the diagnostic."}
-                            if round_result["status"] == "parse_rejected":
-                                update["invalid_proposal"] = terminal["final_text"][:1024]
+                                               "message": round_result["reason"][:512]}
+                            update["invalid_proposal"] = terminal["final_text"][:1024]
                         if incumbent is not None:
                             update["incumbent"] = {"round": incumbent["round"],
                                 "predicate": incumbent["proposal"]["predicate"],

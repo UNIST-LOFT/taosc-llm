@@ -97,6 +97,57 @@ def test_disjoint_crashes_get_separate_immutable_clause_owners(tmp_path):
     assert result["clauses"][1]["prefix"] == [result["clauses"][0]["factors"]]
 
 
+@pytest.mark.parametrize("max_evaluations,termination", [
+    (2, "evaluation-budget-reached"), (64, "clause-budget-reached"),
+])
+def test_full_repair_survives_lower_regression_partial_search(
+        tmp_path, max_evaluations, termination):
+    # This bounded grammar can isolate the negative target, but cannot express
+    # both disjoint intervals without the always-repair seed. The zero-regression
+    # partial clause must not replace that proved full repair in the result.
+    limits = SearchLimits(max_evaluations=max_evaluations, max_atoms=1,
+                          max_factors=1, max_clauses=1, operand_depth=1)
+    output = tmp_path / "search"
+    identity = {"case": "crash-first", "limit": max_evaluations}
+    with Journal(output, identity) as journal:
+        backend = FiniteExecution(journal, limits)
+        result = SearchEngine(backend).run()
+        introductions = [journal.load(event["data"]["state"]) for event in journal.events
+                         if event["kind"] == "commit" and event["data"]["operation"] == "introduce"]
+        assert any(len(state["clauses"][0]["owners"]) == 1 for state in introductions)
+        # The published alternative has its own identity; historical owners do
+        # not silently change when another complete expression is selected.
+        assert result["clauses"][0]["id"] > introductions[-1]["clauses"][0]["id"]
+    assert result["termination"] == termination
+    assert result["score"]["covered"] == ["system:0", "system:4"]
+    assert result["score"]["target_failures"] == []
+    assert result["score"]["branch_regressions"] == ["system:1", "system:2", "system:3"]
+    before = {path: path.read_bytes() for path in (output / "segments").iterdir()}
+    with Journal(output, identity, resume=True) as journal:
+        backend = FiniteExecution(journal, limits)
+        backend.evaluations = limits.max_evaluations
+        resumed = SearchEngine(backend).run()
+        assert backend.requests == []
+        assert resumed["clauses"] == result["clauses"]
+        assert resumed["score"] == result["score"]
+    assert all(path.read_bytes() == contents for path, contents in before.items())
+
+
+def test_full_repair_checkpoint_requires_introduction_proof(tmp_path):
+    limits = SearchLimits(max_evaluations=1, operand_depth=1)
+    output = tmp_path / "search"
+    identity = {"case": "full-repair-proof"}
+    with Journal(output, identity) as journal:
+        engine = SearchEngine(FiniteExecution(journal, limits))
+        engine._start_draft("introduce", "system:0")
+        engine._step_draft()
+        engine.state["full_repair"]["clauses"][0]["owners"] = ["system:0"]
+        engine._save()
+    with Journal(output, identity, resume=True) as journal:
+        with pytest.raises(ValueError, match="introduction does not establish owners"):
+            SearchEngine(FiniteExecution(journal, limits))
+
+
 def test_interrupted_draft_resumes_without_committing_partial_coverage(tmp_path):
     limits = SearchLimits(operand_depth=1, max_factors=1, max_atoms=512)
     output = tmp_path / "search"

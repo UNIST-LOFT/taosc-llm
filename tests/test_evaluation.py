@@ -132,16 +132,16 @@ def test_aggregate_rejection_preserves_case_availability(
             assert row['branches'] is None
 
 
-@pytest.mark.parametrize(('extra', 'expected_quality', 'expected_diagnostic', 'exit_code'), [
-    ('normal', 'improved_with_regressions', 'not_rejected', 0),
-    ('other', 'rejected', 'not_rejected', 2),
-    ('target', 'rejected', 'reject_same_crash', 2),
-    ('unavailable', 'incomplete', 'not_rejected', 3),
-    ('baseline-gap', 'incomplete', 'not_rejected', 3),
-    ('no-repair', 'unproven', 'not_rejected', 3),
+@pytest.mark.parametrize(('extra', 'expected_quality', 'expected_diagnostic'), [
+    ('normal', 'improved_with_regressions', 'not_rejected'),
+    ('other', 'rejected', 'not_rejected'),
+    ('target', 'rejected', 'reject_same_crash'),
+    ('unavailable', 'incomplete', 'not_rejected'),
+    ('baseline-gap', 'incomplete', 'not_rejected'),
+    ('no-repair', 'unproven', 'not_rejected'),
 ])
 def test_candidate_quality_keeps_target_diagnostic_and_soft_branch_cli_outcome(
-        dataset, tmp_path, monkeypatch, extra, expected_quality, expected_diagnostic, exit_code, capsys):
+        dataset, tmp_path, monkeypatch, extra, expected_quality, expected_diagnostic, capsys):
     from taosc_llm.cli import _run
 
     template = dataset.rows[0]
@@ -169,19 +169,18 @@ def test_candidate_quality_keeps_target_diagnostic_and_soft_branch_cli_outcome(
     assert result['quality']['status'] == expected_quality
     assert result['quality']['counts']['branch_regressions'] >= 1
     assert result['quality']['counts']['improved'] == (0 if extra == 'no-repair' else 1)
-    assert _run('taosc-llm-evaluate', lambda: result) == exit_code
+    assert _run('taosc-llm-evaluate', lambda: result) == 0
     assert json.loads(capsys.readouterr().out)['quality']['status'] == expected_quality
 
 
-@pytest.mark.parametrize(('status', 'expected'), [
-    ('improved', 0), ('improved_with_regressions', 0),
-    ('rejected', 2), ('incomplete', 3), ('unproven', 3),
+@pytest.mark.parametrize('status', [
+    'improved', 'improved_with_regressions', 'rejected', 'incomplete', 'unproven',
 ])
 @pytest.mark.parametrize('label', ['taosc-llm', 'taosc-llm-evaluate'])
-def test_cli_candidate_quality_exit_status(status, expected, label, capsys):
+def test_cli_candidate_quality_exit_status(status, label, capsys):
     from taosc_llm.cli import _run
     result = {'status': 'not_rejected', 'predicate': 'rax != 0', 'quality': {'status': status}}
-    assert _run(label, lambda: result) == expected
+    assert _run(label, lambda: result) == 0
     assert json.loads(capsys.readouterr().out) == result
 
 

@@ -1,6 +1,8 @@
 """Persistent admission budgets cannot be replenished by process interruption."""
 from copy import deepcopy
+import json
 from pathlib import Path
+import subprocess
 import threading
 from types import SimpleNamespace
 
@@ -15,6 +17,103 @@ from taosc_llm.no_llm import backend as module
 from taosc_llm.no_llm.backend import Backend
 from taosc_llm.no_llm.journal import Journal
 from taosc_llm.no_llm.model import SearchLimits, SearchStopped
+
+
+@pytest.mark.parametrize("termination", [
+    "observed-goals-met", "no-target-cases", "evidence-unavailable",
+    "bounded-search-exhausted", "clause-budget-reached", "wall-time-reached",
+    "evaluation-budget-reached", "interrupted",
+])
+def test_search_cli_completion_preserves_scoped_evidence(tmp_path, monkeypatch, capfd, termination):
+    from taosc_llm.no_llm import cli, run
+    result = {"termination": termination, "predicate": None, "coverage": "partial",
+              "publication_status": "unavailable", "score": {
+                  "target_failures": ["system:0"], "branch_regressions": ["system:1"]},
+              "verified": False, "binradar_verification": "not_run"}
+    monkeypatch.setattr(run, "synthesize", lambda *args, **kwargs: result)
+    assert cli.main(["--dataset", str(tmp_path), "--output", str(tmp_path / "result")]) == (
+        130 if termination == "interrupted" else 0)
+    assert json.loads(capfd.readouterr().out) == result
+
+
+@pytest.mark.parametrize("mode,status", [
+    (mode, status) for mode in ("manual", "provider", "evaluate", "warm")
+    for status in (("not_rejected", "reject_same_crash", "unavailable")
+                   if mode in ("evaluate", "warm") else
+                   ("not_rejected", "reject_same_crash", "rejected", "unavailable", "abstained", "refinement_exhausted"))
+])
+def test_public_cli_completed_results_do_not_encode_quality(tmp_path, monkeypatch, capfd, mode, status):
+    from taosc_llm import cli, synthesis
+    result = {"status": status, "predicate": None if mode == "warm" else "rax != 0",
+              "quality": {"status": "unproven", "counts": {"target_remaining": 1, "other_crash": 1}},
+              "verified": False, "binradar_verification": "not_run"}
+    operation = lambda *args, **kwargs: result
+    arguments = ["--dataset", str(tmp_path)]
+    if mode in ("manual", "provider"):
+        monkeypatch.setattr(synthesis, "generate_manual" if mode == "manual" else "generate_with_pi", operation)
+        arguments += ["--predicate", "rax != 0"] if mode == "manual" else ["--provider-env", str(tmp_path / "provider.env")]
+        entrypoint = cli.main
+    else:
+        monkeypatch.setattr(evaluation, "warm_dataset" if mode == "warm" else "evaluate_dataset", operation)
+        arguments += ["--warm"] if mode == "warm" else ["--predicate", "rax != 0"]
+        entrypoint = cli.evaluate_main
+    assert entrypoint(arguments) == 0
+    assert json.loads(capfd.readouterr().out) == result
+
+
+@pytest.mark.parametrize("mode", ["no-llm", "manual", "provider", "evaluate"])
+@pytest.mark.parametrize("error,expected", [
+    (ValueError("invalid configuration"), 1), (RuntimeError("provider or build failed"), 1),
+    (OSError("storage failed"), 1), (KeyboardInterrupt(), 130),
+])
+def test_public_cli_operational_failure_is_not_completion(tmp_path, monkeypatch, capfd, mode, error, expected):
+    from taosc_llm import cli, synthesis
+    from taosc_llm.no_llm import cli as search_cli, run
+    def fail(*args, **kwargs):
+        raise error
+    arguments = ["--dataset", str(tmp_path)]
+    if mode == "no-llm":
+        monkeypatch.setattr(run, "synthesize", fail)
+        entrypoint = search_cli.main
+        arguments += ["--output", str(tmp_path / "result")]
+    elif mode in ("manual", "provider"):
+        monkeypatch.setattr(synthesis, "generate_manual" if mode == "manual" else "generate_with_pi", fail)
+        entrypoint = cli.main
+        arguments += ["--predicate", "rax != 0"] if mode == "manual" else ["--provider-env", str(tmp_path / "provider.env")]
+    else:
+        monkeypatch.setattr(evaluation, "evaluate_dataset", fail)
+        entrypoint = cli.evaluate_main
+        arguments += ["--predicate", "rax != 0"]
+    assert entrypoint(arguments) == expected
+    assert not capfd.readouterr().out
+
+
+@pytest.mark.parametrize("status,expected", [("infrastructure_error", 1), ("refining", 1), ("cancelled", 130)])
+def test_manual_cli_noncompleted_status_is_not_success(tmp_path, monkeypatch, capfd, status, expected):
+    from taosc_llm import cli, synthesis
+    result = {"status": status, "verified": False, "binradar_verification": "not_run"}
+    monkeypatch.setattr(synthesis, "generate_manual", lambda *args, **kwargs: result)
+    assert cli.main(["--dataset", str(tmp_path), "--predicate", "rax != 0"]) == expected
+    assert json.loads(capfd.readouterr().out) == result
+
+
+@pytest.mark.parametrize("entrypoint", ["search", "manual", "evaluate"])
+def test_public_cli_invalid_arguments_remain_nonzero(tmp_path, entrypoint):
+    from taosc_llm import cli
+    from taosc_llm.no_llm import cli as search_cli
+    operation = {"search": search_cli.main, "manual": cli.main, "evaluate": cli.evaluate_main}[entrypoint]
+    with pytest.raises(SystemExit) as error:
+        operation(["--dataset", str(tmp_path), "--unknown-option"])
+    assert error.value.code == 2
+
+
+def test_manual_cli_child_build_failure_is_fatal(tmp_path, monkeypatch, capfd):
+    from taosc_llm import cli, synthesis
+    def fail(*args, **kwargs):
+        raise subprocess.CalledProcessError(7, ["builder"])
+    monkeypatch.setattr(synthesis, "generate_manual", fail)
+    assert cli.main(["--dataset", str(tmp_path), "--predicate", "rax != 0"]) == 1
+    assert not capfd.readouterr().out
 
 
 @pytest.mark.parametrize("closed,expected", [(False, 25.0), (True, 5.0)])

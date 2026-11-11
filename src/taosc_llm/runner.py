@@ -293,13 +293,15 @@ class Experiment:
                 self._finish(self.resident_job, code)
                 raise StageFailure(f"resident producer exited before shutdown (exit {code}); see {self.log}")
 
-    def stage(self, name, command, *, accepted=(0,), timeout=None, cwd=None, structured=True):
+    def stage(self, name, command, *, timeout=None, cwd=None, structured=True):
         job = self._start(name, command, cwd=cwd, structured=structured)
         code = self.supervisor.wait(job, timeout=self.args.stage_timeout if timeout is None else timeout,
                                     tick=self.health)
         self._finish(job, code)
         self.health()
-        if code not in accepted:
+        if code == 130:
+            raise RunnerInterrupted()
+        if code != 0:
             raise StageFailure(f"{name} failed (exit {code}); see {self.log}")
         return code
 
@@ -404,16 +406,31 @@ class Experiment:
                 command.extend(("--pi-sdk-root", str(args.pi_sdk_root)))
             if args.session_feedback:
                 command.append("--session-feedback")
-        code = self.stage("synthesis", command, accepted=(0, 2, 3))
+        self.stage("synthesis", command)
         output = self.log / "synthesis.json"
         result = _read_json(output)
+        if args.mode == "no-llm":
+            completed = (result.get("schema_version") == 1
+                         and result.get("engine") == "taosc-llm-no-llm"
+                         and result.get("termination") in (
+                             "observed-goals-met", "no-target-cases", "evidence-unavailable",
+                             "bounded-search-exhausted", "clause-budget-reached",
+                             "wall-time-reached", "evaluation-budget-reached"))
+        else:
+            completed = result.get("status") in (
+                "built", "abstained", "not_rejected", "reject_same_crash", "rejected",
+                "unavailable", "refinement_exhausted")
+        if (not completed or (args.mode == "no-llm" and "predicate" not in result)
+                or result.get("verified") is not False
+                or result.get("binradar_verification") != "not_run"):
+            raise StageFailure(f"synthesis did not return a completed scoped result: {output}")
         self.record["synthesis_result"] = str(output)
         self.record["result_directory"] = str(self.root / "result")
         self.record["synthesis"] = {key: result[key] for key in (
             "status", "termination", "coverage", "predicate", "quality", "selected_round",
-            "publication_status", "budgets", "result_record")
-                                   if key in result}
-        return code
+            "score", "publication_status", "budgets", "result_record",
+            "verified", "binradar_verification") if key in result}
+        return 0
 
     def execute(self) -> int:
         args = self.args
@@ -426,11 +443,19 @@ class Experiment:
         if args.stop_after == "dataset":
             return 0
         if not args.resume:
-            code = self.stage("warm", _cli("evaluate_main", "--dataset", dataset, "--warm",
-                                           "--workers", args.execution_workers, "--cache-dir", self.root / "cache"),
-                              accepted=(0, 2, 3))
+            self.stage("warm", _cli("evaluate_main", "--dataset", dataset, "--warm",
+                                    "--workers", args.execution_workers, "--cache-dir", self.root / "cache"))
+            output = self.log / "warm.json"
+            result = _read_json(output)
+            if (result.get("status") not in ("not_rejected", "reject_same_crash", "unavailable")
+                    or result.get("verified") is not False or result.get("predicate") is not None):
+                raise StageFailure(f"warm did not return a completed neutral evaluation: {output}")
+            self.record["warm_result"] = str(output)
+            self.record["warm"] = {key: result[key] for key in (
+                "status", "predicate", "quality", "summary", "verified") if key in result}
+            self.persist()
             if args.stop_after == "warm":
-                return code
+                return 0
         return self.synthesize(dataset)
 
     def shutdown(self):
@@ -469,7 +494,7 @@ def _execute(args, root, record, *, held_fds=()) -> int:
                     if not prior_error:
                         raise
                     print(f"[cleanup] {error}", file=sys.stderr)
-        record["status"] = "finished" if code == 0 else "scoped-result"
+        record["status"] = "finished"
     except RunnerInterrupted as error:
         code = error.exit_code
         record.update(status="interrupted", error=str(error))

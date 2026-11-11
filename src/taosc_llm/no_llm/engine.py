@@ -35,7 +35,7 @@ class SearchEngine:
                       "blocked": [], "refine_index": 0, "refine_progress": False,
                       "draft": None, "revision": 0, "termination": None,
                       "prediction_evidence": {}, "prediction_revision": 0,
-                      "processed_evaluations": [], "atoms": []}
+                      "processed_evaluations": [], "atoms": [], "full_repair": None}
         for event in self.journal.events:
             if event["kind"] in ("checkpoint", "commit"):
                 self.state = self.journal.load(event["data"]["state"])
@@ -60,13 +60,21 @@ class SearchEngine:
             if set(self.state["atoms"]) != set(self.space.atoms):
                 raise ValueError("checkpoint atom corpus mismatch")
             self.space.atoms = tuple(self.state["atoms"])
-        self._validate_incumbent()
+        self._validate_incumbent(self.state["clauses"], self.current, self.score)
+        self.full_repair_score = None
+        if self.state["full_repair"] is not None:
+            saved = self.state["full_repair"]
+            evaluated = backend.load(saved["evaluation"])
+            self.full_repair_score = Score.from_evaluation(self.population, evaluated)
+            self._validate_incumbent(saved["clauses"], evaluated, self.full_repair_score)
+            if not self.population.crashes <= self.full_repair_score.covered:
+                raise ValueError("saved full repair does not cover every target")
 
-    def _validate_incumbent(self):
+    def _validate_incumbent(self, clauses, current, score):
         """A durable checkpoint is not itself proof of ownership or execution."""
         required = set()
         ids = set()
-        for clause in self.state["clauses"]:
+        for clause in clauses:
             owners = frozenset(clause["owners"])
             if (not owners or not owners <= self.population.crashes or owners & required
                     or clause["id"] in ids):
@@ -97,11 +105,11 @@ class SearchEngine:
                     raise ValueError("checkpoint refinement lost local owners")
             elif clause["factors"] != clause["introduced_factors"]:
                 raise ValueError("checkpoint has unproved refinement")
-        if not required <= self.score.covered:
+        if not required <= score.covered:
             raise ValueError("checkpoint incumbent lost global owners")
-        if self.state["clauses"]:
-            expected = parse_candidate(self.family, compose(self.family, _clauses(self.state["clauses"])))
-            if self.current["descriptor"] != expected.descriptor:
+        if clauses:
+            expected = parse_candidate(self.family, compose(self.family, _clauses(clauses)))
+            if current["descriptor"] != expected.descriptor:
                 raise ValueError("checkpoint incumbent expression mismatch")
 
     def _save(self, *, commit=None):
@@ -251,6 +259,55 @@ class SearchEngine:
                                "prediction_revision": self.state["prediction_revision"]}
         self._save()
 
+    def _introduction_record(self, best):
+        return {"id": self.state["revision"] + 1,
+                "factors": best["factors"], "introduced_factors": best["factors"],
+                "prefix": [list(row) for row in _clauses(self.state["clauses"])],
+                "prefix_evaluation": self.state["evaluation"],
+                "owners": best["owners"], "introduction": best["evaluation"],
+                "witnesses": best["witnesses"]}
+
+    def _remember_full_repair(self, clauses, score, reference, *, pending_introduction=False):
+        # Keep searching partial clauses: committing an always-repair seed here
+        # would bind every owner to one conjunction and prevent useful OR splits.
+        # But never lose a proved full repair just because a partial draft has
+        # fewer branch regressions when a finite search ends.
+        if not self.population.crashes <= score.covered:
+            return
+        saved = self.state["full_repair"]
+        rank = (len(score.regressions), _cost(_clauses(clauses)))
+        if saved is not None and rank >= (
+                len(self.full_repair_score.regressions), _cost(_clauses(saved["clauses"]))):
+            return
+        self.state["full_repair"] = {"clauses": copy.deepcopy(clauses), "evaluation": reference,
+                                     "pending_introduction": pending_introduction}
+        self.full_repair_score = score
+
+    def _select_full_repair(self):
+        saved = self.state["full_repair"]
+        if saved is None:
+            return
+        if self.population.crashes <= self.score.covered and (
+                len(self.score.regressions), _cost(_clauses(self.state["clauses"]))) <= (
+                len(self.full_repair_score.regressions), _cost(_clauses(saved["clauses"]))):
+            return
+        current = self.backend.load(saved["evaluation"])
+        score = Score.from_evaluation(self.population, current)
+        self._validate_incumbent(saved["clauses"], current, score)
+        if (not self.population.crashes <= score.covered
+                or not self.score.known_normals <= score.known_normals):
+            raise ValueError("saved full repair lost required observations")
+        self.backend.check_operation()
+        clauses = copy.deepcopy(saved["clauses"])
+        if saved["pending_introduction"]:
+            # An alternative draft never owned the ID used by a later commit.
+            clauses[-1]["id"] = self.state["revision"] + 1
+        self.state.update(clauses=clauses, evaluation=saved["evaluation"],
+                          draft=None, phase="refine", blocked=[], refine_index=0,
+                          refine_progress=False, revision=self.state["revision"] + 1)
+        self.current, self.score = current, score
+        self._save(commit="retain-full-repair")
+
     def _accept_introduction(self, best):
         current = self.backend.load(best["evaluation"])
         score = Score.from_evaluation(self.population, current)
@@ -267,12 +324,7 @@ class SearchEngine:
         if witnesses is None or witnesses != best["witnesses"]:
             raise ValueError("draft introduction does not establish owners")
         self.backend.check_operation()
-        self.state["clauses"].append({"id": self.state["revision"] + 1,
-                                      "factors": best["factors"], "introduced_factors": best["factors"],
-                                      "prefix": [list(row) for row in prefix],
-                                      "prefix_evaluation": self.state["evaluation"],
-                                      "owners": best["owners"], "introduction": best["evaluation"],
-                                      "witnesses": best["witnesses"]})
+        self.state["clauses"].append(self._introduction_record(best))
         self.state["evaluation"] = best["evaluation"]
         self.current = current
         self.score = score
@@ -288,6 +340,7 @@ class SearchEngine:
         self.state["evaluation"] = reference
         self.current = result
         self.score = Score.from_evaluation(self.population, result)
+        self._remember_full_repair(self.state["clauses"], self.score, reference)
         self.state.update(draft=None, refine_progress=True, revision=self.state["revision"] + 1)
         self._save(commit="refine")
 
@@ -318,10 +371,14 @@ class SearchEngine:
                         rank = (len(score.regressions), -len(owners), _cost((tuple(factors),)), tuple(factors))
                         old = draft["best"]
                         old_rank = (old["rank"][0], old["rank"][1], old["rank"][2], tuple(old["rank"][3])) if old else None
+                        candidate = {"rank": list(rank), "factors": list(factors),
+                                     "evaluation": reference, "owners": sorted(owners),
+                                     "witnesses": witnesses}
+                        self._remember_full_repair(
+                            self.state["clauses"] + [self._introduction_record(candidate)], score, reference,
+                            pending_introduction=True)
                         if old_rank is None or rank < old_rank:
-                            draft["best"] = {"rank": list(rank), "factors": list(factors),
-                                             "evaluation": reference, "owners": sorted(owners),
-                                             "witnesses": witnesses}
+                            draft["best"] = candidate
                         if score.regressions <= self.score.regressions:
                             self._accept_introduction(draft["best"])
                             return
@@ -424,6 +481,13 @@ class SearchEngine:
         except KeyboardInterrupt:
             self.state["termination"] = "interrupted"
             self._save()
+        if self.state["termination"] != "interrupted":
+            try:
+                with self.backend.restoration():
+                    self._select_full_repair()
+            except (SearchStopped, KeyboardInterrupt):
+                self.state["termination"] = "interrupted"
+                self._save()
         return self.result()
 
     def result(self):

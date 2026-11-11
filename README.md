@@ -228,7 +228,14 @@ caches; only a genuine new evidence revision reopens an exhausted frontier.
 Each introduced clause keeps its immutable marginal owner cases,
 prefix revision, expression and decisive-hit evidence. Refinement must preserve
 both that local obligation without later clauses and the current global owners;
-hiding normal cases behind unavailable evidence is not an improvement.
+hiding normal cases behind unavailable evidence is not an improvement. A proved
+full-target repair is retained separately while partial clauses explore better
+partitions. On normal/budget termination it takes precedence over a partial
+repair, even with more branch regressions; among full repairs fewer regressions
+then lower expression cost wins. Selection reauthenticates the saved expression,
+introduction owners and witnesses without new execution. Cancellation never
+promotes a draft. This prevents losing complete crash coverage without locking
+all targets into the first always-repair conjunction.
 
 | Search option | Finite default | Bound |
 |---|---:|---|
@@ -286,9 +293,12 @@ function mutations cannot be transferred to newly built artifacts and leave
 publication partial. Every result retains `verified=false` and
 `binradar_verification=not_run`.
 
-Exit status: **0** observed goals met (or no admitted target cases), **2** search
-stopped/incomplete goals, **3** incomplete evidence/publication, **130** interrupted,
-**1** input/storage/engine failure. Read the result, not exit status alone.
+Exit status: **0** for every completed search outcome, including remaining
+crashes/regressions, no candidate, exhausted budget/grammar and partial evidence
+or publication; **130** interrupted; **1** input/storage/engine/build failure.
+Invalid CLI usage remains nonzero. Judge repair from `score`, `termination`,
+`coverage`, `publication_status` and the artifacts, never process exit alone.
+A built-artifact branch mismatch is still an error, not partial success.
 Acceptance and remaining representative-corpus/live-replay gates are recorded in
 the [implementation record](../../agent-docs/taosc-llm/memo/patch-synthesizer/README.md).
 
@@ -377,8 +387,12 @@ quality stop with `termination=repeated_result`; matching counts alone do not
 suffice. Otherwise the configured limit (default four rounds) ends with
 `termination=round_limit`. Both retain the incumbent's actual quality and report
 residual branches normally; crashes and evidence gaps do not become success.
-Without an evaluated candidate use `refinement_exhausted`. Explicit abstention
-stops without a candidate. No final BinRadar verification is run.
+Without an evaluated candidate a valid abstention stops without a candidate;
+a later abstention retains an already evaluated incumbent. Invalid model
+proposals can receive bounded corrective feedback, but an unrecovered final
+parse error with no incumbent remains an error. Build/storage/integrity and
+provider failures propagate; they are not `refinement_exhausted` outcomes.
+No final BinRadar verification is run.
 
 Provider routing, credential-file syntax, isolated SDK setup, per-operation
 bounds and externally managed scheduling are specified in
@@ -427,10 +441,9 @@ Stdout contains one JSON result; diagnostics go to stderr. Common CLI exits:
 
 | Exit | Meaning |
 |---|---|
-| 0 | `prepared`, `built`, `abstained`, non-rejected neutral warming, or candidate quality `improved` / `improved_with_regressions`; never FINAL proof |
-| 2 | `reject_same_crash` or quality `rejected` (including other crash) |
-| 3 | `unavailable`, quality `incomplete` or `unproven` |
-| 1 | Other terminal failure, including exhausted refinement or infrastructure/parser/build error |
+| 0 | Completed setup/evaluation/synthesis, including abstention, no candidate, remaining crashes/regressions, evidence gaps and bounded exhaustion; never repair or FINAL proof |
+| 1 | Input, provider/API, unrecovered parser, storage, engine or build failure |
+| 2 | Invalid CLI arguments, not candidate quality |
 | 130 | Interrupted; local cleanup does not prove remote provider completion |
 
 `evaluation.status` remains the target-only diagnostic: any same-target crash
@@ -440,10 +453,11 @@ success. The separate `evaluation.quality` carries status, orthogonal counts and
 reasons. Original-target/neutral-normal disagreement is `baseline_gaps`, not an
 improvement. Other crashes, unavailable evidence and unproven repair remain
 separate from `improved`/`preserved_normal`; facet counts can overlap.
-Candidate evaluation CLI exits and provider/manual terminal outcomes use this
-quality verdict. An all-unavailable candidate now exits 3, not 0. `--warm` is
-acquisition rather than candidate assessment and keeps the target-only exit
-policy; its JSON status is not guaranteed to be `warmed`.
+Candidate quality remains in the result, independent of CLI exit status. A
+completed all-unavailable or rejected candidate exits 0 without changing its
+quality or evidence. `--warm` is acquisition rather than candidate assessment;
+its JSON status is not guaranteed to be `warmed`, and its completed outcomes
+also exit 0.
 Full private `report_summary` retains actual firing, paired transitions, capture
 gaps and oracle warnings; offline predictions are not actual activity. See the
 [quality classification contract](../../agent-docs/taosc-llm/PROMPTS_AND_EVIDENCE.md#capture-and-outcome-interpretation)
@@ -715,11 +729,14 @@ retained. Unkillable survivors are reported as cleanup errors, never success.
 Linux pidfds/subreapers are required; there is no unsafe group-number fallback.
 
 Stdout is one runner JSON summary; stderr is progress. `run.json` references the
-actual synthesis JSON and preserves its scoped result. Exit 0 means a completed
-requested stage or explicit skip; 2/3 preserve the final requested warm/synthesis
-result. A full pipeline accepts scoped warm outcomes 0/2/3 (the baseline may
-reject the same crash), records that code, and returns synthesis's code instead.
-Operational warm errors still stop the pipeline. Exit 124 means wall timeout;
+actual synthesis JSON and preserves its scoped result, including score/quality,
+residual targets/regressions and publication status. Exit 0 means a completed
+requested stage or explicit skip. Warm and synthesis children must return the
+current zero-exit completed-result contract; old quality-derived 2/3 codes are
+not silently accepted. Zero without a valid terminal result is also an error.
+Operational warm/producer/build errors still stop the pipeline: a required
+resident that cannot establish its baseline is not a completed search outcome.
+Exit 124 means the runner killed an over-limit stage, not a cooperative search stop;
 130/143 mean SIGINT/SIGTERM; 1 means operational failure. Argparse errors use 2.
 Inspect status and synthesis evidence, not exit 0 alone. No path runs FINAL.
 Existing no-LLM live-mutation artifact-publication limits are unchanged.
