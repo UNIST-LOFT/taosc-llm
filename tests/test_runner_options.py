@@ -119,7 +119,7 @@ def test_invalid_combinations_do_not_create_output(tmp_path, monkeypatch, argv):
 
 @pytest.mark.parametrize("option,default", [
     ("search-timeout", "3600"), ("max-evaluations", "256"),
-    ("max-atoms", "512"), ("beam-width", "12"), ("max-clauses", "12"),
+    ("max-atoms", "1024"), ("beam-width", "12"), ("max-clauses", "12"),
     ("max-factors", "6"), ("operand-depth", "2"),
 ])
 @pytest.mark.parametrize("mode", ["manual", "provider"])

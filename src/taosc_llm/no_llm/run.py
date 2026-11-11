@@ -94,7 +94,9 @@ def synthesize(dataset, *, output: Path, limits: SearchLimits | None = None,
                     os.close(descriptor)
                     directory = parent / "build-workdir"
                     build = asyncio.run(_build(backend, build_candidate(dataset, result["predicate"], directory)))
-                    verification = verify_built_candidate(dataset, build, engine.current, workers=execution_workers)
+                    with backend.restoration():
+                        selected_evaluation = backend.load(result["evaluation"])
+                    verification = verify_built_candidate(dataset, build, selected_evaluation, workers=execution_workers)
                     backend.check_cancelled()
                     _durable_build(build, journal.directory)
                     publication = {"build": build, "artifact_execution": verification}
@@ -106,7 +108,7 @@ def synthesize(dataset, *, output: Path, limits: SearchLimits | None = None,
         except (SearchStopped, KeyboardInterrupt) as stop:
             reason = "interrupted" if isinstance(stop, KeyboardInterrupt) else stop.reason
             if engine is not None:
-                result = engine.result()
+                result = engine.result(interrupted=reason == "interrupted")
                 result["termination"] = reason
             else:
                 result = {"schema_version": 1, "engine": "taosc-llm-no-llm",

@@ -222,26 +222,33 @@ Search uses ordered generic repair DNF; CWE-805 uses its ordered dual safe CNF
 against one same clamp. No new runtime grammar or independently reduced clamp
 OR is introduced. Bounded atom/beam exploration shortlists candidates using
 captured values; only actual execution or equal complete-vector reuse establishes
-coverage. One frontier considers all unresolved targets: an unavailable anchor
-cannot veto another case’s actual repair. Identical prediction states preserve
-caches; only a genuine new evidence revision reopens an exhausted frontier.
-Each introduced clause keeps its immutable marginal owner cases,
-prefix revision, expression and decisive-hit evidence. Refinement must preserve
-both that local obligation without later clauses and the current global owners;
-hiding normal cases behind unavailable evidence is not an improvement. A proved
-full-target repair is retained separately while partial clauses explore better
-partitions. On normal/budget termination it takes precedence over a partial
-repair, even with more branch regressions; among full repairs fewer regressions
-then lower expression cost wins. Selection reauthenticates the saved expression,
-introduction owners and witnesses without new execution. Cancellation never
-promotes a draft. This prevents losing complete crash coverage without locking
-all targets into the first always-repair conjunction.
+coverage. Each branch considers all unresolved targets: an unavailable anchor
+cannot veto another case’s actual repair. A bounded, deterministic frontier gives
+work to high-coverage, low-regression and different case-membership alternatives.
+Early clause acceptance preserves alternative draft continuations, so a locally
+stuck or full-repair decomposition is not the only path. Identical prediction
+states preserve caches; only genuine new evidence reopens exhausted work.
+Each branch keeps immutable clause-introduction owners, prefix evaluations and
+decisive-hit witnesses. Refinement preserves both local obligations without later
+clauses and that branch’s global owners; selecting a different branch never
+transfers ownership. Losing normal evidence or crashing an admitted normal is
+not an improvement.
+
+An independent best-result archive ranks eligible, actually evaluated programs
+by unresolved target count, then branch regression count, expression cost and
+stable expression. This retains better partial repairs as well as full repairs,
+even if the working branch has fewer regressions. The archive does not force an
+always-repair seed to own every target in the exploratory branches. Normal/budget
+termination reauthenticates the selected program’s evaluation and ownership
+proofs without new execution or overwriting the working frontier. Artifact
+publication compares against that selected evaluation, not the active branch.
+Cancellation never promotes a draft.
 
 | Search option | Finite default | Bound |
 |---|---:|---|
 | `--timeout` | 3600 seconds | Positive finite admission budget |
 | `--max-evaluations` | 256 | Positive; includes baseline admission |
-| `--max-atoms` | 512 | 1–65536 |
+| `--max-atoms` | 1024 | 1–65536 |
 | `--beam-width` | 12 | 1–256 |
 | `--max-clauses` | 12 | 1–128 |
 | `--max-factors` | 6 | 1–128 |
@@ -254,10 +261,10 @@ The evaluation-count cap still charges baseline/candidate operations before
 admission and persists across interruption. In-flight evaluation drains under
 existing per-execution limits. Finalization is separate from search admission,
 remains cancellable under native limits, and may finish after the search deadline;
-it does not reset spent search time. A time/evaluation-budget stop may commit
-an already fully evaluated best draft after reauthenticating its evidence, owners
-and marginal witnesses, without admitting new evaluation. Cancellation never
-promotes a draft; positive branch regressions remain visible. Search stop reasons
+it does not reset spent search time. A time/evaluation-budget stop selects the
+already evaluated best-result archive after reauthenticating its evidence, owners
+and marginal witnesses; it does not commit a draft or admit new evaluation.
+Cancellation never promotes a draft; positive branch regressions remain visible. Search stop reasons
 distinguish goals, budgets, bounded exhaustion,
 interruption and evidence gaps; no global optimum or out-of-corpus repair is
 claimed. `coverage=complete` means complete observations, not all targets repaired.
@@ -270,8 +277,9 @@ of truth. Resume never overwrites old segments/payloads or interprets manual/Pi
 `run.json`. Checksums, chains and transitive evidence references are checked;
 a torn final record remains on disk, while complete corruption is fatal.
 Directory/file locks, restrictive permissions, symlink rejection and fsync ordering
-protect publication. The frontier, capture revision, atom order, incumbent,
-owners and spent budgets are restored. Different dataset/artifact/oracle,
+protect publication. The best-result archive, active and pending branches,
+scheduling order, capture revision, atom order, owner proofs and spent budgets
+are restored. Different dataset/artifact/oracle,
 implementation, limits, workers or replay policy refuses resume. SIGINT/TERM
 stop admission and drain registered children. SIGKILL cannot report its stop time:
 the interval since the last durable budget timestamp, including downtime, is
