@@ -590,6 +590,101 @@ into native sessions; no old-results migration or deletion is performed. See the
 and the single authoritative
 [raw error schema and privacy contract](../../agent-docs/taosc-llm/PROVIDER_AND_PI.md#raw-error-artifacts-authoritative-persistence-contract).
 
+## Result collection
+
+`taosc-llm-collect-results` reads saved provider/manual/no-LLM results without
+loading a dataset, running a target/model, or contacting a replay server. The
+checkout launcher is `collect-results.py` in this package; the module entry is
+`python -m taosc_llm.collect_results`. No native tools or credentials are needed.
+
+```sh
+uv run --project utils/taosc-llm taosc-llm-collect-results \
+  --exp benchmarks/loftix/exp.list --workdir workdir-0.1.24-new \
+  --run-prefix taosc-llm-out --mode provider \
+  --format csv --output /tmp/taosc-llm-results.csv
+```
+
+For no-LLM use its workdir and `--run-prefix taosc-llm-no-llm-out --mode no-llm`.
+Alternatively, repeat `--run-dir SAVED_RUN` to collect exact runner directories,
+standalone provider/manual outputs, or standalone no-LLM journals. This bypasses
+experiment discovery and does not select a new candidate.
+
+### Independent result axes
+
+Collection deliberately does **not** use the producer's stricter `quality` or
+no-LLM `score` to classify a patch. Its primary objective is **only the designated
+target crash**, not eliminating every other crash or proving complete evidence.
+
+| `target_status` | Meaning |
+|---|---|
+| `target_present` | At least one observed candidate reproduces the target crash. |
+| `target_absent` | At least one candidate outcome is observed and none reproduces the target; normal and other-crash outcomes both qualify. |
+| `not_observed` | A candidate exists but no outcome is classified; never counted as target removal. |
+| `no_candidate` | No selected predicate was produced. |
+
+These labels describe the **observed cohort**, not universal repair or causal
+attribution. Unknown cases do not turn `target_absent` into an incomplete patch,
+but remain explicitly counted. Baseline gaps, other crashes and branch differences
+never reject a patch in this collector. Existing synthesis/selection algorithms,
+model feedback, stored strict quality and exit policies are unchanged.
+
+| Axis | Important fields / interpretation |
+|---|---|
+| Target outcomes | `candidate_known`, `candidate_unknown`, `candidate_target_crashes`; `candidate_other_crashes` is informational only. |
+| Target transitions | `target_baselines = target_fixed + target_remaining + target_unobserved`. System cases use the applicable original; function cases use the neutral when the original is inapplicable. Unknown originals never borrow neutral outcomes. Target→normal **or other crash** counts as `target_fixed`, even with a known original/neutral mismatch; this is an observed transition, not proof that the predicate caused it. |
+| Regression | `branch_regressions / branch_comparable` counts authenticated normal→normal complete-vector differences. `new_target_failures` compares compatible neutral-normal→candidate-target, not an instrumentation-induced original/neutral change. No other-crash penalty or automatic cross-run ranking is added. |
+| Comparison limits | `branch_comparison_unavailable` is all cases outside that normal→normal denominator, including inapplicable transitions. It is not a count of crashing cases. `candidate_capture_incomplete` can coexist with a known normal/crash outcome. |
+| Baseline diagnostics | `baseline_gaps` records unavailable/incompatible source/control/oracle evidence; known original/neutral disagreements are separately `original_neutral_mismatches`. Neither vetoes observed target transitions or an independently valid neutral branch comparison. These are recomputed diagnostics, not copies of the legacy quality facets. |
+| Execution / storage | `lifecycle`, `exit_code`, `run_error` describe the producer. `collection_status`/`collection_error` describe reading its results. `legacy_quality`, publication and verification fields remain separately visible. |
+
+Every metric is also emitted with `system_` and `function_` prefixes. Missing
+evaluations have null/blank counters, not invented zeros. An existing empty
+case inventory has zero counters but never `target_absent`. Regression counts
+must be read with their comparable denominator: losing evidence is not progress.
+
+### Discovery, output and recovery
+
+- Defaults follow the BinRadar collector's experiment-list convention:
+  `--exp exp.list`, `--workdir workdir`, `--run-prefix taosc-llm-out`, `--format log`.
+  List entries resolve relative to the list file, including paths with spaces.
+- `--runs all` is the default. Only exact `PREFIX-NUMERIC` directories are read,
+  in numeric order. `--runs latest` means the highest run number, **including
+  failed/interrupted runs**, not the latest successful run. `--mode` filters the
+  collected rows afterward; unknown/error rows remain visible.
+- `--jobs 1` bounds memory to one selected evaluation. Explicit `--jobs N` uses
+  ordered processes; `0` selects CPU/run count and may consume substantial memory.
+  `--format log|csv|tsv|json`, `-n/--no-subject-id`, and `--output -` are supported.
+  CSV/TSV have one row per run; JSON includes rows and separate summary counters.
+- Default output is `<exp-list-dir>/logs/taosc-llm-results-UTC-TIMESTAMP.<format>`.
+  Explicit output never creates that default directory. Stdout output contains
+  only the requested format; diagnostics go to stderr.
+- Compact runner metadata selects the saved round, not the last attempted round.
+  A failed provider run can retain a usable partial candidate under `result/`;
+  its metrics are collected without changing the failed lifecycle. Deliberate
+  generation/dataset/warm stops have no candidate. Unsupported `Single` formats
+  get explicit rows; missing workdirs/runs and corrupt/missing required result
+  records get collection-error rows rather than silently disappearing.
+- No-LLM result/evaluation payload references and result events are checksum
+  checked read-only. Collection never opens a live `Journal`, resumes search,
+  loads historical branches, or rereads native capture files. It reports saved
+  observations, not a new capture/binary integrity or execution verification.
+- Collector exit **0** means readable results were collected, even for failed
+  producer runs, target misses, regression, unknown evidence or abstention.
+  Exit **1** means collection/input/output errors (other rows are retained when
+  possible); invalid CLI usage exits **2**.
+
+Provider evaluations still describe the cached descriptor, not execution of the
+new fixed/selectable binaries. No-LLM `publication_status=matched` is saved local
+artifact parity, not FINAL. The collector never promotes either into verification.
+
+Validation: both collector test modules pass (98 tests). An isolated wheel-only
+installation was exercised from an external cwd, including the installed CLI,
+checkout launcher, module entry and sequential/spawn-process equality on eight
+saved provider/no-LLM scenarios. These included target→other crash, residual target,
+baseline disagreement, failed-provider incumbent, abstention and legacy journals.
+Use isolated `uv build --wheel`; the root development venv need not contain
+setuptools. These checks do not rerun subjects, models or FINAL.
+
 ## Experiment runner
 
 `taosc-llm-run` is the installed Python orchestrator; `python -m taosc_llm.runner`
@@ -849,12 +944,14 @@ are preserved. This is not a published Loftix release. The integration reference
 records actual package-build and installed-smoke results separately from live
 provider acceptance and final BinRadar verification.
 
-Six installed wrappers are `taosc-llm`, `taosc-llm-run`, `taosc-llm-no-llm`, `taosc-llm-setup`,
-`taosc-llm-evaluate`, and `taosc-llm-fixture`. Source allowlists and the wheel
+Seven installed wrappers are `taosc-llm`, `taosc-llm-run`, `taosc-llm-no-llm`,
+`taosc-llm-setup`, `taosc-llm-evaluate`, `taosc-llm-fixture`, and
+`taosc-llm-collect-results`. Source allowlists and the wheel
 exclude real `.env` files, credentials, workdirs, node_modules and caches. The
 wheel ships Python, `runtime.c`, prompts and adapter, not the SDK/native closure.
-Python 3.10+ and BinRadar native resources are required; the local uv project uses
-the checkout BinRadar package. E9 overrides are `E9TOOL`/`E9COMPILE`; otherwise
+Python 3.10+ is required; setup/evaluation/synthesis also require BinRadar native
+resources. The read-only collector uses only the standard library. The local uv
+project uses the checkout BinRadar package. E9 overrides are `E9TOOL`/`E9COMPILE`; otherwise
 BinRadar resolves `e9patch@1.0.1`. Help does not require credentials/native discovery.
 See the [maintained reference](../../agent-docs/taosc-llm/README.md) for contracts
 and validation limits. Future Taosc orchestration remains a separate integration.
