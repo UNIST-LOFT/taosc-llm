@@ -113,9 +113,9 @@ def _execute(dataset, case: dict, descriptor: str, directory: Path, *, original=
                     alias.chmod(0o500 if not extension else 0o600)
             binary = work / (dataset.binary + '.brpatched')
             artifact_hash = sha256(binary)
-        # Existing cached PIE builds have not established descriptor relocation
-        # parity. p0 cannot take a repair destination; candidate repair must not
-        # be inferred from that baseline or silently executed with wrong VAs.
+        # Native PIE repair actions work, but the host QASAN path has not
+        # established PIE hit-count/fault-address parity, even for exit(128).
+        # A neutral p0 attempt never establishes nonneutral execution capability.
         with binary.open('rb') as stream:
             header = stream.read(20)
         if (len(header) >= 18 and header[:4] == b'\x7fELF'

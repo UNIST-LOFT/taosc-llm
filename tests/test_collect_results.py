@@ -322,7 +322,12 @@ def test_parallel_collection_has_identical_order_and_rows(tmp_path):
 @pytest.mark.parametrize("output_format,delimiter", [("csv", ","), ("tsv", "\t")])
 @pytest.mark.parametrize("verbose", ["full", "compact"])
 def test_tabular_columns_are_stable_and_quote_special_paths(tmp_path, output_format, delimiter, verbose):
-    root = manual(tmp_path / 'run "quoted", with spaces')
+    root = manual(tmp_path / 'run "quoted", with spaces', cases=[
+        case(0, outcome="target_crash"),
+        case(1, outcome="target_crash", domain="function"),
+        case(2, outcome="target_crash", domain="function"),
+        case(3),
+    ])
     row = collect(root)
     stream = io.StringIO()
     write_output(stream, output_format, [row], verbose=verbose)
@@ -334,7 +339,8 @@ def test_tabular_columns_are_stable_and_quote_special_paths(tmp_path, output_for
     if verbose == "compact":
         assert reader.fieldnames == [
             "subject", "mode", "predicate", "candidate_known", "candidate_normal",
-            "candidate_target_crashes", "branch_comparable", "branch_regressions",
+            "system_candidate_target_crashes", "function_candidate_target_crashes",
+            "branch_comparable", "branch_regressions",
         ]
 
     stream = io.StringIO()
@@ -343,11 +349,13 @@ def test_tabular_columns_are_stable_and_quote_special_paths(tmp_path, output_for
     saved = list(reduced_reader)
     assert reduced_reader.fieldnames == [key for key in reader.fieldnames if key != "subject"]
     assert saved == [{key: value for key, value in full[0].items() if key != "subject"}]
-    assert saved[0]["candidate_known"] == "1"
-    assert saved[0]["candidate_target_crashes"] == "0"
+    assert saved[0]["candidate_known"] == "4"
+    assert saved[0]["system_candidate_target_crashes"] == "1"
+    assert saved[0]["function_candidate_target_crashes"] == "2"
     if verbose == "full":
+        assert saved[0]["candidate_target_crashes"] == "3"
         assert saved[0]["run_directory"] == str(root)
-        assert saved[0]["target_status"] == "target_absent"
+        assert saved[0]["target_status"] == "target_present"
 
 
 @pytest.mark.parametrize("output_format", ["json", "log"])
@@ -424,7 +432,8 @@ def test_recorded_no_candidate_and_unknown_evidence_are_not_failures(tmp_path, v
                  "--format", "json", "--verbose", verbose, "--output", str(output)]) == 0
     rows = json.loads(output.read_text())["rows"]
     assert [row["candidate_known"] for row in rows] == [None, 0]
-    assert [row["candidate_target_crashes"] for row in rows] == [None, 0]
+    for domain in ("system", "function"):
+        assert [row[f"{domain}_candidate_target_crashes"] for row in rows] == [None, 0]
     if verbose == "full":
         assert [row["target_status"] for row in rows] == ["no_candidate", "not_observed"]
         assert rows[0]["candidate_total"] is None

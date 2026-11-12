@@ -12,13 +12,13 @@ from taosc_llm.dataset import load_dataset
 
 
 def make_dataset(root, *, count=2, patch_format="ERM generic", binradar_run=None,
-                 concrete_run="/private/source-run"):
+                 concrete_run="/private/source-run", destination=4097):
     root.mkdir(parents=True, exist_ok=True)
     workdir = root / "workdir"
     workdir.mkdir()
     payloads = {"config.env": b"BINARY=fixture\nTEST_CMD=./fixture @@\n", "fixture.orig": b"harmless fixture identity",
                 "fixture.brcached": b"harmless cached identity", "patch-format": patch_format.encode(),
-                "patch-location": b"1000", "patch-destination": b"1001"}
+                "patch-location": b"1000", "patch-destination": f"{destination:x}".encode()}
     cwe805 = patch_format == "ERM CWE-805"
     if cwe805:
         payloads["stack-size"] = b"0\n"
@@ -38,7 +38,9 @@ def make_dataset(root, *, count=2, patch_format="ERM generic", binradar_run=None
             "provider": {"id": "ghidra", "version": "12.1"}, "operation": operation,
             "parameters": {"address" if operation in ("resolve_containing_procedure", "xrefs") else "procedure": hex(address)},
             "normalized_result": normalized}}
-    for role, address in (("patch", 4096), ("destination", 4097)):
+    for role, address in (("patch", 4096), ("destination", destination)):
+        if role == "destination" and address == 0:
+            continue
         resolution = evidence("resolve_containing_procedure", address,
             {"query_address": hex(address), "found": True, "procedure": procedure})
         for view in ("instructions", "decompilation", "references"):
@@ -73,7 +75,7 @@ def make_dataset(root, *, count=2, patch_format="ERM generic", binradar_run=None
     case_path = root / "cases.jsonl"
     case_path.write_text("".join(json.dumps(c) + "\n" for c in cases))
     manifest = {"schema_version": 2, "binary": "fixture", "patch_format": patch_format,
-                "patch": {"location": 4096, "destination": 4097, "address_domain": "elf-va"},
+                "patch": {"location": 4096, "destination": destination, "address_domain": "elf-va"},
                 "artifacts": artifacts, "sources": {"concrete_run": concrete_run,
                                                    "binradar_run": None if binradar_run is None else str(binradar_run)},
                 "analysis": analysis_records,
@@ -101,6 +103,7 @@ def proposal(context, **changes):
 
 
 def test_dataset_identity_and_private_projection(context):
+    assert "action" not in context.projection["patch"]
     other = prepare_context(context.dataset)
     assert other.context_id != context.context_id
     assert other.call_tool("get_patch_context", {"context_id": context.context_id})["error"]["code"] == "stale_context"
@@ -114,6 +117,31 @@ def test_dataset_identity_and_private_projection(context):
     with pytest.raises(ValueError):
         context.verify_artifacts()
     assert not query(context, "get_patch_context")["ok"]
+
+
+@pytest.mark.parametrize("patch_format", ["ERM generic", "ERM CWE-805"])
+def test_termination_context_has_no_executable_destination(tmp_path, patch_format):
+    dataset = make_dataset(tmp_path / "dataset", patch_format=patch_format, destination=0)
+    context = prepare_context(dataset, run_dir=tmp_path / "run")
+    patch = context.projection["patch"]
+    assert patch["destination"] == "0x0"
+    assert patch["action"] == {"kind": "exit", "status": 128}
+    assert "action" not in dataset.manifest["patch"]
+    inventory = context.projection["analysis"]
+    destination = inventory["sites"]["destination"]
+    assert destination["procedure_id"] is None and "128" in destination["note"]
+    assert "limitation" not in destination and "address" not in destination
+    assert inventory["same_procedure"] is False
+    assert "destination" not in inventory["references"]
+    assert query(context, "get_patch_context")["ok"]
+    expression = "0" if patch_format == "ERM generic" else "1 * s->rax < i->end - i->begin"
+    assert query(context, "evaluate_predicate", predicate=expression)["ok"]
+    for args in ({"view": "references", "site": "destination"},
+                 {"view": "instructions", "window": {"address": "0x0"}},
+                 {"view": "function", "facet": "cfg", "address": "0x0"}):
+        result = query(context, "get_function_analysis", procedure_id="procedure:0x1000", **args)
+        assert not result["ok"]
+    assert not query(context, "get_function_analysis", procedure_id="procedure:0x0", view="function")["ok"]
 
 
 @pytest.mark.parametrize('name,args', [

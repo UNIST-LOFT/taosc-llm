@@ -49,10 +49,12 @@ def snapshot(workdir: Path) -> dict[str, bytes]:
     [
         "unsupported_family",
         "missing_format",
-        "zero_destination",
+        "zero_location",
         "missing_allocator",
         "missing_location",
         "malformed_destination",
+        "overflow_destination",
+        "boolean_destination",
         "empty_location",
         "missing_binary_setting",
         "missing_original",
@@ -66,8 +68,8 @@ def test_invalid_inputs_preserve_previous_artifacts(tmp_path, monkeypatch, inval
         (workdir / "patch-format").write_text("Single CWE-805\n")
     elif invalid == "missing_format":
         (workdir / "patch-format").unlink()
-    elif invalid == "zero_destination":
-        (workdir / "patch-destination").write_text("0\n")
+    elif invalid == "zero_location":
+        (workdir / "patch-location").write_text("0\n")
     elif invalid == "missing_allocator":
         (workdir / "patch-format").write_text("ERM CWE-805\n")
         guard = "1 * s->rax < i->end - i->begin"
@@ -75,6 +77,10 @@ def test_invalid_inputs_preserve_previous_artifacts(tmp_path, monkeypatch, inval
         (workdir / "patch-location").unlink()
     elif invalid == "malformed_destination":
         (workdir / "patch-destination").write_text("0x401000\n0x401010\n")
+    elif invalid == "overflow_destination":
+        (workdir / "patch-destination").write_text("0x10000000000000000\n")
+    elif invalid == "boolean_destination":
+        (workdir / "patch-destination").write_text("true\n")
     elif invalid == "empty_location":
         (workdir / "patch-location").write_text("\n")
     elif invalid == "missing_binary_setting":
@@ -118,6 +124,30 @@ def test_cwe805_stack_bounds_preserve_previous_artifacts(tmp_path, stack_size, p
 
     with pytest.raises(ValueError):
         generate_patch(config, workdir, predicate, native_runner=forbidden_runner)
+    assert snapshot(workdir) == before
+
+
+@pytest.mark.parametrize("zero_hook", ["call", "return"])
+def test_zero_destination_does_not_admit_zero_allocator_hooks(tmp_path, zero_hook):
+    config, workdir = prepared_workdir(tmp_path)
+    (workdir / "patch-destination").write_text("0\n")
+    (workdir / "patch-format").write_text("ERM CWE-805\n")
+    (workdir / "stack-size").write_text("0\n")
+    trace = workdir / "trace"
+    trace.mkdir()
+    address = (workdir / "patch-location").read_text().strip().removeprefix("0x")
+    call = "0" if zero_hook == "call" else address
+    returned = "0" if zero_hook == "return" else address
+    (trace / "malloc.calls").write_text(f"0 {call}\n1 {address}\n")
+    (trace / "malloc.returns").write_text(returned + "\n")
+    before = snapshot(workdir)
+
+    def forbidden_runner(command, stage):
+        pytest.fail("zero allocator hooks must fail before native work")
+
+    with pytest.raises(ValueError):
+        generate_patch(config, workdir, "1 * s->rax < i->end - i->begin",
+                       native_runner=forbidden_runner)
     assert snapshot(workdir) == before
 
 

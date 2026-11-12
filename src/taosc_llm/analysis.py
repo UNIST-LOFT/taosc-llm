@@ -165,6 +165,9 @@ def prepare_analysis(root: Path, binary: Path, addresses: dict[str, int], *,
         raise ValueError("static preparation currently supports only the explicit ghidra provider")
     if any(type(value) is not int or not 1 <= value <= 2147483 for value in (timeout, query_timeout)):
         raise ValueError("static analysis timeouts must be 1..2147483 integer seconds")
+    # Destination zero selects exit(128), not code at virtual address zero.
+    addresses = {role: address for role, address in addresses.items()
+                 if role != "destination" or address != 0}
     root, binary = root.resolve(), binary.resolve()
     executable = rea or os.environ.get("TAOSC_LLM_REA") or shutil.which("rea")
     if executable:
@@ -276,8 +279,14 @@ def _frozen(dataset):
     digest = dataset.manifest["artifacts"][dataset.binary + ".orig"]["sha256"]
     addresses = {"patch": dataset.manifest["patch"]["location"],
                  "destination": dataset.manifest["patch"]["destination"]}
+    termination = addresses["destination"] == 0
+    if termination:
+        del addresses["destination"]
     sites = {role: {"address": hex(address), "procedure_id": None,
                     "limitation": "frozen containing procedure unavailable"} for role, address in addresses.items()}
+    if termination:
+        sites["destination"] = {"procedure_id": None,
+            "note": "Selected repair exits with status 128; destination 0 is a termination sentinel, not an executable address."}
     for record in dataset.manifest.get("analysis", []):
         role, view = record.get("function_id"), record.get("view")
         if role not in addresses or view not in _VIEWS:

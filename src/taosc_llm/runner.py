@@ -106,7 +106,7 @@ def _subject_preflight(args, patch_format) -> None:
         destination = next((directory / name for directory in (args.workdir, args.subject)
                             for name in ("patch-destination", "destinations")
                             if os.path.lexists(directory / name)), metadata("patch-destination"))
-        _address(destination)
+        _address(destination, allow_zero=True)
         if patch_format == "ERM CWE-805":
             stack = int(metadata("stack-size").read_text().strip(), 0)
             if not 0 <= stack <= 1048576:

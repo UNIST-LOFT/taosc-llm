@@ -32,7 +32,8 @@ ROW_FIELDS = (
 COLUMNS = ROW_FIELDS + METRIC_FIELDS
 _COMPACT_COLUMNS = (
     "subject", "mode", "predicate", "candidate_known", "candidate_normal",
-    "candidate_target_crashes", "branch_comparable", "branch_regressions",
+    "system_candidate_target_crashes", "function_candidate_target_crashes",
+    "branch_comparable", "branch_regressions",
 )
 _MODES = ("provider", "manual", "no-llm")
 _PAYLOAD = re.compile(r"payloads/([0-9a-f]{64})\.([A-Za-z0-9][A-Za-z0-9._-]{0,31})")

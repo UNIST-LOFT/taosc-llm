@@ -21,13 +21,13 @@ from binradar import binradar_setup, paths
 from .family import parse_candidate
 
 
-def _address(path: Path) -> int:
+def _address(path: Path, *, allow_zero: bool = False) -> int:
     text = path.read_text(encoding="utf-8").strip()
     if not re.fullmatch(r"(?:0[xX])?[0-9a-fA-F]{1,16}", text):
         raise ValueError(f"{path}: expected exactly one hexadecimal ELF address")
     address = int(text, 16)
-    if not address:
-        raise ValueError(f"{path}: address 0 is not a supported jump destination/site")
+    if not address and not allow_zero:
+        raise ValueError(f"{path}: address 0 is not a supported patch site")
     return address
 
 
@@ -45,7 +45,9 @@ def _check_original(original: Path, location: int, destination: int) -> None:
             ]
             for name, address in (("patch-location", location),
                                   ("patch-destination", destination)):
-                if not any(start <= address < end for start, end in executable):
+                if name == "patch-destination" and address == 0:
+                    continue
+                if not address or not any(start <= address < end for start, end in executable):
                     raise ValueError(f"{name}: 0x{address:x} is outside executable ELF bytes")
     except ELFError as error:
         raise ValueError(f"{original}: invalid ELF: {error}") from error
@@ -98,7 +100,7 @@ def generate_patch(config: Path, workdir: Path, predicate: str, *,
     patch_format = (workdir / "patch-format").read_text(encoding="utf-8").strip()
     candidate = parse_candidate(patch_format, predicate)
     location = _address(workdir / "patch-location")
-    destination = _address(workdir / "patch-destination")
+    destination = _address(workdir / "patch-destination", allow_zero=True)
     original = workdir / f"{binary}.orig"
     _check_original(original, location, destination)
     allocator = None
@@ -143,11 +145,12 @@ def generate_patch(config: Path, workdir: Path, predicate: str, *,
         predicates._emit_brpatches_inc(stage / "brpatches.inc", records)
         predicates.write_runtime_predicates(
             stage / "brpatches.json", candidate.family, records)
+        # STATE.rip relocates nonzero ELF destinations for PIE. Zero instead
+        # selects exit(128), independent of the image's runtime load address.
+        destination_expression = ("0" if destination == 0 else
+                                  f"((uintptr_t)state->rip + 0x{destination:x} - 0x{location:x})")
         (stage / "predicate.h").write_text(
-            # STATE.rip is the matching instruction's runtime address. A static
-            # ELF destination alone is not a valid process address for PIE.
-            f"#define TAOSC_DEST ((uintptr_t)state->rip + 0x{destination:x} - 0x{location:x})\n",
-            encoding="utf-8")
+            f"#define TAOSC_DEST {destination_expression}\n", encoding="utf-8")
         (stage / "taosc-llm-runtime.c").write_bytes(
             files("taosc_llm").joinpath("runtime.c").read_bytes())
         (stage / "taosc-llm-selector.c").write_text(

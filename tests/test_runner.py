@@ -195,8 +195,10 @@ def test_completed_concrete_reuse_preserves_source_and_needs_no_runtime(tmp_path
     assert (output / "run.json").read_bytes() == saved
 
 
-def test_reused_mutation_endpoint_and_outputs_are_not_owned(tmp_path, capsys):
+@pytest.mark.parametrize("destination", ["401010", "0"])
+def test_reused_mutation_endpoint_and_outputs_are_not_owned(tmp_path, capsys, destination):
     directory, workdir = subject(tmp_path)
+    (workdir / "patch-destination").write_text(destination + "\n")
     concrete, mutation = tmp_path / "concrete", tmp_path / "mutation"
     concrete.mkdir()
     mutation.mkdir()
@@ -255,7 +257,7 @@ def test_resume_refuses_uninitialized_search_without_rewriting_run(tmp_path, cap
 
 
 @pytest.mark.parametrize("field,value", [
-    ("patch-location", "0"), ("patch-destination", "0"),
+    ("patch-location", "0"), ("patch-destination", "-1"),
     ("patch-destination", "10000000000000000"), ("patch-destination", "not-an-address"),
 ])
 def test_invalid_address_fails_before_generation_or_output(tmp_path, capsys, field, value):

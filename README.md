@@ -60,16 +60,20 @@ Required workdir inputs:
 brpatches.json
 patch-format                   exactly ERM generic or ERM CWE-805
 patch-location                 one nonzero hexadecimal ELF virtual address
-patch-destination              one selected nonzero hexadecimal ELF virtual address
+patch-destination              one selected hexadecimal ELF virtual address, or 0 for exit(128)
 generate-concrete.env
 ```
 
 `config.env` is loaded as data, not executed. It must supply `BINARY` and an
 invocation/POC consistent with generation metadata; the POC must resolve locally.
-Address files accept an optional `0x` prefix and must identify executable,
-file-backed original ELF ranges. The caller owns instruction boundaries and
-handler/frame compatibility. CWE-805 additionally requires complete allocator
-traces under `trace/` and `stack-size`. Mutation import also requires
+Address files accept an optional `0x` prefix. The location and every nonzero
+destination must identify executable, file-backed original ELF ranges. Destination
+`0` is Taosc's `exit(128)` action, not a jump to null: only a firing repair branch
+terminates; neutral/non-firing/trapping branches retain original flow. Setup skips
+REA lookup for this action and explicitly describes termination in model context.
+The caller owns instruction boundaries and nonzero handler/frame compatibility.
+CWE-805 additionally requires complete allocator traces under `trace/` and
+`stack-size`. Mutation import also requires
 `generate-binradar.env` and artifact-bound capture context plus committed evidence.
 
 The concrete run supplies `minimizer.sbsv` original-only baseline v1 observations
@@ -179,9 +183,29 @@ capture sets, measured cost) are unchanged; see the
 Concrete workers are bounded to 1–32 (`--workers` here, `--execution-workers` in
 synthesis). They do not limit LLM concurrency; external orchestration owns any
 account-wide provider limits.
-A supplied PIE `.brcached` cannot currently execute a nonneutral descriptor:
-literal-destination relocation is unproven, so that path explicitly reports
-`unavailable`. This is distinct from the fixed/selectable builder's PIE support.
+A supplied PIE `.brcached` still reports nonneutral descriptor execution as
+`unavailable`, including destination `0`. Zero needs no jump relocation, but
+QASAN patch-hit tracking and E9/oracle address normalization also need consistent
+load-bias support. Do not bypass this existing observation-capability boundary
+or weaken capture checks. Native fixed/selectable PIE builds support zero termination.
+
+Previously compiled zero-destination artifacts silently continued on branch 1;
+they must be rebuilt with the updated shared runtime. `taosc-llm-run` rebuilds
+`.brcached` when no `--binradar-run` is supplied, including when `--concrete-run`
+is reused. Explicit datasets/mutation runs are immutable and are not silently
+rebuilt: regenerate the cached artifact and its bound mutation evidence before
+preparing a fresh dataset. Do not combine new binaries with old artifact-bound
+captures or modify a workdir in use by another run.
+
+A harmless non-PIE original→dataset→manual-CLI smoke with real QASAN/REA/E9
+completed with CLI exit 0 and three known normal candidate outcomes. The built
+fixed binary exited 128 for negative/zero inputs and retained exit 17 for the
+normal input; selectable ID 0 preserved the original abort and ID 1 terminated
+only when the predicate fired. This is runtime proof, not benchmark repair or
+FINAL verification. Collector tests passed 32 cases; the final execution/capability
+and fresh-build-worker check passed 19. Native E9 tests also covered generic and
+CWE-805 fixed/selectable/cached zero termination, neutral and arithmetic-trap
+behavior, and logging/capture before exit, with PIE and non-PIE artifacts.
 
 ## Non-LLM branch-selection synthesis
 
@@ -637,7 +661,11 @@ model feedback, stored strict quality and exit policies are unchanged.
 | Baseline diagnostics | `baseline_gaps` records unavailable/incompatible source/control/oracle evidence; known original/neutral disagreements are separately `original_neutral_mismatches`. Neither vetoes observed target transitions or an independently valid neutral branch comparison. These are recomputed diagnostics, not copies of the legacy quality facets. |
 | Execution / storage | `lifecycle`, `exit_code`, `run_error` describe the producer. `collection_status`/`collection_error` describe reading its results. `legacy_quality`, publication and verification fields remain separately visible. |
 
-Every metric is also emitted with `system_` and `function_` prefixes. Missing
+Every metric is also emitted with `system_` and `function_` prefixes. Concrete
+(`system`) and BinRadar mutation (`function`) target oracles can identify different
+fault addresses. Compact output separates their target-crash counts; it does not
+reinterpret either oracle or change synthesis selection. Full output retains
+both per-domain counters and the combined `candidate_target_crashes`. Missing
 evaluations have null/blank counters, not invented zeros. An existing empty
 case inventory has zero counters but never `target_absent`. Regression counts
 must be read with their comparable denominator: losing evidence is not progress.
@@ -658,14 +686,16 @@ must be read with their comparable denominator: losing evidence is not progress.
   CSV/TSV have one row per run; JSON includes rows and separate summary counters.
 - `--verbose full` is the default and preserves all fields. `--verbose compact`
   selects these row fields, in order, in every format: `subject`, `mode`,
-  `predicate`, `candidate_known`, `candidate_normal`, `candidate_target_crashes`,
+  `predicate`, `candidate_known`, `candidate_normal`,
+  `system_candidate_target_crashes`, `function_candidate_target_crashes`,
   `branch_comparable`, `branch_regressions`. JSON metadata/summary and the log
   summary remain unchanged; compact logs omit the extra subject/run headings.
   Selection, row order, metric values, nulls and exit codes do not change.
   Inspect `full` for unknown outcomes, baseline gaps and execution/storage errors.
-  Zero target crashes means observed target removal only when `candidate_known`
-  is positive; zero `branch_comparable` means no regression comparison, not a
-  proven absence of regression.
+  A zero domain crash count alone does not prove removal: check that domain's
+  `system_candidate_known` or `function_candidate_known` in `full`. Other compact
+  counters remain combined across domains; zero `branch_comparable` means no
+  regression comparison, not a proven absence of regression.
 - `subject` contains the experiment-list identifier, e.g. `binutils/CVE-2017-14745`.
   No numeric `subject_id` is generated. `-n/--no-subject-id` omits that textual
   `subject` column/key (and the subject in log headings), allowing subsequent
@@ -696,9 +726,10 @@ artifact parity, not FINAL. The collector never promotes either into verificatio
 
 Validation: collector I/O tests pass (32 tests), including full/compact output,
 subject omission, null-versus-zero observations and preserved collection failures.
-The checkout CLI was exercised against a saved journal in all four formats:
-default output equals explicit `full`, `compact` has the eight ordered fields,
-and `compact -n` has seven, with unchanged values. Pass a real journal directory
+The checkout CLI was exercised against four saved CVE journals in all four
+formats: `compact` has nine ordered fields and `compact -n` has eight, with
+values identical to the corresponding full fields. Concrete/mutation counts
+remained separate, including concrete zero with nonzero mutation target crashes. Pass a real journal directory
 to `--run-dir`: symlinked journal aliases
 are rejected as `unsafe journal payload` by the existing containment check.
 An isolated wheel-only installation was exercised from an external cwd, including the installed CLI,

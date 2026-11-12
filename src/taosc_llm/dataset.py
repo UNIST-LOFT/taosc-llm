@@ -454,7 +454,9 @@ def load_dataset(path: Path) -> PreparedDataset:
     if not isinstance(binary, str) or Path(binary).name != binary or binary in ("", ".", ".."):
         raise ValueError("invalid dataset binary")
     patch = manifest.get("patch", {})
-    if patch.get("address_domain") != "elf-va" or any(type(patch.get(key)) is not int or not 0 < patch[key] < 2**64 for key in ("location", "destination")):
+    if patch.get("address_domain") != "elf-va" or any(
+            type(patch.get(key)) is not int or not minimum <= patch[key] < 2**64
+            for key, minimum in (("location", 1), ("destination", 0))):
         raise ValueError("invalid ELF patch addresses")
     dataset = PreparedDataset(manifest_path.parent, manifest)
     dataset.verify_artifacts()

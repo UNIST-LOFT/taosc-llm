@@ -23,6 +23,22 @@ def dataset(tmp_path, monkeypatch):
     return prepare_dataset(config, work, concrete, mutation, output=tmp_path / "dataset")
 
 
+@pytest.mark.parametrize("field,value", [
+    ("location", 0), ("location", False), ("location", True),
+    ("location", -1), ("location", 2**64), ("location", "1000"),
+    ("destination", False), ("destination", True), ("destination", -1),
+    ("destination", 2**64), ("destination", "0"), ("destination", None),
+])
+def test_manifest_rejects_invalid_numeric_patch_addresses(dataset, field, value):
+    manifest = deepcopy(dataset.manifest)
+    manifest["patch"][field] = value
+    manifest.pop("dataset_id")
+    manifest["dataset_id"] = hashlib.sha256(canonical(manifest)).hexdigest()
+    (dataset.root / "manifest.json").write_bytes(canonical(manifest))
+    with pytest.raises(ValueError, match="invalid ELF patch addresses"):
+        load_dataset(dataset.root)
+
+
 def owned_path(dataset, kind):
     if kind == "input":
         return dataset.root / dataset.case("system:0")["input_path"]

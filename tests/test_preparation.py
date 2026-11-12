@@ -113,11 +113,27 @@ def test_unknown_original_result_schema_is_not_admitted(tmp_path, version):
 
 @pytest.mark.parametrize("env_file", ["config.env", "binradar.env", "generate-concrete.env", "generate-binradar.env"])
 @pytest.mark.parametrize("key", ["PATCH_LOC", "PATCH_DEST"])
-def test_rejects_configured_address_mismatch(tmp_path, env_file, key):
+@pytest.mark.parametrize("termination", [False, True])
+def test_rejects_configured_address_mismatch(tmp_path, env_file, key, termination):
     config, work, run = preparation_inputs(tmp_path)
+    if termination:
+        (work / "patch-destination").write_text("0")
     path = config if env_file == "config.env" else work / env_file
     path.write_text(config.read_text() + f"{key}=ffffffff\n")
     with pytest.raises(ValueError, match="identity mismatch"):
+        prepare_dataset(config, work, run, None, output=tmp_path / "dataset")
+    assert not (tmp_path / "dataset").exists()
+
+
+@pytest.mark.parametrize("field,value", [
+    ("patch-location", "0"), ("patch-location", "ffffffff"),
+    ("patch-destination", "10000000000000000"), ("patch-destination", "-1"),
+    ("patch-destination", "true"), ("patch-destination", "not-an-address"),
+])
+def test_rejects_invalid_patch_metadata(tmp_path, field, value):
+    config, work, run = preparation_inputs(tmp_path)
+    (work / field).write_text(value)
+    with pytest.raises(ValueError, match="ELF"):
         prepare_dataset(config, work, run, None, output=tmp_path / "dataset")
     assert not (tmp_path / "dataset").exists()
 
@@ -126,7 +142,7 @@ def test_rejects_configured_address_mismatch(tmp_path, env_file, key):
 def test_rejects_mismatched_setup_identity(tmp_path, defect):
     config, work, run = preparation_inputs(tmp_path)
     if defect == "destination":
-        (work / "patch-destination").write_text("0")
+        (work / "patch-destination").write_text("ffffffff")
     elif defect == "map":
         path = work / "fixture.brcached.e9map.json"
         value = json.loads(path.read_text())
@@ -372,6 +388,37 @@ def test_static_views_require_bound_producer_evidence(tmp_path, monkeypatch, def
     dataset = prepare_dataset(config, work, run, None, output=tmp_path / "dataset", rea="/host/rea")
     assert all(record["availability"] == ("available" if defect is None else "unavailable")
                and record["complete"] is (defect is None) for record in dataset.manifest["analysis"])
+
+
+@pytest.mark.parametrize("family", ["ERM generic", "ERM CWE-805"])
+def test_termination_destination_skips_static_resolution(tmp_path, monkeypatch, family):
+    config, work, run = preparation_inputs(tmp_path, family)
+    (work / "patch-destination").write_text("0\n")
+    environment = config.read_text() + "PATCH_DEST=0\n"
+    for path in (config, work / "binradar.env", work / "generate-concrete.env", work / "generate-binradar.env"):
+        path.write_text(environment)
+    mutation = mutation_inputs(tmp_path, work)
+    calls = static_session(monkeypatch)
+    dataset = prepare_dataset(config, work, run, mutation, output=tmp_path / "dataset", rea="/host/rea")
+    assert dataset.manifest["patch"]["destination"] == 0
+    assert dataset.execution_environment()["PATCH_DEST"] == "0"
+    assert len(dataset.snapshots(dataset.case("function:2")["capture"])) == 1
+    assert calls and all(address != 0 for _operation, address in calls)
+    assert {row["function_id"] for row in dataset.manifest["analysis"]} == {"patch"}
+    inventory = analysis.analysis_inventory(load_dataset(dataset.root))
+    destination = inventory["sites"]["destination"]
+    assert destination["procedure_id"] is None
+    assert "128" in destination["note"]
+    assert "limitation" not in destination and "address" not in destination
+    assert not inventory["same_procedure"] and "destination" not in inventory["references"]
+    assert all("destination" not in window["sites"] for window in inventory["windows"])
+    procedure = inventory["sites"]["patch"]["procedure_id"]
+    with pytest.raises(ValueError, match="site must belong"):
+        analysis.analysis_view(dataset, procedure, "references", site="destination")
+    with pytest.raises(ValueError, match="exact frozen instruction"):
+        analysis.analysis_view(dataset, procedure, "instructions", window={"address": "0x0"})
+    with pytest.raises(ValueError, match="inside the frozen procedure body"):
+        analysis.analysis_view(dataset, procedure, "function", facet="cfg", address="0x0")
 
 
 def test_same_function_reuses_dossier_but_not_address_references(tmp_path, monkeypatch):

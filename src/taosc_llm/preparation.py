@@ -32,12 +32,12 @@ def _copy(source: Path, root: Path, relative: str) -> dict:
     return {"path": relative, "sha256": sha256(destination)}
 
 
-def _address(path: Path) -> int:
+def _address(path: Path, *, allow_zero: bool = False) -> int:
     value = path.read_text().strip()
     if not re.fullmatch(r"(?:0[xX])?[0-9a-fA-F]{1,16}", value):
         raise ValueError(f"invalid ELF address: {path.name}")
     number = int(value, 16)
-    if not 0 < number < 2**64:
+    if not (0 if allow_zero else 1) <= number < 2**64:
         raise ValueError(f"invalid zero/overflow ELF address: {path.name}")
     return number
 
@@ -194,7 +194,8 @@ def prepare_dataset(config: Path, workdir: Path, concrete_run: Path, binradar_ru
     patch_format = (workdir / "patch-format").read_text().strip()
     if patch_format not in ("ERM generic", "ERM CWE-805"):
         raise ValueError("only explicit ERM generic and ERM CWE-805 families are supported")
-    location, destination = _address(workdir / "patch-location"), _address(workdir / "patch-destination")
+    location = _address(workdir / "patch-location")
+    destination = _address(workdir / "patch-destination", allow_zero=True)
     parent = Path(output).absolute().parent if output is not None else workdir / "taosc-llm-datasets"
     parent.mkdir(parents=True, exist_ok=True)
     if output is not None and Path(output).exists():
@@ -237,7 +238,8 @@ def prepare_dataset(config: Path, workdir: Path, concrete_run: Path, binradar_ru
                 raise ValueError("ERM cached-state datasets require little-endian x86-64 ELF")
             ranges = [(int(segment["p_vaddr"]), int(segment["p_vaddr"]) + int(segment["p_filesz"]))
                       for segment in elf.iter_segments() if segment["p_type"] == "PT_LOAD" and segment["p_flags"] & 1]
-            if any(not any(start <= address < end for start, end in ranges) for address in (location, destination)):
+            code_addresses = (location, destination) if destination else (location,)
+            if any(not any(start <= address < end for start, end in ranges) for address in code_addresses):
                 raise ValueError("patch addresses must belong to original executable file-backed ELF ranges")
         concrete_reference = None
         probe_path = concrete_run / "probe-results.sbsv"

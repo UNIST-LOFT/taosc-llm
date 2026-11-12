@@ -175,7 +175,9 @@ def prepare_context(dataset, *, run_dir: Path | None = None, workers: int = 1,
         projection = {
             "context_id": identity, "patch_format": validated.patch_format,
             "patch": {"location": hex(validated.manifest['patch']['location']),
-                      "destination": hex(validated.manifest['patch']['destination'])},
+                      "destination": hex(validated.manifest['patch']['destination']),
+                      **({"action": {"kind": "exit", "status": 128}}
+                         if validated.manifest['patch']['destination'] == 0 else {})},
             "grammar_contract": grammar_contract(validated.patch_format),
             "analysis": analysis, "original_poc": original_poc,
             "examples": sample_cases(validated, case_records(validated)),

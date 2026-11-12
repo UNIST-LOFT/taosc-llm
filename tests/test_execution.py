@@ -19,9 +19,10 @@ class FixtureDataset:
         for name in ('fixture.orig', 'fixture.brcached'):
             (self.workdir / name).write_bytes(b'harmless')
         (root / 'input').write_bytes(b'input')
-        self.manifest = {'artifacts': {
-            path.name: {'sha256': execution.sha256(path)}
-            for path in self.workdir.iterdir()}}
+        self.manifest = {'patch': {'location': 0x10, 'destination': 0x20},
+                         'artifacts': {
+                             path.name: {'sha256': execution.sha256(path)}
+                             for path in self.workdir.iterdir()}}
 
     def artifact(self, name):
         return self.workdir / name
@@ -251,9 +252,10 @@ def test_silent_preload_failure_is_not_an_observation(tmp_path, monkeypatch, ori
             execution.execute_capture(dataset, case, 'p0', tmp_path / 'owned')
 
 
-def test_pie_candidate_capability_is_explicit_not_false_execution(tmp_path):
-    import pytest
+@pytest.mark.parametrize('destination', [0, 0x20])
+def test_pie_candidate_capability_is_explicit_not_false_execution(tmp_path, destination):
     dataset = FixtureDataset(tmp_path)
+    dataset.manifest['patch']['destination'] = destination
     header = bytearray(20)
     header[:6] = b'\x7fELF\x02\x01'
     header[16:18] = (3).to_bytes(2, 'little')
