@@ -270,8 +270,8 @@ Cancellation never promotes a draft.
 
 | Search option | Finite default | Bound |
 |---|---:|---|
-| `--timeout` | 3600 seconds | Positive finite admission budget |
-| `--max-evaluations` | 256 | Positive; includes baseline admission |
+| `--timeout` | 10800 seconds | Positive finite admission budget |
+| `--max-evaluations` | 512 | Positive; includes baseline admission |
 | `--max-atoms` | 1024 | 1–65536 |
 | `--beam-width` | 12 | 1–256 |
 | `--max-clauses` | 12 | 1–128 |
@@ -385,46 +385,54 @@ frames/allocation/free histories require bounded `get_patch_context(view="poc_lo
 pages. Neither saved-log addresses nor site values replace the configured target
 oracle. See [POC evidence](../../agent-docs/taosc-llm/PROMPTS_AND_EVIDENCE.md#original-poc-diagnostic-summary).
 Candidate proposals require evaluation of the exact expression. Context and
-`list_cases` show at most three crash/three normal examples. Evaluation feedback
-separates missed targets, normal→target/other-crash regressions, and normal→normal
-complete-vector branch regressions. Each group has counts and at most three
-examples. Quality feedback also exposes bounded other-crash, unavailable,
-original/neutral-gap and unproven-repair examples; none counts as success. Optional register/mutation filters and similarity
-select more small examples, never an exhaustive case page. Hashes/audit metadata
-stay private; model IDs are short scoped handles. Static `function` views default
-to available facets; select a facet/address for local CFG/value-flow evidence. Strict response parsing, native builds and actual evaluation feedback
-feed bounded refinement rounds (`--max-rounds` 1–16, default 4, provider-only);
-manual mode rejects provider options instead of ignoring them. The primary goal
-is blocking all crashes without missing or unproven evidence. The secondary goal
-is minimizing authenticated normal→normal branch-vector differences, not rejecting
-an otherwise established repair merely because differences remain.
-`evaluation.quality.status=improved` ends immediately as `not_rejected` with
-`termination=quality_met`. `improved_with_regressions` also maps to `not_rejected`
-and exit 0, but continues refinement while the budget and new candidates permit.
-Neither verdict proves general equivalence or a global minimum.
+`list_cases` show at most three crash/three normal examples. Feedback's authoritative
+`objective` reports observed designated-target crashes first, then authenticated
+normal→normal complete-vector branch regressions, with system/function denominators.
+Other crashes, observation/control gaps and legacy strict quality are separate
+`diagnostics`, never rejection criteria or selection tiebreakers. Target→other crash
+removes the designated target; it is not evidence of general functional correctness.
+Failure groups have counts and at most three examples; optional scoped filters
+retrieve more. Hashes and private paths stay host-only. Static `function` views
+default to available facets; select a facet/address for local CFG/value-flow evidence.
 
-The selected incumbent must retain all established repairs and observed normal
-executions, and cannot add a newly crashing case (target, other or normal→crash).
-Among admissible proposals, fewer crashing cases, fewer unresolved cases, fewer
-branch regressions, then more repairs determine selection in that order; ties
-retain the incumbent. This prevents losing evidence from masquerading as
-improvement. `selected_round` binds the retained proposal/build/evaluation even
-if later attempts are worse.
+Strict parsing, builds and actual evaluations feed provider refinement
+(`--max-rounds` 1–16, default 4); manual mode rejects provider-only options.
+Incumbent selection compares target-crash counts on case IDs whose outcomes are
+known in **both** evaluations. A strict target improvement takes precedence over
+branch differences. Otherwise it compares branch-regression counts on case IDs
+with authenticated comparable vectors in **both** evaluations. Ties retain the
+incumbent. Losing observations alone cannot improve either score; unrelated gaps
+do not veto a demonstrated improvement. Previously repaired/normal case sets are
+not independent preservation gates. `selection.comparison` records the paired
+denominators and counts; raw totals remain in `objective`. Domain-specific target
+identities are unchanged. `selected_round` binds the retained proposal/build/evaluation.
 
-Each new round receives the full validated prior proposal, including rationale
-and assumptions, bounded host results, the incumbent and remaining round budget.
-Previously admitted result IDs remain inspectable. Two consecutive evaluated
-rounds with the same canonical predicate and unchanged aggregate and case-level
-quality stop with `termination=repeated_result`; matching counts alone do not
-suffice. Otherwise the configured limit (default four rounds) ends with
-`termination=round_limit`. Both retain the incumbent's actual quality and report
-residual branches normally; crashes and evidence gaps do not become success.
+The observed lower bound—at least one known outcome, zero observed target crashes
+and zero observed branch regressions—ends refinement with
+`termination=observed_objective_minimum`. Empty/all-unknown populations cannot
+meet it. Gaps and other crashes remain diagnostic even at this stopping point;
+this is not a universal repair/equivalence claim, and `verified` remains false.
+Each new round receives the full prior proposal, rationale/assumptions, observed
+objective, bounded feedback, incumbent and remaining budget. Two consecutive
+evaluated rounds with the same canonical predicate and unchanged objective and
+selection case sets end with `termination=repeated_result`; matching counts alone
+do not suffice. Otherwise refinement ends at `termination=round_limit`. Both retain
+the incumbent and report residuals normally; branch regressions are not process errors.
 Without an evaluated candidate a valid abstention stops without a candidate;
 a later abstention retains an already evaluated incumbent. Invalid model
 proposals can receive bounded corrective feedback, but an unrecovered final
 parse error with no incumbent remains an error. Build/storage/integrity and
 provider failures propagate; they are not `refinement_exhausted` outcomes.
 No final BinRadar verification is run.
+
+Validation: 618 focused synthesis, feedback/context, metrics/collection, evidence,
+runner and no-LLM tests passed. Read-only re-selection of saved
+`libming/CVE-2018-8806` run `taosc-llm-out-00003` retained round 1 (`rdx >= 4`),
+not historical round 4: round 2 had four authenticated branch regressions versus
+zero, and rounds 3/4 did not improve the objective. No provider/target execution
+was repeated. API and actual direct/runner CLI parsers confirmed the new no-LLM
+budgets and explicit overrides; parsing stopped before dataset access/search.
+All 111 local documentation targets/anchors across the six changed documents resolved.
 
 Provider routing, credential-file syntax, isolated SDK setup, per-operation
 bounds and externally managed scheduling are specified in
@@ -481,7 +489,10 @@ Stdout contains one JSON result; diagnostics go to stderr. Common CLI exits:
 `evaluation.status` remains the target-only diagnostic: any same-target crash
 rejects, otherwise a nonempty case set is `not_rejected`, including unavailable
 cases; an empty set is `unavailable`. Do not aggregate this field as repair
-success. The separate `evaluation.quality` carries status, orthogonal counts and
+success. Provider/manual result `objective` is the observed target/branch view;
+its run status distinguishes `target_present`, `target_absent` and `not_observed`
+as `reject_same_crash`, `not_rejected` and `unavailable`. The separate legacy
+`evaluation.quality` is diagnostic only and carries status, orthogonal counts and
 reasons. Original-target/neutral-normal disagreement is `baseline_gaps`, not an
 improvement. Other crashes, unavailable evidence and unproven repair remain
 separate from `improved`/`preserved_normal`; facet counts can overlap.
@@ -858,7 +869,7 @@ execution; caller-owned runs/servers are never signalled, restarted or shut down
 | `--concrete-timeout` | 0 | Optional external concrete wall cap **from launch**, including PROBE and MINIMIZER drain; monitored even while waiting for ready. |
 | `--stage-timeout` | 0 | Optional external wall cap per setup/dataset/warm/synthesis stage; does not bound producer completion. |
 | `--graceful-timeout` | 10 s | Grace before TERM/KILL escalation; positive. |
-| `--search-timeout` | 3600 s | Persistent no-LLM search admission budget, not whole-program wall time. |
+| `--search-timeout` | 10800 s | Persistent no-LLM search admission budget, not whole-program wall time. |
 
 The default external watchdogs are disabled deliberately, not the native budgets:
 PROBE precedes the generation clock, and concrete MINIMIZER has a shared native
@@ -909,6 +920,9 @@ uv run --project utils/taosc-llm taosc-llm-run \
 Resume requires an initialized no-LLM search. It uses the recorded dataset,
 cache and result, adds a fresh attempt log directory, and never repeats setup,
 generation or warm. The engine checks code/runtime, budget and snapshot identity.
+The 10800-second/512-evaluation defaults apply to new no-LLM runs, not retroactive
+budget extensions. Older journals require matching limits and implementation;
+start a fresh output after this defaults/code change rather than resuming them.
 A lost resident remains unavailable; a replacement generation cannot restore its
 identity. Interruption before search initialization requires a fresh run, optionally
 reusing completed producers/dataset. Manual/Pi session resume is not introduced.

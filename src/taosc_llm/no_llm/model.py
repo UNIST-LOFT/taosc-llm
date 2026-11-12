@@ -7,8 +7,8 @@ import math
 
 @dataclass(frozen=True)
 class SearchLimits:
-    timeout: float = 3600.0
-    max_evaluations: int = 256
+    timeout: float = 10800.0
+    max_evaluations: int = 512
     max_atoms: int = 1024
     beam_width: int = 12
     max_clauses: int = 12

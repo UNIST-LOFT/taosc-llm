@@ -231,10 +231,21 @@ def test_scoped_authority(context):
 def test_real_offline_evaluation_and_result_reference(context):
     result = query(context, "evaluate_predicate", predicate="rax < 0")
     assert result["ok"] and result["mode"] == "offline"
-    assert result["missed_target_crashes"]["count"] == 0
-    assert result["regressions"]["count"] == 0
-    assert "warning" in result
+    objective = result["objective"]
+    assert objective["target_status"] == "not_observed"
+    assert objective["candidate_known"] == 0
+    assert objective["candidate_unknown"] == 2
+    assert objective["candidate_target_crashes"] == 0
+    assert objective["branch_comparable"] == objective["branch_regressions"] == 0
+    assert objective["domains"]["function"]["candidate_unknown"] == 2
+    assert objective["domains"]["system"]["candidate_unknown"] == 0
+    assert result["missed_target_crashes"]["count"] == result["branch_regressions"]["count"] == 0
+    assert "warning" in result["diagnostics"]
+    assert "quality" in result["diagnostics"] and "quality" not in result
     assert "cases" not in result and "summary" not in result
+    public = json.dumps(result)
+    assert "/private" not in public
+    assert all(record["sha256"] not in public for record in context.dataset.manifest["artifacts"].values())
     referenced = query(context, "get_candidate_result", result_id=result["result_id"])
     assert referenced == result
     assert query(context, "get_candidate_result", result_id="foreign")["error"]["code"] == "out_of_scope"

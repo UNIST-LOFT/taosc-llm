@@ -420,20 +420,6 @@ def summarize_quality(reports):
     return {'status': status, 'counts': counts, 'reasons': reasons}
 
 
-def quality_case_sets(evaluation):
-    """Private exact case sets for refinement and evidence-preserving selection."""
-    result = {key: set() for key in (*_QUALITY_COUNTS, 'known_normals', 'observed_normals')}
-    for item in evaluation.get('cases', []):
-        report = item['report']
-        quality = report.get('quality') or classify_quality(report)
-        for facet in quality['facets']:
-            result[facet].add(item['case_id'])
-        for flag in ('known_normal', 'observed_normal'):
-            if quality.get(flag):
-                result[flag + 's'].add(item['case_id'])
-    return {key: frozenset(value) for key, value in result.items()}
-
-
 def _branch_comparison(neutral, candidate):
     if neutral is None or candidate is None or 2 in neutral or 2 in candidate:
         return {'status': 'unavailable'}

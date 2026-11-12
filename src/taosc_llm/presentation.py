@@ -8,6 +8,7 @@ from __future__ import annotations
 from binradar.binradar_taosc_predicates import REGISTER_TO_VAR
 
 from .cases import case_order, case_records, relevant_registers
+from .collection_metrics import selection_case_sets, selection_objective
 from .evidence import classify_quality, project_case, summarize_quality
 
 
@@ -155,58 +156,63 @@ def sample_cases(dataset, records, *, predicate=None):
             for key, group in groups.items()}
 
 
-def _counterexample(dataset, record, predicate):
+def _counterexample(dataset, record, predicate, *, diagnostic=False, branch=False):
     report = record['report']
-    quality = report.get('quality') or classify_quality(report)
     result = _example(dataset, record, predicate)
-    # An explicit failure counterexample is not an initial normal/crash sample.
-    # Other faults and unknown outcomes must stay visible, without fault PCs.
-    result.update(basis='candidate', outcome=report['candidate']['outcome'],
-                  category=quality['category'])
+    # Other faults and unknown outcomes stay visible without fault PCs.
+    result.update(basis='candidate', outcome=report.get('candidate', {}).get('outcome', 'unknown'))
     neutral = report.get('neutral_baseline', {})
     if neutral.get('compatible_control') is True:
         result['neutral_baseline'] = neutral.get('outcome', 'unknown')
-    if quality['reasons']:
-        result['reasons'] = quality['reasons']
-    if 'branch_difference' in quality:
-        result['branch_difference'] = quality['branch_difference']
+    if diagnostic:
+        quality = report.get('quality') or classify_quality(report)
+        result['category'] = quality['category']
+        if quality['reasons']:
+            result['reasons'] = quality['reasons']
+    if branch:
+        comparison = report['branch_comparison']
+        result['branch_difference'] = {key: comparison[key] for key in
+            ('basis', 'first_difference', 'neutral_branch', 'candidate_branch', 'neutral_hits', 'candidate_hits')
+            if key in comparison}
     return result
 
 
 def feedback(dataset, evaluation):
-    """Public quality counts and at most three examples per failure/gap facet.
+    """Observed target/branch objective, separate from strict-quality diagnostics.
 
-    Crash regressions and target misses are disjoint. Other crashes and baseline
-    gaps are orthogonal facets; counts must not be summed into a population.
+    Target failures use actual candidate outcomes; branch failures require the
+    shared authenticated comparison. Every example group is bounded to three.
     Raw reports, capture identities and observed fault addresses remain private.
     """
     records = case_records(dataset, evaluation)
-    groups = {key: [] for key in ('target_misses', 'crash_regressions', 'branch_regressions',
-                                  'other_crashes', 'unavailable', 'baseline_gaps', 'unproven')}
+    case_sets = selection_case_sets(evaluation)
+    groups = {key: [] for key in ('crash_regressions', 'other_crashes', 'unavailable',
+                                  'baseline_gaps', 'unproven')}
     for record in records:
         quality = record['report'].get('quality') or classify_quality(record['report'])
         for facet in quality['facets']:
             if facet in groups:
                 groups[facet].append(record)
     predicate = evaluation.get('predicate')
-    def examples(group):
-        return [_counterexample(dataset, record, predicate) for record in _representatives(group)]
+    def examples(group, **options):
+        return [_counterexample(dataset, record, predicate, **options)
+                for record in _representatives(group)]
     quality = summarize_quality(record['report'] for record in records)
-    quality['objectives'] = {
-        'hard': ('Block all candidate crashes, including target and other crashes. '
-                 'Incomplete or unproven evidence never establishes repair success.'),
-        'soft': ('Minimize and report authenticated normal-to-normal branch-vector regressions. '
-                 'Residual branch regressions alone do not reject an otherwise established repair.')}
-    quality['examples'] = {key: examples(groups[key]) for key in
-                          ('other_crashes', 'unavailable', 'baseline_gaps', 'unproven') if groups[key]}
-    result = {'quality': quality}
-    for public, private in (('missed_target_crashes', 'target_misses'),
-                            ('regressions', 'crash_regressions'), ('branch_regressions', 'branch_regressions')):
-        result[public] = {'count': len(groups[private]), 'examples': examples(groups[private])}
+    diagnostics = {
+        'quality': quality,
+        'examples': {key: examples(group, diagnostic=True) for key, group in groups.items() if group},
+    }
     if quality['status'] in ('incomplete', 'unproven') or any(
             groups[key] for key in ('unavailable', 'baseline_gaps', 'unproven')):
-        result['warning'] = ('Limited evidence: missing candidate evidence, unmatched controls or unproven repair. '
-                             'Normal observations alone do not establish repair.')
+        diagnostics['warning'] = (
+            'Limited evidence: missing candidate observations, unmatched controls or unproven repair. '
+            'These are diagnostic limitations, not selection penalties; missing data is not success.')
+    result = {'objective': selection_objective(evaluation), 'diagnostics': diagnostics}
+    for public, private in (('missed_target_crashes', 'target_crashes'),
+                            ('branch_regressions', 'branch_regressions')):
+        group = [record for record in records if record['report']['case_id'] in case_sets[private]]
+        result[public] = {'count': len(case_sets[private]),
+                          'examples': examples(group, branch=private == 'branch_regressions')}
     return result
 
 

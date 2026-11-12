@@ -258,7 +258,12 @@ def test_feedback_follows_final_host_outcome_only(tmp_path, monkeypatch, outcome
         settled.append(final)
         prompts.append(prompt)
         if prompt is not None:
-            assert outcome in prompt
+            reviewed = json.loads(prompt[prompt.index('{'):])
+            assert reviewed['host_run_status'] == outcome
+            if outcome != 'abstained':
+                assert reviewed['objective'] == reviewed['feedback']['objective']
+                assert reviewed['objective']['candidate_known'] == (outcome == 'not_rejected')
+                assert reviewed['objective']['candidate_target_crashes'] == 0
             assert "private-host-path" not in prompt
             assert "raw-provider-secret" not in prompt
             response["session_feedback"] = {"type": "feedback_complete", "final_text": "# Review\nBounded evidence.",
@@ -275,7 +280,7 @@ def test_feedback_follows_final_host_outcome_only(tmp_path, monkeypatch, outcome
                             "counts": {}, "reasons": []},
                 "report_summary": {"domains": {}}, "cases": [{"case_id": "function:0", "source": "raw-provider-secret",
                     "report": {"case_id": "function:0", "domain": "function",
-                               "candidate": {"outcome": "unknown"},
+                               "candidate": {"outcome": "normal" if outcome == "not_rejected" else "unknown"},
                                "activation": {"status": "unknown"}}}]}
 
     monkeypatch.setattr(synthesis, "run_adapter", model)
@@ -449,66 +454,106 @@ def test_refinement_uses_same_minimal_feedback_as_review(tmp_path, monkeypatch):
 
 def quality_round(*, repaired=(), normals=(), branches=(), misses=(), missing=(), others=(), gaps=(),
                   predicate="rax < 0"):
-    """Private classifier outputs at the refinement boundary, not fake captures."""
+    """Saved report boundary fixtures with actual outcomes, not quality-only scores."""
+    from test_collection_metrics import case
+    from taosc_llm.evidence import summarize_quality
+
     rows = []
     for ids, facet in ((repaired, "improved"), (normals, "preserved_normal"),
                        (branches, "branch_regressions"), (misses, "target_misses"),
                        (missing, "unavailable"), (others, "other_crashes"), (gaps, "baseline_gaps")):
         for identifier in ids:
             normal = facet in ("preserved_normal", "branch_regressions")
-            rows.append({"case_id": identifier, "report": {"quality": {
-                "facets": [facet], "known_normal": normal, "observed_normal": normal, "reasons": []}}})
-    from taosc_llm.evidence import summarize_quality
+            row = case(int.from_bytes(identifier.encode(), 'big'),
+                       original='normal' if normal else 'target_crash',
+                       neutral='normal' if normal else 'target_crash',
+                       outcome={'target_misses': 'target_crash', 'unavailable': 'unknown',
+                                'other_crashes': 'other_crash'}.get(facet, 'normal'),
+                       comparison='different' if facet == 'branch_regressions' else 'equal')
+            if facet == 'baseline_gaps':
+                row['report']['neutral_baseline']['compatible_control'] = False
+            row['report']['quality'] = {
+                'category': facet, 'facets': [facet], 'known_normal': normal,
+                'observed_normal': normal, 'reasons': []}
+            rows.append(row)
     return {"proposal": {"predicate": predicate},
             "evaluation": {"cases": rows, "quality": summarize_quality(row["report"] for row in rows)}}
 
 
-@pytest.mark.parametrize("change,accepted,reason", [
-    ({"repaired": ("target",), "normals": ("n1",), "branches": ("n2",)}, True, "quality-improved"),
-    ({"repaired": (), "normals": ("n1", "n2")}, False, "preservation-failed"),
-    ({"repaired": ("target",), "normals": ("n1",), "missing": ("n2",)}, False, "preservation-failed"),
-    ({"repaired": ("target",), "normals": ("n1",), "misses": ("n2",)}, False, "preservation-failed"),
-    ({"repaired": ("target",), "branches": ("n1", "n2")}, False, "no-quality-improvement"),
+@pytest.mark.parametrize('change,accepted,reason', [
+    ({'repaired': ('target',), 'normals': ('n1',), 'branches': ('n2',)}, True,
+     'branch-regressions-reduced'),
+    ({'repaired': ('target',), 'normals': ('n1',), 'missing': ('n2',)}, True,
+     'branch-regressions-reduced'),
+    ({'repaired': ('target',), 'normals': ('n1',), 'misses': ('n2',)}, False,
+     'target-crashes-increased'),
+    ({'repaired': ('target',), 'branches': ('n1', 'n2')}, False,
+     'no-objective-improvement'),
 ])
-def test_incumbent_reduces_regressions_without_losing_repairs_or_evidence(change, accepted, reason):
-    previous = quality_round(repaired=("target",), branches=("n1", "n2"))
-    selected, diagnostic = synthesis._select_candidate(previous, quality_round(**change))
-    assert selected is accepted
-    assert diagnostic["reason"] == reason
-    if change.get("missing"):
-        assert diagnostic["lost_normal_evidence"] == {"count": 1, "case_ids": ["n2"]}
-    if not change["repaired"]:
-        assert diagnostic["lost_improvements"] == {"count": 1, "case_ids": ["target"]}
+def test_selection_compares_target_then_shared_branch_outcomes(change, accepted, reason):
+    previous = quality_round(repaired=('target',), branches=('n1', 'n2'))
+    selected, comparison = synthesis._select_candidate(previous, quality_round(**change))
+    assert selected is accepted and comparison['reason'] == reason
 
 
-def test_nonreproducing_normal_branch_regression_cannot_be_hidden():
-    previous = quality_round(branches=("mismatch",))
-    previous["evaluation"]["cases"][0]["report"]["quality"]["known_normal"] = False
-    selected, diagnostic = synthesis._select_candidate(previous, quality_round(missing=("mismatch",)))
-    assert selected is False
-    assert diagnostic["lost_normal_evidence"]["case_ids"] == ["mismatch"]
+def test_ming_branch_regression_increase_cannot_win_by_losing_other_observations():
+    previous = quality_round(repaired=('target',), normals=('n1', 'n2'), others=('f1', 'f2'))
+    candidate = quality_round(repaired=('target',), branches=('n1', 'n2'), missing=('f1', 'f2'))
+    selected, comparison = synthesis._select_candidate(previous, candidate)
+    assert selected is False and comparison['reason'] == 'branch-regressions-increased'
+    assert comparison['comparison'] == {
+        'shared_known': 3, 'shared_branch_comparable': 2,
+        'previous_target_crashes': 0, 'candidate_target_crashes': 0,
+        'previous_branch_regressions': 0, 'candidate_branch_regressions': 2}
 
 
-def test_other_crash_repair_outweighs_additional_normal_branch_changes():
-    previous = quality_round(repaired=("target",), others=("other",), branches=("n1",), normals=("n2",))
-    candidate = quality_round(repaired=("target", "other"), branches=("n1", "n2"))
-    selected, diagnostic = synthesis._select_candidate(previous, candidate)
-    assert selected is True and diagnostic["reason"] == "quality-improved"
+def test_true_target_repair_outranks_extra_branch_differences_and_other_crashes():
+    previous = quality_round(misses=('target',), normals=('n1', 'n2'), repaired=('other',))
+    candidate = quality_round(others=('target', 'other'), branches=('n1', 'n2'))
+    selected, comparison = synthesis._select_candidate(previous, candidate)
+    assert selected is True and comparison['reason'] == 'target-crashes-reduced'
+    objective = synthesis.selection_objective(candidate['evaluation'])
+    assert synthesis._objective_outcome(objective) == 'not_rejected'
+    assert objective['candidate_target_crashes'] == 0 and objective['branch_regressions'] == 2
 
 
-def test_fewer_branch_changes_cannot_introduce_an_other_crash():
-    previous = quality_round(repaired=("target",), missing=("unknown",), branches=("n1", "n2"))
-    candidate = quality_round(repaired=("target",), others=("unknown",), normals=("n1", "n2"))
-    selected, diagnostic = synthesis._select_candidate(previous, candidate)
-    assert selected is False
-    assert diagnostic["new_crash_failures"] == {"count": 1, "case_ids": ["unknown"]}
+@pytest.mark.parametrize('remaining', ['missing', 'others', 'repaired'])
+def test_gap_or_other_only_changes_do_not_win(remaining):
+    previous = quality_round(branches=('n1',), others=('other',))
+    candidate = quality_round(**{remaining: ('n1', 'other')})
+    selected, comparison = synthesis._select_candidate(previous, candidate)
+    assert selected is False and comparison['reason'] == 'no-objective-improvement'
 
 
-def test_fewer_branch_changes_cannot_replace_complete_evidence_with_a_gap():
-    previous = quality_round(repaired=("target",), branches=("n1",), normals=("n2",))
-    candidate = quality_round(repaired=("target",), normals=("n1",), gaps=("n2",))
-    selected, diagnostic = synthesis._select_candidate(previous, candidate)
-    assert selected is False and diagnostic["reason"] == "preservation-failed"
+def test_real_branch_improvement_with_unrelated_gaps_and_other_crash_is_not_vetoed():
+    previous = quality_round(branches=('n1',), normals=('n2',), repaired=('target',))
+    candidate = quality_round(normals=('n1',), missing=('n2',), others=('target',))
+    selected, comparison = synthesis._select_candidate(previous, candidate)
+    assert selected is True and comparison['reason'] == 'branch-regressions-reduced'
+    assert comparison['comparison']['shared_branch_comparable'] == 1
+
+
+def test_shared_target_repair_is_not_vetoed_by_an_unrelated_observation_gap():
+    previous = quality_round(misses=('target',), normals=('unrelated',))
+    candidate = quality_round(others=('target',), missing=('unrelated',))
+    selected, comparison = synthesis._select_candidate(previous, candidate)
+    assert selected is True and comparison['reason'] == 'target-crashes-reduced'
+    assert comparison['comparison']['shared_known'] == 1
+    assert comparison['comparison']['candidate_target_crashes'] == 0
+
+
+def test_target_crash_can_move_between_cases_when_shared_target_count_improves():
+    previous = quality_round(misses=('t1', 't2'), repaired=('t3',))
+    candidate = quality_round(repaired=('t1', 't2'), misses=('t3',))
+    selected, comparison = synthesis._select_candidate(previous, candidate)
+    assert selected is True and comparison['reason'] == 'target-crashes-reduced'
+
+
+def test_target_count_drop_from_observation_loss_is_not_improvement():
+    previous = quality_round(misses=('target',), branches=('n1',))
+    candidate = quality_round(missing=('target', 'n1'))
+    selected, comparison = synthesis._select_candidate(previous, candidate)
+    assert selected is False and comparison['reason'] == 'no-objective-improvement'
 
 
 @pytest.mark.parametrize("candidate,repeated", [
@@ -518,7 +563,7 @@ def test_fewer_branch_changes_cannot_replace_complete_evidence_with_a_gap():
     ({"normals": ("n2",), "branches": ("n1",), "predicate": "rax <= 0"}, False),
     ({"normals": ("n2",), "missing": ("n1",)}, False),
 ])
-def test_stagnation_requires_same_predicate_and_unchanged_case_quality(candidate, repeated):
+def test_stagnation_requires_same_predicate_and_unchanged_case_objective(candidate, repeated):
     previous = quality_round(repaired=("target",), normals=("n2",), branches=("n1",))
     current = quality_round(repaired=("target",), **candidate)
     # Fresh versus cached acquisition is not a change in observed quality.
@@ -559,6 +604,11 @@ def test_provider_retains_crash_repair_before_minimizing_residual_branches(
     async def model(current, *args):
         index = len(model_calls)
         model_calls.append(current)
+        if index:
+            update = json.loads(current._feedback)[-1]
+            assert update['objective'] == update['feedback']['objective']
+            expected = repaired if index >= 2 else initial
+            assert update['incumbent']['objective'] == synthesis.selection_objective(expected['evaluation'])
         if index == 3 and ending == "abstain":
             return terminal(current, proposal(current, decision="abstain", predicate=None), [])
         predicate = "rax &&" if index == 3 and ending == "malformed" else predicates[index]
@@ -572,11 +622,16 @@ def test_provider_retains_crash_repair_before_minimizing_residual_branches(
     monkeypatch.setattr(synthesis, "_model_round", model)
     monkeypatch.setattr(synthesis, "build_candidate", build)
     monkeypatch.setattr(evaluation, "evaluate_dataset", lambda *args, **kwargs: evaluated.pop(0))
-    monkeypatch.setattr(synthesis, "predicate_feedback", lambda dataset, value: {"quality": value["quality"]})
+    monkeypatch.setattr(synthesis, "predicate_feedback", lambda dataset, value: {
+        "objective": synthesis.selection_objective(value)})
     result = asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=4))
     assert result["status"] == "not_rejected" and result["termination"] == termination
     assert result["selected_round"] == 2 and result["proposal"]["predicate"] == "rax <= 0"
     assert result["quality"] == repaired["evaluation"]["quality"]
+    assert result['objective'] == result['rounds'][1]['objective'] == synthesis.selection_objective(
+        repaired['evaluation'])
+    assert result['objective']['candidate_target_crashes'] == 0
+    assert result['objective']['branch_regressions'] == 2
     assert result["quality"]["status"] == "improved_with_regressions"
     assert result["quality"]["counts"]["improved"] == 2
     assert result["quality"]["counts"]["branch_regressions"] == 2
@@ -584,7 +639,7 @@ def test_provider_retains_crash_repair_before_minimizing_residual_branches(
     assert build_calls == predicates[:3 if ending in ("abstain", "malformed", "repeat") else 4]
     assert result["rounds"][1]["selection"]["accepted"] is True
     if ending != "repeat":
-        assert result["rounds"][2]["selection"]["reason"] == "preservation-failed"
+        assert result["rounds"][2]["selection"]["reason"] == "target-crashes-increased"
     assert result["build"]["predicate"] == "rax <= 0"
     assert result["verified"] is False and result["binradar_verification"] == "not_run"
     assert json.loads((context.run_dir / "run.json").read_text()) == result
@@ -593,10 +648,11 @@ def test_provider_retains_crash_repair_before_minimizing_residual_branches(
 @pytest.mark.parametrize("cases,status,quality", [
     ({"repaired": ("target",), "normals": ("normal",)}, "not_rejected", "improved"),
     ({"repaired": ("target",), "branches": ("normal",)}, "not_rejected", "improved_with_regressions"),
-    ({"misses": ("target",)}, "rejected", "rejected"),
-    ({"others": ("other",)}, "rejected", "rejected"),
+    ({"misses": ("target",)}, "reject_same_crash", "rejected"),
+    ({"others": ("other",)}, "not_rejected", "rejected"),
     ({"missing": ("target",)}, "unavailable", "incomplete"),
-    ({"normals": ("normal",)}, "unavailable", "unproven"),
+    ({"normals": ("normal",)}, "not_rejected", "unproven"),
+    ({}, "unavailable", "incomplete"),
 ])
 def test_manual_completed_quality_is_reported_without_runtime_error(tmp_path, monkeypatch, cases, status, quality):
     dataset = make_dataset(tmp_path / "dataset")
@@ -666,7 +722,8 @@ def test_real_failure_after_repair_is_not_masked_by_retained_incumbent(tmp_path,
     monkeypatch.setattr(synthesis, "_model_round", model)
     monkeypatch.setattr(synthesis, "build_candidate", build)
     monkeypatch.setattr(evaluation, "evaluate_dataset", lambda *args, **kwargs: evaluated)
-    monkeypatch.setattr(synthesis, "predicate_feedback", lambda dataset, value: {"quality": value["quality"]})
+    monkeypatch.setattr(synthesis, "predicate_feedback", lambda dataset, value: {
+        "objective": synthesis.selection_objective(value)})
     with pytest.raises(RuntimeError, match="provider request failed" if phase == "provider" else "native build failed"):
         asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=4))
     result = json.loads((context.run_dir / "run.json").read_text())
@@ -675,6 +732,61 @@ def test_real_failure_after_repair_is_not_masked_by_retained_incumbent(tmp_path,
     assert result["quality"]["status"] == "improved_with_regressions"
     assert result["evaluation"] == evaluated and result["build"]["predicate"] == "rax < 0"
     assert result["verified"] is False and result["binradar_verification"] == "not_run"
+
+
+@pytest.mark.parametrize('cases,minimum,status', [
+    ({}, False, 'unavailable'),
+    ({'missing': ('target',)}, False, 'unavailable'),
+    ({'others': ('target',)}, True, 'not_rejected'),
+    ({'repaired': ('target',), 'missing': ('unrelated',)}, True, 'not_rejected'),
+    ({'gaps': ('target',)}, True, 'not_rejected'),
+    ({'repaired': ('target',), 'branches': ('normal',)}, False, 'not_rejected'),
+    ({'misses': ('target',)}, False, 'reject_same_crash'),
+])
+def test_provider_stop_uses_known_observed_objective_not_strict_quality(
+        tmp_path, monkeypatch, cases, minimum, status):
+    context = prepare_context(make_dataset(tmp_path / 'dataset'), run_dir=tmp_path / 'runs')
+    provider = ProviderConfig(api_key='offline-only', base_url='https://example.invalid/v1', model='offline')
+    evaluated = quality_round(**cases)['evaluation']
+    for index, row in enumerate(evaluated['cases']):
+        row.update(case_id=f'function:{index}', domain='function')
+        row['report'].update(case_id=row['case_id'], domain='function')
+        row['report']['original_baseline']['applicable'] = False
+    # Even a forged legacy success must not turn missing observations into repair.
+    if not evaluated['cases'] or cases.get('missing') and not cases.get('repaired'):
+        evaluated['quality']['status'] = 'improved'
+    calls = []
+
+    async def model(current, *args):
+        calls.append(current)
+        if len(calls) == 1:
+            return terminal(current, proposal(current), ['rax < 0'])
+        return terminal(current, proposal(current, decision='abstain', predicate=None), [])
+
+    async def build(*args):
+        return {'status': 'built', 'verified': False}
+
+    from taosc_llm import evaluation
+    monkeypatch.setattr(synthesis, 'adapter_command', lambda _: ['not-executed'])
+    monkeypatch.setattr(synthesis, '_model_round', model)
+    monkeypatch.setattr(synthesis, 'build_candidate', build)
+    monkeypatch.setattr(evaluation, 'evaluate_dataset', lambda *args, **kwargs: evaluated)
+    result = asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=2))
+    assert result['status'] == status
+    assert result['termination'] == ('observed_objective_minimum' if minimum else 'abstained')
+    assert len(calls) == (1 if minimum else 2)
+    assert result['selected_round'] == 1 and result['evaluation'] == evaluated
+    assert result['objective'] == result['rounds'][0]['objective'] == synthesis.selection_objective(evaluated)
+    assert result['verified'] is False and result['binradar_verification'] == 'not_run'
+
+
+def test_repeated_result_ignores_other_crash_and_baseline_quality_penalties():
+    previous = quality_round(repaired=('target',), branches=('n1',))
+    current = quality_round(others=('target',), branches=('n1',), predicate='rax  < 0')
+    assert previous['evaluation']['quality'] != current['evaluation']['quality']
+    assert synthesis._repeated_result('ERM generic', previous, current) is True
+    current['evaluation']['cases'][1]['report']['original_baseline']['outcome'] = 'unknown'
+    assert synthesis._repeated_result('ERM generic', previous, current) is True
 
 
 def test_replay_binding_fails_before_provider_or_original_execution(tmp_path, monkeypatch):

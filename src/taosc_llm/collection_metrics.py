@@ -96,6 +96,45 @@ def _reports(evaluation: dict) -> list[tuple[str, dict]]:
     return reports
 
 
+def _branch_evidence(report: dict) -> tuple[bool, bool, bool, bool]:
+    """Shared control/capture authentication for collection and selection."""
+    neutral = _object(report, 'neutral_baseline')
+    candidate = _object(report, 'candidate')
+    artifact = _object(report, 'oracle').get('evaluation_artifact_sha256')
+    control_compatible = (neutral.get('compatible_control') is True and bool(artifact)
+                          and neutral.get('artifact_sha256') == artifact)
+    compatible = control_compatible and candidate.get('artifact_sha256') == artifact
+    capture_complete = _object(candidate, 'capture').get('status') in ('complete', 'zero_hits')
+    actual = capture_complete and _object(report, 'activation').get('status') in (
+        'fired', 'not_fired', 'zero_hits')
+    neutral_complete = _object(neutral, 'capture').get('status') in ('complete', 'zero_hits')
+    comparison = _object(report, 'branch_comparison')
+    comparable = (compatible and actual and neutral_complete
+                  and neutral.get('outcome') == candidate.get('outcome') == 'normal'
+                  and comparison.get('basis') == 'actual_complete_vectors'
+                  and comparison.get('status') in ('equal', 'different'))
+    return control_compatible, compatible, capture_complete, comparable
+
+
+def selection_case_sets(evaluation: dict | None) -> dict[str, frozenset[str]]:
+    """Observed objective evidence, independent of strict producer quality."""
+    result = {key: set() for key in ('known', 'target_crashes', 'branch_comparable',
+                                    'branch_regressions')}
+    reports = [] if evaluation is None else _reports(evaluation)
+    for case, (_, report) in zip([] if evaluation is None else evaluation['cases'], reports):
+        case_id = case.get('case_id', report.get('case_id'))
+        outcome = _object(report, 'candidate').get('outcome', 'unknown')
+        if outcome != 'unknown':
+            result['known'].add(case_id)
+        if outcome == 'target_crash':
+            result['target_crashes'].add(case_id)
+        if _branch_evidence(report)[3]:
+            result['branch_comparable'].add(case_id)
+            if report['branch_comparison']['status'] == 'different':
+                result['branch_regressions'].add(case_id)
+    return {key: frozenset(ids) for key, ids in result.items()}
+
+
 def _summarize(reports: list[tuple[str, dict]] | None, candidate_present: bool) -> dict:
     result = {field: None if reports is None else 0 for field in _FIELDS}
     result['target_status'] = 'not_observed' if candidate_present else 'no_candidate'
@@ -125,19 +164,10 @@ def _summarize(reports: list[tuple[str, dict]] | None, candidate_present: bool) 
             transition = ('target_remaining' if outcome == 'target_crash' else
                           'target_unobserved' if outcome == 'unknown' else 'target_fixed')
             result[transition] += 1
-        artifact = oracle.get('evaluation_artifact_sha256')
-        control_compatible = (neutral.get('compatible_control') is True and bool(artifact)
-                              and neutral.get('artifact_sha256') == artifact)
-        compatible = control_compatible and candidate.get('artifact_sha256') == artifact
-        capture_complete = _object(candidate, 'capture').get('status') in ('complete', 'zero_hits')
-        actual = capture_complete and activation in ('fired', 'not_fired', 'zero_hits')
+        control_compatible, compatible, capture_complete, comparable = _branch_evidence(report)
         neutral_complete = _object(neutral, 'capture').get('status') in ('complete', 'zero_hits')
         if compatible and neutral_complete and neutral_outcome == 'normal' and outcome == 'target_crash':
             result['new_target_failures'] += 1
-        comparable = (compatible and actual and neutral_complete
-                      and neutral_outcome == outcome == 'normal'
-                      and comparison.get('basis') == 'actual_complete_vectors'
-                      and comparison.get('status') in ('equal', 'different'))
         if comparable:
             result['branch_comparable'] += 1
             result['branch_regressions'] += comparison['status'] == 'different'
@@ -161,6 +191,16 @@ def _summarize(reports: list[tuple[str, dict]] | None, candidate_present: bool) 
         elif result['candidate_known']:
             result['target_status'] = 'target_absent'
     return result
+
+
+def selection_objective(evaluation: dict | None) -> dict:
+    """Public observed-outcome objective; counts never imply universal repair."""
+    metrics = collect_metrics(evaluation, candidate_present=True)
+    fields = ('target_status', 'candidate_known', 'candidate_unknown',
+              'candidate_target_crashes', 'branch_comparable', 'branch_regressions')
+    return {**{field: metrics[field] for field in fields},
+            'domains': {domain: {field: metrics[domain + '_' + field] for field in fields}
+                        for domain in ('system', 'function')}}
 
 
 def collect_metrics(evaluation: dict | None, *, candidate_present: bool) -> dict:

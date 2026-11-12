@@ -86,36 +86,49 @@ def test_prepared_original_fallback_is_explicit_not_candidate_or_neutral_state(d
     assert 'activation' not in example
 
 
-def test_feedback_counts_full_population_and_partitions_same_artifact_regressions(dataset):
+def test_feedback_counts_actual_targets_and_separates_strict_diagnostics(dataset):
     reports = [report(i) for i in range(8)]
     reports += [report(i, neutral='normal') for i in range(20, 25)]
-    # An original normal is not a compatible neutral normal, in either domain.
+    # Missing controls do not erase actual designated target outcomes.
     reports += [report(40, original='normal', neutral='unknown', compatible=False),
                 report(41, domain='function', original='normal', neutral='unknown',
                        applicable=False, compatible=False)]
     reports += [report(60, neutral='normal', candidate='other_crash'),
                 report(61, candidate='normal'), report(62, candidate='unknown')]
     response = feedback(dataset, evaluation_for(dataset, reports))
-    assert response['missed_target_crashes']['count'] == 10
-    assert response['regressions']['count'] == 6
+    objective = response['objective']
+    assert objective == {
+        'target_status': 'target_present', 'candidate_known': 17, 'candidate_unknown': 1,
+        'candidate_target_crashes': 15, 'branch_comparable': 0, 'branch_regressions': 0,
+        'domains': {
+            'system': {'target_status': 'target_present', 'candidate_known': 16, 'candidate_unknown': 1,
+                       'candidate_target_crashes': 14, 'branch_comparable': 0, 'branch_regressions': 0},
+            'function': {'target_status': 'target_present', 'candidate_known': 1, 'candidate_unknown': 0,
+                         'candidate_target_crashes': 1, 'branch_comparable': 0, 'branch_regressions': 0},
+        },
+    }
+    assert response['missed_target_crashes']['count'] == 15
     assert len(response['missed_target_crashes']['examples']) == 3
-    assert len(response['regressions']['examples']) == 3
-    assert all(row['neutral_baseline'] == 'normal' for row in response['regressions']['examples'])
-    quality = response['quality']
+    assert all(row['outcome'] == 'target_crash' and 'category' not in row
+               for row in response['missed_target_crashes']['examples'])
+    diagnostics = response['diagnostics']
+    quality = diagnostics['quality']
     assert quality['status'] == 'rejected'
+    assert quality['counts']['crash_regressions'] == 6
     assert quality['counts']['other_crashes'] == 1
-    other = quality['examples']['other_crashes'][0]
+    other = diagnostics['examples']['other_crashes'][0]
     assert (other['case_id'], other['outcome'], other['category']) == ('system:60', 'other_crash', 'crash_regression')
     assert quality['counts']['unavailable'] == 1
     assert quality['counts']['unproven'] == 1
-    assert isinstance(response['warning'], str)
+    assert isinstance(diagnostics['warning'], str)
+    assert all(len(examples) <= 3 for examples in diagnostics['examples'].values())
     public = json.dumps(response)
-    assert '0xbad' not in public and '/private/' not in public
+    assert '0xbad' not in public and '/private/' not in public and 'private-oracle' not in public
     assert all(char * 64 not in public for char in 'abcd')
-    assert 'outcomes' not in response and 'report_summary' not in response
+    assert not any(key in response for key in ('quality', 'regressions', 'warning', 'outcomes', 'report_summary'))
 
 
-def test_feedback_exposes_bounded_exact_branch_counterexamples_and_gap_counts(dataset):
+def test_feedback_exposes_bounded_authenticated_branch_witnesses_and_gap_counts(dataset):
     reports = [report(i, neutral='normal', original='normal', candidate='normal', activity='fired')
                for i in range(8)]
     difference = {'status': 'different', 'basis': 'actual_complete_vectors', 'neutral_hits': 2,
@@ -125,81 +138,128 @@ def test_feedback_exposes_bounded_exact_branch_counterexamples_and_gap_counts(da
     reports += [report(20, candidate='normal', activity='fired', compatible=False),
                 report(21, candidate='unknown', activity='unknown')]
     response = feedback(dataset, evaluation_for(dataset, reports))
-    assert response['quality']['status'] == 'incomplete'
+    assert response['objective']['target_status'] == 'target_absent'
+    assert response['objective']['candidate_known'] == 9
+    assert response['objective']['candidate_unknown'] == 1
+    assert response['objective']['branch_comparable'] == response['objective']['branch_regressions'] == 8
     assert response['branch_regressions']['count'] == 8
     assert len(response['branch_regressions']['examples']) == 3
     for example in response['branch_regressions']['examples']:
-        assert example['category'] == 'branch_regression'
+        assert 'category' not in example
         assert example['outcome'] == example['neutral_baseline'] == 'normal'
         assert example['branch_difference'] == {key: value for key, value in difference.items() if key != 'status'}
-    assert response['quality']['counts']['baseline_gaps'] == 1
-    assert response['quality']['counts']['unavailable'] == 1
-    assert response['quality']['counts']['improved'] == 0
-    assert all(len(examples) <= 3 for examples in response['quality']['examples'].values())
+    diagnostics = response['diagnostics']
+    assert diagnostics['quality']['status'] == 'incomplete'
+    assert diagnostics['quality']['counts']['baseline_gaps'] == 1
+    assert diagnostics['quality']['counts']['unavailable'] == 1
+    assert diagnostics['quality']['counts']['improved'] == 0
+    assert all(len(examples) <= 3 for examples in diagnostics['examples'].values())
 
 
-@pytest.mark.parametrize(('extra', 'expected'), [
-    (None, 'improved_with_regressions'),
-    ('target_crash', 'rejected'),
-    ('other_crash', 'rejected'),
-    ('unknown', 'incomplete'),
-    ('baseline_gap', 'incomplete'),
-    ('trapped', 'unproven'),
-    ('no_repair', 'unproven'),
+@pytest.mark.parametrize(('candidate', 'status', 'known', 'unknown', 'targets'), [
+    ('normal', 'target_absent', 1, 0, 0),
+    ('other_crash', 'target_absent', 1, 0, 0),
+    ('target_crash', 'target_present', 1, 0, 1),
+    ('unknown', 'not_observed', 0, 1, 0),
 ])
-def test_feedback_distinguishes_hard_crash_blocking_from_soft_branch_objective(dataset, extra, expected):
-    reports = [report(i, neutral='normal', original='normal', candidate='normal', activity='fired')
-               for i in range(8)]
-    for row in reports:
-        row['branch_comparison'] = {
-            'status': 'different', 'basis': 'actual_complete_vectors', 'first_difference': 0,
-            'neutral_branch': 0, 'candidate_branch': 1, 'neutral_hits': 1, 'candidate_hits': 1}
-    if extra != 'no_repair':
-        reports.append(report(20, candidate='normal', activity='fired'))
-    if extra in ('target_crash', 'other_crash', 'unknown'):
-        reports.append(report(21, candidate=extra, activity='unknown' if extra == 'unknown' else 'fired'))
-    elif extra == 'baseline_gap':
-        reports.append(report(21, candidate='normal', activity='fired', compatible=False))
-    elif extra == 'trapped':
-        reports.append(report(21, candidate='normal', activity='trapped'))
-    response = feedback(dataset, evaluation_for(dataset, reports))
-    assert response['quality']['status'] == expected
-    objectives = response['quality']['objectives']
-    assert 'Block all candidate crashes' in objectives['hard']
-    assert 'target and other crashes' in objectives['hard']
-    assert 'Incomplete or unproven' in objectives['hard']
-    assert 'Minimize and report' in objectives['soft']
-    assert 'alone do not reject' in objectives['soft']
-    assert response['branch_regressions']['count'] == 8
-    assert len(response['branch_regressions']['examples']) == 3
-    assert all(example['branch_difference']['first_difference'] == 0
-               for example in response['branch_regressions']['examples'])
-    assert ('warning' in response) == (extra in ('unknown', 'baseline_gap', 'trapped', 'no_repair'))
-    public = json.dumps(response)
-    assert '0xbad' not in public and '/private/' not in public
-    assert all(char * 64 not in public for char in 'abcd')
+def test_objective_uses_actual_outcomes_not_legacy_quality(dataset, candidate, status, known, unknown, targets):
+    row = report(0, candidate=candidate, compatible=False, activity='unknown')
+    # A saved strict verdict/facet is not the objective, in either direction.
+    row['quality'] = {'category': 'improved', 'facets': ['improved'], 'reasons': [],
+                      'known_normal': False, 'observed_normal': True}
+    response = feedback(dataset, evaluation_for(dataset, [row]))
+    objective = response['objective']
+    assert objective['target_status'] == status
+    assert objective['candidate_known'] == known
+    assert objective['candidate_unknown'] == unknown
+    assert objective['candidate_target_crashes'] == targets
+    assert response['missed_target_crashes']['count'] == targets
+    assert response['branch_regressions'] == {'count': 0, 'examples': []}
+    assert 'status' not in response and 'quality' not in response
 
 
-def test_normal_unknown_activity_and_nonreproducing_control_have_one_warning(dataset):
+def test_target_free_other_crashes_are_diagnostic_not_rejection(dataset):
+    response = feedback(dataset, evaluation_for(dataset, [report(0, candidate='other_crash')]))
+    assert response['objective']['target_status'] == 'target_absent'
+    assert response['objective']['candidate_known'] == 1
+    assert response['objective']['candidate_target_crashes'] == 0
+    assert response['diagnostics']['quality']['status'] == 'rejected'
+    assert response['diagnostics']['quality']['counts']['other_crashes'] == 1
+    assert response['diagnostics']['examples']['other_crashes'][0]['outcome'] == 'other_crash'
+    assert 'rejected' not in json.dumps(response['objective'])
+
+
+@pytest.mark.parametrize('limitation', ['artifact', 'control', 'capture', 'activity', 'prediction', 'other_crash'])
+def test_branch_counterexamples_require_authenticated_actual_normal_comparison(dataset, limitation):
+    row = report(0, neutral='normal', original='normal', candidate='normal', activity='fired')
+    row['branch_comparison'] = {
+        'status': 'different', 'basis': 'actual_complete_vectors', 'first_difference': 0,
+        'neutral_branch': 0, 'candidate_branch': 1, 'neutral_hits': 1, 'candidate_hits': 1}
+    if limitation == 'artifact':
+        row['candidate']['artifact_sha256'] = 'b' * 64
+    elif limitation == 'control':
+        row['neutral_baseline']['compatible_control'] = False
+    elif limitation == 'capture':
+        row['candidate']['capture']['status'] = 'incomplete'
+    elif limitation == 'activity':
+        row['activation']['status'] = 'trapped'
+    elif limitation == 'prediction':
+        row['branch_comparison']['basis'] = 'offline_prediction'
+    else:
+        row['candidate']['outcome'] = 'other_crash'
+    row['quality'] = {'category': 'branch_regression', 'facets': ['branch_regressions'], 'reasons': [],
+                      'known_normal': True, 'observed_normal': True}
+    response = feedback(dataset, evaluation_for(dataset, [row]))
+    assert response['objective']['branch_comparable'] == response['objective']['branch_regressions'] == 0
+    assert response['branch_regressions'] == {'count': 0, 'examples': []}
+
+
+def test_branch_witnesses_do_not_depend_on_legacy_quality_facets(dataset):
+    row = report(0, neutral='normal', original='normal', candidate='normal', activity='fired')
+    row['branch_comparison'] = {
+        'status': 'different', 'basis': 'actual_complete_vectors', 'first_difference': 0,
+        'neutral_branch': 0, 'candidate_branch': 1, 'neutral_hits': 1, 'candidate_hits': 1,
+        'private_path': '/private/branch', 'artifact_sha256': 'b' * 64}
+    row['quality'] = {'category': 'preserved_normal', 'facets': ['preserved_normal'], 'reasons': [],
+                      'known_normal': True, 'observed_normal': True}
+    response = feedback(dataset, evaluation_for(dataset, [row]))
+    assert response['objective']['branch_regressions'] == response['branch_regressions']['count'] == 1
+    witness = response['branch_regressions']['examples'][0]['branch_difference']
+    assert witness['first_difference'] == 0 and witness['candidate_branch'] == 1
+    assert 'private_path' not in witness and 'artifact_sha256' not in witness
+
+
+def test_empty_inventory_does_not_establish_target_removal(dataset):
+    response = feedback(dataset, evaluation_for(dataset, []))
+    assert response['objective']['target_status'] == 'not_observed'
+    assert response['objective']['candidate_known'] == response['objective']['candidate_unknown'] == 0
+    assert response['missed_target_crashes'] == response['branch_regressions'] == {'count': 0, 'examples': []}
+
+
+def test_normal_unknown_activity_and_nonreproducing_control_have_diagnostic_warning(dataset):
     row = report(0, candidate='normal', neutral='normal', activity='unknown')
     row['warnings'] = ['control_does_not_reproduce_target']
     response = feedback(dataset, evaluation_for(dataset, [row]))
-    assert response['missed_target_crashes']['count'] == response['regressions']['count'] == 0
-    assert response['branch_regressions']['count'] == 0
-    assert response['quality']['status'] == 'incomplete'
-    assert response['quality']['counts']['unavailable'] == 1
-    assert response['quality']['counts']['baseline_gaps'] == 1
-    assert response['quality']['counts']['improved'] == 0
-    assert isinstance(response['warning'], str)
-    assert not any(key in response for key in ('repaired', 'success', 'verified', 'activation'))
+    assert response['missed_target_crashes']['count'] == response['branch_regressions']['count'] == 0
+    assert response['objective']['target_status'] == 'target_absent'
+    assert response['objective']['branch_comparable'] == 0
+    diagnostics = response['diagnostics']
+    assert diagnostics['quality']['status'] == 'incomplete'
+    assert diagnostics['quality']['counts']['unavailable'] == 1
+    assert diagnostics['quality']['counts']['baseline_gaps'] == 1
+    assert diagnostics['quality']['counts']['improved'] == 0
+    assert isinstance(diagnostics['warning'], str)
+    assert not any(key in response for key in ('repaired', 'success', 'verified', 'activation', 'warning'))
 
 
 def test_function_original_not_applicable_is_not_a_coverage_gap(dataset):
     row = report(0, domain='function', original='unknown', applicable=False,
                  candidate='normal', activity='fired')
     response = feedback(dataset, evaluation_for(dataset, [row]))
-    assert 'warning' not in response
-    assert response['missed_target_crashes']['count'] == response['regressions']['count'] == 0
+    assert 'warning' not in response['diagnostics']
+    assert response['objective']['domains']['function']['target_status'] == 'target_absent'
+    assert response['objective']['domains']['system']['target_status'] == 'not_observed'
+    assert response['missed_target_crashes']['count'] == response['branch_regressions']['count'] == 0
 
 
 def test_explicit_detail_is_allowlisted_and_does_not_invent_activity(dataset):

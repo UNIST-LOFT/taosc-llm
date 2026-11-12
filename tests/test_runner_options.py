@@ -117,15 +117,15 @@ def test_invalid_combinations_do_not_create_output(tmp_path, monkeypatch, argv):
     assert list(tmp_path.iterdir()) == []
 
 
-@pytest.mark.parametrize("option,default", [
-    ("search-timeout", "3600"), ("max-evaluations", "256"),
-    ("max-atoms", "1024"), ("beam-width", "12"), ("max-clauses", "12"),
-    ("max-factors", "6"), ("operand-depth", "2"),
+@pytest.mark.parametrize("option", [
+    "search-timeout", "max-evaluations", "max-atoms", "beam-width",
+    "max-clauses", "max-factors", "operand-depth",
 ])
 @pytest.mark.parametrize("mode", ["manual", "provider"])
-def test_explicit_search_defaults_are_rejected_in_other_modes(option, default, mode):
+def test_explicit_search_defaults_are_rejected_in_other_modes(option, mode):
+    default = getattr(parse_args([]), option.replace("-", "_"))
     with pytest.raises(SystemExit) as exc:
-        parse_args(["--mode", mode, "--stop-after", "warm", "--" + option, default])
+        parse_args(["--mode", mode, "--stop-after", "warm", "--" + option, str(default)])
     assert exc.value.code == 2
 
 

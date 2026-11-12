@@ -239,11 +239,8 @@ def test_quality_requires_actual_repair_and_matching_target_baselines(dataset):
     row = {**observed(candidate, same=False), 'neutral_baseline': observed(neutral)}
     report = project_case(dataset, case, row)
     assert report['quality']['category'] == 'improved'
-    from taosc_llm.evidence import quality_case_sets, summarize_quality
+    from taosc_llm.evidence import summarize_quality
     assert summarize_quality([report])['status'] == 'improved'
-    sets = quality_case_sets({'cases': [{'case_id': case['id'], 'report': report}]})
-    assert sets['improved'] == {case['id']}
-    assert not sets['known_normals']
     # Same normal candidate, but the neutral does not reproduce the original.
     row['neutral_baseline'] = observed(capture(dataset, normal=True), same=False)
     mismatch = project_case(dataset, case, row)
@@ -251,9 +248,6 @@ def test_quality_requires_actual_repair_and_matching_target_baselines(dataset):
     assert 'improved' not in mismatch['quality']['facets']
     assert summarize_quality([mismatch])['status'] == 'incomplete'  # branch divergence does not erase the gap
     assert 'original-neutral-disagreement' in mismatch['quality']['reasons']
-    sets = quality_case_sets({'cases': [{'case_id': case['id'], 'report': mismatch}]})
-    assert sets['observed_normals'] == sets['branch_regressions'] == sets['baseline_gaps'] == {case['id']}
-    assert not sets['known_normals'] and not sets['improved']
 
 
 @pytest.mark.parametrize(('neutral_branches', 'candidate_branches', 'values', 'difference'), [
@@ -276,10 +270,8 @@ def test_normal_complete_vector_differences_have_exact_counterexamples(
     assert quality['branch_difference'] == dict(zip(
         ('first_difference', 'neutral_branch', 'candidate_branch', 'neutral_hits', 'candidate_hits'), difference),
         basis='actual_complete_vectors')
-    from taosc_llm.evidence import quality_case_sets, summarize_quality
+    from taosc_llm.evidence import summarize_quality
     assert summarize_quality([report])['status'] == 'unproven'  # normal-only cases do not establish repair
-    sets = quality_case_sets({'cases': [{'case_id': case['id'], 'report': report}]})
-    assert sets['branch_regressions'] == sets['known_normals'] == sets['observed_normals'] == {case['id']}
 
 
 @pytest.mark.parametrize('kind', ['predicted', 'partial', 'invalid', 'wrong-artifact',

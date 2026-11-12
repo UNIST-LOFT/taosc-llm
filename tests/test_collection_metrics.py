@@ -3,7 +3,7 @@ from copy import deepcopy
 
 import pytest
 
-from taosc_llm.collection_metrics import collect_metrics
+from taosc_llm.collection_metrics import collect_metrics, selection_case_sets, selection_objective
 
 
 ARTIFACT = 'a' * 64
@@ -193,6 +193,9 @@ def test_unavailable_or_predicted_branch_pairs_cannot_enter_denominator(kind):
     assert result['branch_comparison_unavailable'] == 1
     assert result['predicate_traps'] == (kind == 'trap')
     assert result['candidate_capture_incomplete'] == (kind in ('partial', 'invalid'))
+    selected = selection_case_sets({'cases': [row]})
+    assert selected['branch_comparable'] == selected['branch_regressions'] == frozenset()
+    assert bool(selected['known']) is (kind != 'unknown-outcome')
 
 
 def test_authenticated_empty_vectors_are_comparable_not_missing():
@@ -302,3 +305,34 @@ def test_original_neutral_mismatch_survives_missing_candidate_evidence():
 def test_candidate_presence_must_be_explicit_boolean():
     with pytest.raises(ValueError, match='candidate_present'):
         collect_metrics(None, candidate_present='yes')
+
+
+def test_selection_sets_keep_actual_targets_and_authenticated_branch_support():
+    rows = [case(0, outcome='target_crash'),
+            case(1, original='unknown', neutral='normal'),
+            case(2, original='target_crash', neutral='normal', comparison='equal'),
+            case(3, domain='function', outcome='other_crash'),
+            {'case_id': 'system:4', 'domain': 'system'},
+            {'report': case(5)['report']}]
+    selected = selection_case_sets({'cases': rows})
+    assert selected == {
+        'known': frozenset(('system:0', 'system:1', 'system:2', 'function:3', 'system:5')),
+        'target_crashes': frozenset(('system:0',)),
+        'branch_comparable': frozenset(('system:1', 'system:2')),
+        'branch_regressions': frozenset(('system:1',))}
+    assert selection_case_sets(None) == selection_case_sets({'cases': []}) == {
+        key: frozenset() for key in selected}
+
+
+@pytest.mark.parametrize('evaluation', [None, {'cases': []}, {'cases': [case(outcome='unknown')]},
+                                        {'cases': [case(), case(1, domain='function', outcome='target_crash')]}])
+def test_public_objective_is_exact_collector_projection(evaluation):
+    result = selection_objective(evaluation)
+    collected = collect_metrics(evaluation, candidate_present=True)
+    fields = ('target_status', 'candidate_known', 'candidate_unknown',
+              'candidate_target_crashes', 'branch_comparable', 'branch_regressions')
+    assert set(result) == {*fields, 'domains'}
+    assert {key: result[key] for key in fields} == {key: collected[key] for key in fields}
+    assert result['domains'] == {
+        domain: {key: collected[domain + '_' + key] for key in fields}
+        for domain in ('system', 'function')}
