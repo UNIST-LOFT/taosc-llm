@@ -320,43 +320,57 @@ def test_parallel_collection_has_identical_order_and_rows(tmp_path):
 
 
 @pytest.mark.parametrize("output_format,delimiter", [("csv", ","), ("tsv", "\t")])
-def test_tabular_columns_are_stable_and_quote_special_paths(tmp_path, output_format, delimiter):
+@pytest.mark.parametrize("verbose", ["full", "compact"])
+def test_tabular_columns_are_stable_and_quote_special_paths(tmp_path, output_format, delimiter, verbose):
     root = manual(tmp_path / 'run "quoted", with spaces')
     row = collect(root)
     stream = io.StringIO()
-    write_output(stream, output_format, [row])
+    write_output(stream, output_format, [row], verbose=verbose)
     reader = csv.DictReader(io.StringIO(stream.getvalue()), delimiter=delimiter)
     full = list(reader)
     assert full[0]["subject"] == "package/subject"
     assert "subject_id" not in reader.fieldnames
     assert "subject_id" not in row
+    if verbose == "compact":
+        assert reader.fieldnames == [
+            "subject", "mode", "predicate", "candidate_known", "candidate_normal",
+            "candidate_target_crashes", "branch_comparable", "branch_regressions",
+        ]
 
     stream = io.StringIO()
-    write_output(stream, output_format, [row], include_subject_id=False)
+    write_output(stream, output_format, [row], include_subject_id=False, verbose=verbose)
     reduced_reader = csv.DictReader(io.StringIO(stream.getvalue()), delimiter=delimiter)
     saved = list(reduced_reader)
     assert reduced_reader.fieldnames == [key for key in reader.fieldnames if key != "subject"]
     assert saved == [{key: value for key, value in full[0].items() if key != "subject"}]
-    assert saved[0]["run_directory"] == str(root)
-    assert saved[0]["target_status"] == "target_absent"
+    assert saved[0]["candidate_known"] == "1"
+    assert saved[0]["candidate_target_crashes"] == "0"
+    if verbose == "full":
+        assert saved[0]["run_directory"] == str(root)
+        assert saved[0]["target_status"] == "target_absent"
 
 
 @pytest.mark.parametrize("output_format", ["json", "log"])
-def test_subject_omission_preserves_results_without_numeric_ids(tmp_path, output_format):
+@pytest.mark.parametrize("verbose", ["full", "compact"])
+def test_subject_omission_preserves_results_without_numeric_ids(tmp_path, output_format, verbose):
     row = collect(manual(tmp_path / "saved"))
     full = io.StringIO()
     reduced = io.StringIO()
-    write_output(full, output_format, [row])
-    write_output(reduced, output_format, [row], include_subject_id=False)
+    write_output(full, output_format, [row], verbose=verbose)
+    write_output(reduced, output_format, [row], include_subject_id=False, verbose=verbose)
     if output_format == "json":
         expected = json.loads(full.getvalue())
         assert "subject_id" not in expected["rows"][0]
         assert expected["rows"][0].pop("subject") == "package/subject"
         assert json.loads(reduced.getvalue()) == expected
     else:
-        assert "\npackage/subject / saved\n" in full.getvalue()
+        if verbose == "full":
+            assert "\npackage/subject / saved\n" in full.getvalue()
+            assert "\nsaved\n" in reduced.getvalue()
+        else:
+            assert "saved" not in full.getvalue()
+            assert "  subject: \"package/subject\"" in full.getvalue()
         assert "subject_id:" not in full.getvalue()
-        assert "\nsaved\n" in reduced.getvalue()
         assert "package/subject" not in reduced.getvalue()
         assert "  subject:" not in reduced.getvalue()
         assert full.getvalue().split("\nSummary: ")[1] == reduced.getvalue().split("\nSummary: ")[1]
@@ -385,18 +399,21 @@ def test_default_output_uses_exp_list_directory(tmp_path):
     assert len(files) == 1
 
 
-def test_mode_filter_keeps_unknown_errors_but_excludes_other_modes(tmp_path):
+@pytest.mark.parametrize("verbose", ["full", "compact"])
+def test_mode_filter_keeps_unknown_errors_but_excludes_other_modes(tmp_path, verbose):
     one = manual(tmp_path / "manual")
     two = provider(tmp_path / "provider")
     missing = tmp_path / "missing"
     output = tmp_path / "filtered.json"
     assert main(["--run-dir", str(one), "--run-dir", str(two), "--run-dir", str(missing),
-                 "--mode", "provider", "--format", "json", "--output", str(output)]) == 1
+                 "--mode", "provider", "--format", "json", "--verbose", verbose,
+                 "--output", str(output)]) == 1
     rows = json.loads(output.read_text())["rows"]
     assert [row["mode"] for row in rows] == ["provider", "unknown"]
 
 
-def test_recorded_no_candidate_and_unknown_evidence_are_not_failures(tmp_path):
+@pytest.mark.parametrize("verbose", ["full", "compact"])
+def test_recorded_no_candidate_and_unknown_evidence_are_not_failures(tmp_path, verbose):
     abstained = tmp_path / "abstained"
     save(abstained / "run.json", {"provider": {}, "rounds": [], "status": "abstained",
                                   "proposal": {"decision": "abstain"}, "verified": False,
@@ -404,10 +421,13 @@ def test_recorded_no_candidate_and_unknown_evidence_are_not_failures(tmp_path):
     unknown = manual(tmp_path / "unknown", cases=[case(outcome="unknown")])
     output = tmp_path / "rows.json"
     assert main(["--run-dir", str(abstained), "--run-dir", str(unknown),
-                 "--format", "json", "--output", str(output)]) == 0
+                 "--format", "json", "--verbose", verbose, "--output", str(output)]) == 0
     rows = json.loads(output.read_text())["rows"]
-    assert [row["target_status"] for row in rows] == ["no_candidate", "not_observed"]
-    assert rows[0]["candidate_total"] is None
+    assert [row["candidate_known"] for row in rows] == [None, 0]
+    assert [row["candidate_target_crashes"] for row in rows] == [None, 0]
+    if verbose == "full":
+        assert [row["target_status"] for row in rows] == ["no_candidate", "not_observed"]
+        assert rows[0]["candidate_total"] is None
 
 
 def test_residual_target_is_data_not_collection_failure(tmp_path):

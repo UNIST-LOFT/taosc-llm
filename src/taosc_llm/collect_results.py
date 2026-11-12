@@ -30,6 +30,10 @@ ROW_FIELDS = (
     "binradar_verification", "evaluation_source", "collection_status", "collection_error",
 )
 COLUMNS = ROW_FIELDS + METRIC_FIELDS
+_COMPACT_COLUMNS = (
+    "subject", "mode", "predicate", "candidate_known", "candidate_normal",
+    "candidate_target_crashes", "branch_comparable", "branch_regressions",
+)
 _MODES = ("provider", "manual", "no-llm")
 _PAYLOAD = re.compile(r"payloads/([0-9a-f]{64})\.([A-Za-z0-9][A-Za-z0-9._-]{0,31})")
 
@@ -410,8 +414,9 @@ def summarize(rows: list[dict]) -> dict:
 
 
 def write_output(stream: TextIO, output_format: str, rows: list[dict], *,
-                 include_subject_id: bool = True) -> None:
-    fields = tuple(key for key in COLUMNS if include_subject_id or key != "subject")
+                 include_subject_id: bool = True, verbose: str = "full") -> None:
+    columns = _COMPACT_COLUMNS if verbose == "compact" else COLUMNS
+    fields = tuple(key for key in columns if include_subject_id or key != "subject")
     summary = summarize(rows)
     if output_format in ("csv", "tsv"):
         writer = csv.DictWriter(stream, fieldnames=fields,
@@ -427,8 +432,11 @@ def write_output(stream: TextIO, output_format: str, rows: list[dict], *,
     else:
         stream.write("Observed-cohort target results; not universal repair or FINAL verification.\n")
         for row in rows:
-            label = f"{row['subject']} / {row['run']}" if include_subject_id else row["run"]
-            stream.write(f"\n{label}\n")
+            if verbose == "compact":
+                stream.write("\n")
+            else:
+                label = f"{row['subject']} / {row['run']}" if include_subject_id else row["run"]
+                stream.write(f"\n{label}\n")
             for key in fields:
                 stream.write(f"  {key}: {json.dumps(row[key], ensure_ascii=False)}\n")
         stream.write("\nSummary: " + json.dumps(summary, sort_keys=True) + "\n")
@@ -443,6 +451,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="latest means highest numeric run, including failed runs")
     parser.add_argument("--mode", choices=("all", *_MODES), default="all")
     parser.add_argument("--format", choices=("log", "csv", "tsv", "json"), default="log")
+    parser.add_argument("--verbose", choices=("compact", "full"), default="full",
+                        help="output columns: full (default) or compact target/regression metrics")
     parser.add_argument("--output", help="output path, or - for stdout; default: exp-list-dir/logs/taosc-llm-results-TIMESTAMP.ext")
     parser.add_argument("--jobs", type=int, default=1,
                         help="collection processes (default 1; 0 = CPU/run count; each loads one report)")
@@ -478,12 +488,14 @@ def main(argv: list[str] | None = None) -> int:
             output = str(Path(args.exp).absolute().parent / "logs" /
                          f"taosc-llm-results-{timestamp}.{args.format}")
         if output == "-":
-            write_output(sys.stdout, args.format, rows, include_subject_id=not args.no_subject_id)
+            write_output(sys.stdout, args.format, rows, include_subject_id=not args.no_subject_id,
+                         verbose=args.verbose)
         else:
             path = Path(output)
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("w", encoding="utf-8", newline="") as stream:
-                write_output(stream, args.format, rows, include_subject_id=not args.no_subject_id)
+                write_output(stream, args.format, rows, include_subject_id=not args.no_subject_id,
+                             verbose=args.verbose)
             print(f"Results written to: {path}", file=sys.stderr)
         return 1 if any(row["collection_error"] is not None for row in rows) else 0
     except (OSError, ValueError, RuntimeError) as error:

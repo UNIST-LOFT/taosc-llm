@@ -656,6 +656,16 @@ must be read with their comparable denominator: losing evidence is not progress.
   ordered processes; `0` selects CPU/run count and may consume substantial memory.
   `--format log|csv|tsv|json` and `--output -` are supported.
   CSV/TSV have one row per run; JSON includes rows and separate summary counters.
+- `--verbose full` is the default and preserves all fields. `--verbose compact`
+  selects these row fields, in order, in every format: `subject`, `mode`,
+  `predicate`, `candidate_known`, `candidate_normal`, `candidate_target_crashes`,
+  `branch_comparable`, `branch_regressions`. JSON metadata/summary and the log
+  summary remain unchanged; compact logs omit the extra subject/run headings.
+  Selection, row order, metric values, nulls and exit codes do not change.
+  Inspect `full` for unknown outcomes, baseline gaps and execution/storage errors.
+  Zero target crashes means observed target removal only when `candidate_known`
+  is positive; zero `branch_comparable` means no regression comparison, not a
+  proven absence of regression.
 - `subject` contains the experiment-list identifier, e.g. `binutils/CVE-2017-14745`.
   No numeric `subject_id` is generated. `-n/--no-subject-id` omits that textual
   `subject` column/key (and the subject in log headings), allowing subsequent
@@ -684,10 +694,12 @@ Provider evaluations still describe the cached descriptor, not execution of the
 new fixed/selectable binaries. No-LLM `publication_status=matched` is saved local
 artifact parity, not FINAL. The collector never promotes either into verification.
 
-Validation: collector I/O tests pass (26 tests), including numeric-ID removal and
-textual subject omission in all four formats. The checkout CLI was also exercised
-against a saved journal with the default, `-n`, and `--no-subject-id` outputs in
-each format. Pass a real journal directory to `--run-dir`: symlinked journal aliases
+Validation: collector I/O tests pass (32 tests), including full/compact output,
+subject omission, null-versus-zero observations and preserved collection failures.
+The checkout CLI was exercised against a saved journal in all four formats:
+default output equals explicit `full`, `compact` has the eight ordered fields,
+and `compact -n` has seven, with unchanged values. Pass a real journal directory
+to `--run-dir`: symlinked journal aliases
 are rejected as `unsafe journal payload` by the existing containment check.
 An isolated wheel-only installation was exercised from an external cwd, including the installed CLI,
 checkout launcher, module entry and sequential/spawn-process equality on eight
