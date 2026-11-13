@@ -241,7 +241,15 @@ def _mutation_provenance(dataset, case):
             'complete_state': False}
 
 
+def _mutation_parser():
+    parser = sbsv.parser()
+    parser.add_schema(binradar_feedback._FEEDBACK_SCHEMA)
+    parser.add_schema(binradar_feedback._MUTATION_SCHEMA)
+    return parser
+
+
 def _read_mutation_provenance(dataset, case):
+    from .evaluation import _memo
     if case['domain'] != 'function':
         return {'status': 'unavailable', 'writes': [], 'complete_state': False}
     capture = case.get('capture')
@@ -253,9 +261,9 @@ def _read_mutation_provenance(dataset, case):
         record_bytes = getattr(dataset, '_record_bytes', None)
         text = (record_bytes(sidecar).decode() if record_bytes is not None
                 else dataset._verify(sidecar).read_text())
-        parser = sbsv.parser()
-        parser.add_schema(binradar_feedback._FEEDBACK_SCHEMA)
-        parser.add_schema(binradar_feedback._MUTATION_SCHEMA)
+        # Detached parsing retains schemas, never rows. The enclosing provenance
+        # memo serializes access; the parser expires with the validation scope.
+        parser = _memo(dataset, 'mutation-parser', None, _mutation_parser)
         with StringIO(text) as stream:
             header = parser.parse_line_detached(stream.readline())
             if (header is None or header.get_name() != 'binradar-feedback'

@@ -53,7 +53,7 @@ def _atomic(path: Path, value) -> None:
     fd, part = tempfile.mkstemp(prefix='.part-', dir=path.parent)
     try:
         with os.fdopen(fd, 'w') as stream:
-            json.dump(value, stream, sort_keys=True, separators=(',', ':'))
+            stream.write(json.dumps(value, sort_keys=True, separators=(',', ':')))
             stream.write('\n')
             stream.flush()
             os.fsync(stream.fileno())

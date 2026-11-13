@@ -81,15 +81,19 @@ def test_parser_feedback_does_not_mask_real_build_failure(tmp_path, monkeypatch)
             assert latest['error']['kind'] == 'parse_rejected'
             assert json.loads(latest['invalid_proposal'])['predicate'] == 'rax &&'
             return terminal(current, proposal(current), ["rax < 0"])
-        pytest.fail("a real build failure must stop before another provider round")
+        pytest.fail("a real publication failure must stop before another provider round")
     monkeypatch.setattr(synthesis, "_model_round", model)
-    # The real builder rejects the fixture's deliberately non-ELF identity bytes
-    # before any native tool/target runs; this is an execution failure, not quality.
+    # A changed frozen runtime must remain fatal after recoverable parser feedback.
+    original_publish = synthesis.publish_candidate
+    def tampered(dataset, predicate):
+        dataset.artifact('fixture.brcached').write_bytes(b'changed runtime')
+        return original_publish(dataset, predicate)
+    monkeypatch.setattr(synthesis, 'publish_candidate', tampered)
     with pytest.raises((ValueError, RuntimeError, OSError)):
         asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=3))
     result = json.loads((context.run_dir / "run.json").read_text())
     assert len(prompts) == 2
-    assert [r["status"] for r in result["rounds"]] == ["parse_rejected", "build_failed"]
+    assert [r["status"] for r in result["rounds"]] == ["parse_rejected", "publication_failed"]
     assert result["rounds"][-1]["proposal"]["predicate"] == "rax < 0"
     assert result["status"] == "infrastructure_error" and result["verified"] is False
     assert result["binradar_verification"] == "not_run"
@@ -100,9 +104,9 @@ def test_parser_feedback_does_not_mask_real_build_failure(tmp_path, monkeypatch)
                                          (asyncio.CancelledError(), "cancelled")])
 def test_manual_failure_retains_unverified_run_record(tmp_path, monkeypatch, error, status):
     dataset = make_dataset(tmp_path / "dataset")
-    async def abort_build(*args):
+    def abort_build(*args):
         raise error
-    monkeypatch.setattr(synthesis, "build_candidate", abort_build)
+    monkeypatch.setattr(synthesis, "publish_candidate", abort_build)
     with pytest.raises(type(error)):
         synthesis.generate_manual(dataset, "0", output=tmp_path / "runs")
     record = tmp_path / "runs" / "run.json"
@@ -114,7 +118,7 @@ def test_manual_failure_retains_unverified_run_record(tmp_path, monkeypatch, err
     assert result["run_directory"] == str(tmp_path / "runs")
     assert result["status"] == status and result["error_type"] == type(error).__name__
     assert result["verified"] is False and result["binradar_verification"] == "not_run"
-    assert "build" not in result and "evaluation" not in result
+    assert "candidate" not in result and "evaluation" not in result
     assert json.loads(record.with_name("context.json").read_text())["context_id"] == result["context_id"]
 
 
@@ -139,7 +143,7 @@ def test_existing_output_is_rejected_without_execution_or_overwrite(tmp_path, mo
         pytest.fail('occupied output must fail before execution or provider work')
 
     monkeypatch.setattr(synthesis, 'adapter_command', lambda _: ['not-executed'])
-    monkeypatch.setattr(synthesis, 'build_candidate', forbidden)
+    monkeypatch.setattr(synthesis, 'publish_candidate', forbidden)
     monkeypatch.setattr(synthesis, '_model_round', forbidden)
     monkeypatch.setattr(synthesis, 'poc_observation', forbidden)
     monkeypatch.setattr(synthesis, 'prepare_context', forbidden)
@@ -153,7 +157,7 @@ def test_existing_output_is_rejected_without_execution_or_overwrite(tmp_path, mo
             provider = ProviderConfig(api_key='offline-only', base_url='https://example.invalid/v1', model='offline')
             asyncio.run(synthesis.synthesize_context(context, provider))
     assert marker.read_bytes() == b'preserve original result'
-    assert not (output / 'trials').exists() and not (output / 'build-workdir').exists()
+    assert not (output / 'trials').exists() and not (output / 'candidate.json').exists()
 
 
 def test_concurrent_output_claim_has_one_owner_and_preserves_cache(tmp_path):
@@ -271,8 +275,8 @@ def test_feedback_follows_final_host_outcome_only(tmp_path, monkeypatch, outcome
                 "request_count": 1, "usage": None}
         return response
 
-    async def build(*args):
-        return {"status": "built", "verified": False}
+    def build(*args):
+        return {"status": "published", "verified": False}
 
     def evaluate(*args, **kwargs):
         return {"status": outcome, "evaluation_mode": "host", "private_path": "private-host-path",
@@ -284,7 +288,7 @@ def test_feedback_follows_final_host_outcome_only(tmp_path, monkeypatch, outcome
                                "activation": {"status": "unknown"}}}]}
 
     monkeypatch.setattr(synthesis, "run_adapter", model)
-    monkeypatch.setattr(synthesis, "build_candidate", build)
+    monkeypatch.setattr(synthesis, "publish_candidate", build)
     from taosc_llm import evaluation
     monkeypatch.setattr(evaluation, "evaluate_dataset", evaluate)
     result = asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=2, session_feedback=True))
@@ -397,12 +401,12 @@ def test_manual_mode_does_not_run_provider_preflight(tmp_path, monkeypatch):
     def forbidden(*args, **kwargs):
         pytest.fail("manual generation must not run provider POC preflight")
 
-    async def stop(*args):
-        raise RuntimeError("stop before native build")
+    def stop(*args):
+        raise RuntimeError("stop before publication")
 
     monkeypatch.setattr(synthesis, "poc_observation", forbidden)
-    monkeypatch.setattr(synthesis, "build_candidate", stop)
-    with pytest.raises(RuntimeError, match="stop before native build"):
+    monkeypatch.setattr(synthesis, "publish_candidate", stop)
+    with pytest.raises(RuntimeError, match="stop before publication"):
         synthesis.generate_manual(dataset, "0", output=tmp_path / "runs")
 
 
@@ -437,12 +441,12 @@ def test_refinement_uses_same_minimal_feedback_as_review(tmp_path, monkeypatch):
             assert forbidden not in public
         return terminal(current, proposal(current, decision="abstain", predicate=None), [])
 
-    async def build(*args):
-        return {"status": "built", "verified": False}
+    def build(*args):
+        return {"status": "published", "verified": False}
 
     from taosc_llm import evaluation
     monkeypatch.setattr(synthesis, "_model_round", model)
-    monkeypatch.setattr(synthesis, "build_candidate", build)
+    monkeypatch.setattr(synthesis, "publish_candidate", build)
     monkeypatch.setattr(evaluation, "evaluate_dataset", lambda *args, **kwargs: evaluated)
     result = asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=2))
     assert result["status"] == "reject_same_crash" and len(calls) == 2
@@ -574,7 +578,7 @@ def test_stagnation_requires_same_predicate_and_unchanged_case_objective(candida
 
 def test_failed_build_breaks_consecutive_evaluated_result_streak():
     evaluated = quality_round(repaired=("target",), branches=("normal",))
-    failed = {"proposal": evaluated["proposal"], "status": "build_failed"}
+    failed = {"proposal": evaluated["proposal"], "status": "publication_failed"}
     assert synthesis._repeated_result("ERM generic", evaluated, failed) is False
     assert synthesis._repeated_result("ERM generic", failed, evaluated) is False
 
@@ -614,13 +618,13 @@ def test_provider_retains_crash_repair_before_minimizing_residual_branches(
         predicate = "rax &&" if index == 3 and ending == "malformed" else predicates[index]
         return terminal(current, proposal(current, predicate=predicate), [predicate])
 
-    async def build(dataset, predicate, directory):
+    def build(dataset, predicate):
         build_calls.append(predicate)
-        return {"status": "built", "verified": False, "predicate": predicate}
+        return {"status": "published", "verified": False, "predicate": predicate}
 
     from taosc_llm import evaluation
     monkeypatch.setattr(synthesis, "_model_round", model)
-    monkeypatch.setattr(synthesis, "build_candidate", build)
+    monkeypatch.setattr(synthesis, "publish_candidate", build)
     monkeypatch.setattr(evaluation, "evaluate_dataset", lambda *args, **kwargs: evaluated.pop(0))
     monkeypatch.setattr(synthesis, "predicate_feedback", lambda dataset, value: {
         "objective": synthesis.selection_objective(value)})
@@ -640,7 +644,7 @@ def test_provider_retains_crash_repair_before_minimizing_residual_branches(
     assert result["rounds"][1]["selection"]["accepted"] is True
     if ending != "repeat":
         assert result["rounds"][2]["selection"]["reason"] == "target-crashes-increased"
-    assert result["build"]["predicate"] == "rax <= 0"
+    assert result["candidate"]["predicate"] == "rax <= 0"
     assert result["verified"] is False and result["binradar_verification"] == "not_run"
     assert json.loads((context.run_dir / "run.json").read_text()) == result
 
@@ -658,11 +662,11 @@ def test_manual_completed_quality_is_reported_without_runtime_error(tmp_path, mo
     dataset = make_dataset(tmp_path / "dataset")
     evaluated = quality_round(**cases)["evaluation"]
 
-    async def build(*args):
-        return {"status": "built", "verified": False}
+    def build(*args):
+        return {"status": "published", "verified": False}
 
     from taosc_llm import evaluation
-    monkeypatch.setattr(synthesis, "build_candidate", build)
+    monkeypatch.setattr(synthesis, "publish_candidate", build)
     monkeypatch.setattr(evaluation, "evaluate_dataset", lambda *args, **kwargs: evaluated)
     result = synthesis.generate_manual(dataset, "0", output=tmp_path / "runs")
     assert result["status"] == status and result["quality"]["status"] == quality
@@ -671,7 +675,7 @@ def test_manual_completed_quality_is_reported_without_runtime_error(tmp_path, mo
     assert json.loads((tmp_path / "runs" / "run.json").read_text()) == result
 
 
-@pytest.mark.parametrize("error", [ValueError("integrity failure"), RuntimeError("native build failed"),
+@pytest.mark.parametrize("error", [ValueError("integrity failure"), RuntimeError("publication failed"),
                                     OSError("storage failure")])
 def test_provider_build_failure_cannot_become_abstention_or_exhaustion(tmp_path, monkeypatch, error):
     context = prepare_context(make_dataset(tmp_path / "dataset"), run_dir=tmp_path / "runs")
@@ -683,17 +687,17 @@ def test_provider_build_failure_cannot_become_abstention_or_exhaustion(tmp_path,
         calls.append(current)
         return terminal(current, proposal(current), ["rax < 0"])
 
-    async def build(*args):
+    def build(*args):
         raise error
 
     monkeypatch.setattr(synthesis, "_model_round", model)
-    monkeypatch.setattr(synthesis, "build_candidate", build)
+    monkeypatch.setattr(synthesis, "publish_candidate", build)
     with pytest.raises(type(error), match=str(error)):
         asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=4))
     result = json.loads((context.run_dir / "run.json").read_text())
     assert len(calls) == 1 and result["status"] == "infrastructure_error"
     assert result["error_type"] == type(error).__name__
-    assert result["rounds"][0]["status"] == "build_failed"
+    assert result["rounds"][0]["status"] == "publication_failed"
     assert "evaluation" not in result and "quality" not in result
     assert result["verified"] is False and result["binradar_verification"] == "not_run"
 
@@ -713,24 +717,24 @@ def test_real_failure_after_repair_is_not_masked_by_retained_incumbent(tmp_path,
         predicate = "rax < 0" if len(calls) == 1 else "rax <= 0"
         return terminal(current, proposal(current, predicate=predicate), [predicate])
 
-    async def build(dataset, predicate, directory):
+    def build(dataset, predicate):
         if len(calls) == 2:
-            raise RuntimeError("native build failed")
-        return {"status": "built", "verified": False, "predicate": predicate}
+            raise RuntimeError("publication failed")
+        return {"status": "published", "verified": False, "predicate": predicate}
 
     from taosc_llm import evaluation
     monkeypatch.setattr(synthesis, "_model_round", model)
-    monkeypatch.setattr(synthesis, "build_candidate", build)
+    monkeypatch.setattr(synthesis, "publish_candidate", build)
     monkeypatch.setattr(evaluation, "evaluate_dataset", lambda *args, **kwargs: evaluated)
     monkeypatch.setattr(synthesis, "predicate_feedback", lambda dataset, value: {
         "objective": synthesis.selection_objective(value)})
-    with pytest.raises(RuntimeError, match="provider request failed" if phase == "provider" else "native build failed"):
+    with pytest.raises(RuntimeError, match="provider request failed" if phase == "provider" else "publication failed"):
         asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=4))
     result = json.loads((context.run_dir / "run.json").read_text())
     assert result["status"] == "infrastructure_error" and result["error_type"] == "RuntimeError"
     assert len(calls) == 2 and result["selected_round"] == 1
     assert result["quality"]["status"] == "improved_with_regressions"
-    assert result["evaluation"] == evaluated and result["build"]["predicate"] == "rax < 0"
+    assert result["evaluation"] == evaluated and result["candidate"]["predicate"] == "rax < 0"
     assert result["verified"] is False and result["binradar_verification"] == "not_run"
 
 
@@ -763,13 +767,13 @@ def test_provider_stop_uses_known_observed_objective_not_strict_quality(
             return terminal(current, proposal(current), ['rax < 0'])
         return terminal(current, proposal(current, decision='abstain', predicate=None), [])
 
-    async def build(*args):
-        return {'status': 'built', 'verified': False}
+    def build(*args):
+        return {'status': 'published', 'verified': False}
 
     from taosc_llm import evaluation
     monkeypatch.setattr(synthesis, 'adapter_command', lambda _: ['not-executed'])
     monkeypatch.setattr(synthesis, '_model_round', model)
-    monkeypatch.setattr(synthesis, 'build_candidate', build)
+    monkeypatch.setattr(synthesis, 'publish_candidate', build)
     monkeypatch.setattr(evaluation, 'evaluate_dataset', lambda *args, **kwargs: evaluated)
     result = asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=2))
     assert result['status'] == status

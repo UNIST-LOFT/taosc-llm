@@ -45,7 +45,7 @@ def run_native(command: list[str], scratch: Path, *, timeout: int = 300,
         raise ValueError("empty native command")
     environment = native_environment()
     if extra_env:
-        if set(extra_env) - {"PATCH_ID"}:
+        if set(extra_env) - {"PATCH_ID", "TAOSC_PRED", "BRCACHE_STACK_SIZE"}:
             raise ValueError("unsupported native environment field")
         environment.update(extra_env)
     executable = shutil.which(command[0], path=environment.get("PATH"))

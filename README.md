@@ -1,7 +1,7 @@
 # taosc-llm
 
-Prepare immutable BinRadar evidence, evaluate an ERM predicate, and build a manual
-or isolated Pi-driven candidate. Only explicit `ERM generic` and `ERM CWE-805`
+Prepare immutable BinRadar evidence, evaluate an ERM predicate, and publish a manual
+or isolated Pi-driven predicate on the same cached runtime. Only explicit `ERM generic` and `ERM CWE-805`
 families are supported. This is a standalone backend: existing `taosc-fix` and
 `taosc-refine` orchestration is unchanged. Candidate evaluation is rejection-only,
 not final BinRadar verification or proof of repair.
@@ -223,7 +223,7 @@ uv run --project utils/taosc-llm taosc-llm-no-llm \
 `python -m taosc_llm.no_llm` is equivalent. This host-only path imports no
 provider, model context or Pi loop; it accepts no provider/model/session-review
 options. It consumes the same prepared dataset, canonical family parser,
-full-vector evaluator, optional explicit replay bridge and isolated builder.
+full-vector evaluator, optional explicit replay bridge and cached-predicate publisher.
 It neither prepares a dataset nor invokes REA, starts a replay server or runs
 BinRadar FINAL. The wheel/Guix closure still includes the existing Pi tools.
 The reusable library entry is `taosc_llm.no_llm.run.synthesize(dataset,
@@ -265,7 +265,7 @@ even if the working branch has fewer regressions. The archive does not force an
 always-repair seed to own every target in the exploratory branches. Normal/budget
 termination reauthenticates the selected program’s evaluation and ownership
 proofs without new execution or overwriting the working frontier. Artifact
-publication compares against that selected evaluation, not the active branch.
+publication binds that selected predicate to the evaluated cached artifact, not a newly linked binary.
 Cancellation never promotes a draft.
 
 | Search option | Finite default | Bound |
@@ -294,8 +294,8 @@ interruption and evidence gaps; no global optimum or out-of-corpus repair is
 claimed. `coverage=complete` means complete observations, not all targets repaired.
 
 The output is a private, single-writer schema-1 session: immutable `identity.json`,
-`segments/*.jsonl`, content-addressed `payloads/`, private `cache/`, and new
-`candidates/` directories. Stdout is one JSON result; diagnostics go to stderr.
+`segments/*.jsonl`, content-addressed `payloads/` and private `cache/`. The published
+candidate references the frozen dataset artifact; there is no rebuilt candidate directory. Stdout is one JSON result; diagnostics go to stderr.
 `result_record` names the immutable summary payload; journal events are the source
 of truth. Resume never overwrites old segments/payloads or interprets manual/Pi
 `run.json`. Checksums, chains and transitive evidence references are checked;
@@ -315,22 +315,19 @@ completed producers can still be reused.
 
 A missing old replay server allows offline/concrete continuation; an endpoint
 replacement cannot rebind old mutation IDs. BRCH is not a process checkpoint.
-An interrupted build is retried in a new candidate directory. Only a completed
-`publication` event authenticates fully checked artifacts; incomplete attempts
-are recorded separately. Final verification compares fixed and selectable id1
-against candidate outcomes/full vectors and selectable id0 against neutral controls.
-The fixed artifact honors `PATCH_FD` for logging but never lets `PATCH_ID` or SHM
-disable its guard. `publication_status=matched` is local artifact parity only;
-function mutations cannot be transferred to newly built artifacts and leave
-publication partial. Every result retains `verified=false` and
-`binradar_verification=not_run`.
+A completed `publication` event stores the selected predicate binding to the exact
+frozen `.brcached` path/hash and its explicit activation. Resume reauthenticates
+the dataset, runtime bytes, descriptor and activation; it does not rebuild or
+compare different executable layouts. `publication_status=published` means the
+binding is durable, not that targets or regressions are absent. Mutation evidence
+remains bound to its original cached artifact and replay limitations. Every result
+retains `verified=false` and `binradar_verification=not_run`. Older search sessions
+fail the changed implementation identity; start a fresh result directory.
 
 Exit status: **0** for every completed search outcome, including remaining
-crashes/regressions, no candidate, exhausted budget/grammar and partial evidence
-or publication; **130** interrupted; **1** input/storage/engine/build failure.
+crashes/regressions, no candidate, exhausted budget/grammar and partial evidence; **130** interrupted; **1** input/storage/engine/publication failure.
 Invalid CLI usage remains nonzero. Judge repair from `score`, `termination`,
 `coverage`, `publication_status` and the artifacts, never process exit alone.
-A built-artifact branch mismatch is still an error, not partial success.
 Acceptance and remaining representative-corpus/live-replay gates are recorded in
 the [implementation record](../../agent-docs/taosc-llm/memo/patch-synthesizer/README.md).
 
@@ -349,9 +346,9 @@ uv run --project utils/taosc-llm taosc-llm \
 `python -m taosc_llm` is the synthesis CLI. Manual mode loads no provider and
 makes no model request; it uses the same mandatory native isolation and
 candidate-owned outputs as model mode. There is no manual unsandboxed CLI switch.
-Both paths build and evaluate the family-specific candidate. Generic predicates
+Both paths publish and evaluate the family-specific candidate on the frozen `.brcached`. Generic predicates
 are signed-i64 register expressions: **nonzero means jump to the selected repair
-destination**. The builder lowers the safe condition `(expression) == 0` through
+destination**. The family parser lowers the safe condition `(expression) == 0` through
 BinRadar's parser, never interpolating model text as C. CWE-805 instead accepts
 the closed pointer/size safe-clamp grammar; it is not generic C or an arbitrary
 memory-expression interface. Both families support parentheses and logical
@@ -395,7 +392,7 @@ Failure groups have counts and at most three examples; optional scoped filters
 retrieve more. Hashes and private paths stay host-only. Static `function` views
 default to available facets; select a facet/address for local CFG/value-flow evidence.
 
-Strict parsing, builds and actual evaluations feed provider refinement
+Strict parsing, authenticated publication and actual evaluations feed provider refinement
 (`--max-rounds` 1–16, default 4); manual mode rejects provider-only options.
 Incumbent selection compares target-crash counts on case IDs whose outcomes are
 known in **both** evaluations. A strict target improvement takes precedence over
@@ -405,7 +402,7 @@ incumbent. Losing observations alone cannot improve either score; unrelated gaps
 do not veto a demonstrated improvement. Previously repaired/normal case sets are
 not independent preservation gates. `selection.comparison` records the paired
 denominators and counts; raw totals remain in `objective`. Domain-specific target
-identities are unchanged. `selected_round` binds the retained proposal/build/evaluation.
+identities are unchanged. `selected_round` binds the retained proposal/candidate/evaluation.
 
 The observed lower bound—at least one known outcome, zero observed target crashes
 and zero observed branch regressions—ends refinement with
@@ -421,7 +418,7 @@ the incumbent and report residuals normally; branch regressions are not process 
 Without an evaluated candidate a valid abstention stops without a candidate;
 a later abstention retains an already evaluated incumbent. Invalid model
 proposals can receive bounded corrective feedback, but an unrecovered final
-parse error with no incumbent remains an error. Build/storage/integrity and
+parse error with no incumbent remains an error. Publication/storage/integrity and
 provider failures propagate; they are not `refinement_exhausted` outcomes.
 No final BinRadar verification is run.
 
@@ -482,7 +479,7 @@ Stdout contains one JSON result; diagnostics go to stderr. Common CLI exits:
 | Exit | Meaning |
 |---|---|
 | 0 | Completed setup/evaluation/synthesis, including abstention, no candidate, remaining crashes/regressions, evidence gaps and bounded exhaustion; never repair or FINAL proof |
-| 1 | Input, provider/API, unrecovered parser, storage, engine or build failure |
+| 1 | Input, provider/API, unrecovered parser, storage, engine or publication failure |
 | 2 | Invalid CLI arguments, not candidate quality |
 | 130 | Interrupted; local cleanup does not prove remote provider completion |
 
@@ -509,15 +506,15 @@ With `--replay-socket`, a result also carries a `replay` block (endpoint,
 coverage, mutation count, unavailable count). The endpoint never enters the
 model projection or a tool result, and it is not a patch field.
 `unavailable` is not evidence of improvement. Synthesis results retain
-`verified=false` and `binradar_verification=not_run` even when a build exists.
+`verified=false` and `binradar_verification=not_run` even when a candidate is published.
 
 `--output` is the exact private result directory, not a parent for UUID directories.
 Without it, synthesis allocates one temporary directory. Model results go directly
 into `run.json` (including private `context_provenance`), `context.json`, private
 preflight `poc.json`, `trials/<round>/` journals/final text, and
-`candidates/<round>/build-workdir/`, `build-result.json`, `evaluation.json`.
+`candidates/<round>/candidate.json` and `evaluation.json`.
 Optional review writes `session-feedback.md` in that same root. Manual results use
-`build-workdir/`, `build.log`, `context.json` and `run.json` directly under `--output`.
+`candidate.json`, `context.json` and `run.json` directly under `--output`.
 Protocol `run_id` remains metadata; use returned `run_directory`, never append
 `run_id` to locate files.
 
@@ -542,19 +539,23 @@ taosc-llm-out-00000/result/
   candidates/
 ```
 
-| Built artifact | Meaning |
+| `candidate` field | Meaning |
 |---|---|
-| `<BINARY>.patched` | Fixed candidate; independent of `PATCH_ID` |
-| `<BINARY>.brpatched` | Unset/0 selects original; 1 selects candidate |
-| `<BINARY>.{patched,brpatched}.json` | Separate E9 command streams |
-| `<BINARY>.{patched,brpatched}.e9map.json` | Exact binary-bound relocation metadata |
-| `patch-format`, `predicates`, `brpatches.json`, native inputs | Family, lowered safe condition, descriptor and build sources |
+| `artifact.path`, `artifact.sha256` | Exact frozen `<BINARY>.brcached` used for evaluation; no binary copy or rebuild |
+| `predicate`, `source_predicate`, `descriptor` | Canonical candidate, family polarity and runtime descriptor |
+| `activation` | Explicit `PATCH_ID=0`, `TAOSC_PRED=<descriptor>`, `BRCACHE_STACK_SIZE` |
+| `dataset_id`, `patch_location`, `patch_destination` | Immutable evidence and existing repair-site/action binding |
 
-Consume a complete result and matching artifact hashes, not partial files.
-The low-level builder publishes per-file, not as an atomic directory transaction;
-do not share a candidate directory with another build/verifier. Fixed/selectable
-PIE support does not prove subsequent ordinary BinRadar literal-destination
-rebuilds are PIE-compatible.
+Keep the frozen dataset with the result. Apply all `candidate.activation` entries
+when executing `candidate.artifact.path` with the original target arguments.
+In direct cached mode `PATCH_ID=0` labels the observation; the explicit descriptor
+selects the predicate (`TAOSC_PRED=p0` is neutral). This is not an always-enabled
+`.patched` executable and must not be advertised as one. The existing selector
+SHM protocol remains available to BinRadar; the emitted direct activation does not
+inherit its magic selector. No new `.patched` or `.brpatched` is produced by
+manual, provider or no-LLM synthesis. Low-level developer builds remain separate.
+Publication authenticates bytes and metadata, not cross-run machine-state
+stability or out-of-corpus repair; see [the publication boundary](../../agent-docs/taosc-llm/TOOLS_AND_TRUST.md#cached-candidate-publication).
 
 ```python
 from pathlib import Path
@@ -731,9 +732,10 @@ must be read with their comparable denominator: losing evidence is not progress.
   Exit **1** means collection/input/output errors (other rows are retained when
   possible); invalid CLI usage exits **2**.
 
-Provider evaluations still describe the cached descriptor, not execution of the
-new fixed/selectable binaries. No-LLM `publication_status=matched` is saved local
-artifact parity, not FINAL. The collector never promotes either into verification.
+All synthesis modes now publish the same cached artifact/descriptor that their
+evaluations describe. `publication_status=published` is an authenticated binding,
+not FINAL or fresh replay. Historical `matched`/`partial` publication records
+retain their old meaning; collection does not relabel or reverify old results.
 
 Validation: collector I/O tests pass (32 tests), including full/compact output,
 subject omission, null-versus-zero observations and preserved collection failures.
@@ -968,7 +970,7 @@ vulnerability: original signed inputs <=0 abort, positives return 17; the fixtur
 repair route returns 23. It produces real original observations and a schema-2
 dataset, not asserted register JSON. Development values are -7, 0 and 5; six
 signed boundary inputs remain held out from the model. Replay checks original,
-fixed and selectable behavior; any fixture `passed` verdict is finite fixture
+cached-neutral and explicitly activated cached-candidate behavior; any fixture `passed` verdict is finite fixture
 scope only, not final BinRadar verification. Historical fixture results are not
 acceptance evidence for this cutover. Exercised package/build/smoke results and
 remaining gates are recorded in the

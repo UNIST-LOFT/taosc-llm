@@ -18,7 +18,7 @@ def session_identity(dataset: PreparedDataset, limits: SearchLimits, *, workers:
     sources = Path(__file__).parent
     implementation = sorted(sources.glob("*.py")) + [sources.parent / name for name in (
         "dataset.py", "evaluation.py", "evidence.py", "family.py", "poc.py", "replay.py",
-        "builder.py", "publication.py", "native.py", "runtime.c")]
+        "publication.py", "native.py")]
     return {"schema_version": 1, "engine": "taosc-llm-no-llm",
             "dataset_id": dataset.dataset_id, "manifest": dataset.manifest,
             "environment": dataset.execution_environment(), "runtime": execution_identity(),

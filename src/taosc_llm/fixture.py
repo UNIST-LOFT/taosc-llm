@@ -144,18 +144,19 @@ def prepare_fixture(directory: Path, *, pie: bool = False, rea: str | None = Non
 
 
 def verify_fixture(directory: Path, result: dict) -> dict:
-    if "build" not in result:
-        raise ValueError("fixture verification requires a built candidate")
+    if "candidate" not in result:
+        raise ValueError("fixture verification requires a published candidate")
     directory = Path(directory).resolve(strict=True)
     manifest = json.loads((directory / "fixture.json").read_text())
     original = directory / "workdir/fixture.orig"
     if hashlib.sha256(original.read_bytes()).hexdigest() != manifest["original_sha256"]:
         raise ValueError("fixture original changed")
-    build = result["build"]
-    for name, expected in build["artifact_hashes"].items():
-        if hashlib.sha256(Path(build["artifacts"][name]).read_bytes()).hexdigest() != expected:
-            raise ValueError("built fixture artifact changed")
-    candidate = Path(build["artifacts"]["fixture.patched"]).parent
+    from .dataset import load_dataset
+    from .publication import validate_publication
+    candidate = result["candidate"]
+    dataset = load_dataset(directory / "dataset")
+    validate_publication(dataset, candidate, candidate["predicate"])
+    binary = Path(candidate["artifact"]["path"])
     scratch = directory / "verification-scratch"
     scratch.mkdir(mode=0o700, exist_ok=True)
     cases = []
@@ -163,15 +164,12 @@ def verify_fixture(directory: Path, result: dict) -> dict:
         for value in values:
             repaired = 23 if value <= 0 else 17
             baseline = -signal.SIGABRT if value <= 0 else 17
-            modes = (("original", original, None, baseline),
-                     ("fixed", candidate / "fixture.patched", None, repaired),
-                     ("fixed-selector-ignored", candidate / "fixture.patched", "0", repaired),
-                     ("selectable-default", candidate / "fixture.brpatched", None, baseline),
-                     ("selectable-original", candidate / "fixture.brpatched", "0", baseline),
-                     ("selectable-candidate", candidate / "fixture.brpatched", "1", repaired))
-            for mode, binary, selector, expected in modes:
-                actual = run_native([str(binary), str(value)], scratch, timeout=5, check=False,
-                                    extra_env={} if selector is None else {"PATCH_ID": selector},
+            modes = (("original", original, {}, baseline),
+                     ("cached-neutral", binary, {**candidate["activation"], "TAOSC_PRED": "p0"}, baseline),
+                     ("cached-candidate", binary, candidate["activation"], repaired))
+            for mode, executable, activation, expected in modes:
+                actual = run_native([str(executable), str(value)], scratch, timeout=5, check=False,
+                                    extra_env=activation,
                                     self_signals=True).returncode
                 cases.append({"partition": partition, "input": str(value), "mode": mode,
                               "expected_returncode": expected, "actual_returncode": actual,
@@ -179,8 +177,8 @@ def verify_fixture(directory: Path, result: dict) -> dict:
     verification = {"schema_version": 2, "oracle": manifest["oracle"], "context_id": result["context_id"],
                     "status": "passed" if all(case["passed"] for case in cases) else "failed",
                     "scope": "Finite harmless fixture checks, not general correctness or BinRadar phase verification",
-                    "artifact_hashes": build["artifact_hashes"], "cases": cases}
-    write_record(candidate.parent / "verification.json", verification)
+                    "artifact": candidate["artifact"], "cases": cases}
+    write_record(Path(result["run_directory"]) / "verification.json", verification)
     return verification
 
 
@@ -199,7 +197,7 @@ def main(argv: list[str] | None = None) -> int:
                 result: dict = {"status": "prepared", **{name: str(path) for name, path in prepared.items()}}
             else:
                 result = generate_with_pi(prepared["dataset"], args.provider_env, sdk_root=args.pi_sdk_root)
-                if "build" in result:
+                if "candidate" in result:
                     result["fixture_verification"] = verify_fixture(args.directory, result)
                     write_record(Path(result["run_directory"]) / "run.json", result)
         print(json.dumps(result))

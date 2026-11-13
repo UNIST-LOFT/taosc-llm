@@ -1,6 +1,5 @@
 """Real E9 proof on a harmless return-code fixture, not a vulnerable benchmark."""
 
-import asyncio
 import hashlib
 import json
 import os
@@ -20,9 +19,6 @@ from elftools.elf.elffile import ELFFile
 from taosc_llm.builder import generate_patch
 from taosc_llm.dataset import load_dataset
 from taosc_llm.fixture import prepare_fixture
-from taosc_llm.native import run_native
-from taosc_llm.publication import build_candidate, verify_built_candidate
-from taosc_llm.evaluation import evaluate_dataset
 
 ASSEMBLY = """\
 .text
@@ -379,27 +375,27 @@ def test_real_cached_zero_runs_through_execution_worker(tmp_path):
         assert error is None and [state.branch for state in snapshots] == [branch]
 
 
-def test_fresh_build_worker_preserves_runtime_dependency_closure(tmp_path):
+def test_manual_cli_publishes_evaluated_runtime_and_replays_held_out_inputs(tmp_path, capfd):
+    from taosc_llm.cli import main
+    from taosc_llm.fixture import verify_fixture
     require_native_tools()
-    prepared = prepare_fixture(tmp_path / "caller")
-    dataset = load_dataset(prepared["dataset"])
-    original = dataset.artifact('fixture.orig')
-    original_bytes = original.read_bytes()
-    built = asyncio.run(build_candidate(dataset, "rax <= 0", tmp_path / "candidate"))
-    scratch = tmp_path / "execution"
-    scratch.mkdir()
-    fixed = built["artifacts"]["fixture.patched"]
-    # This crosses the fresh Python process and real native build boundaries.
-    # Guix must resolve dependencies outside the interpreter's own site-packages.
-    for value, expected in (("-1", 23), ("1", 17)):
-        result = run_native([fixed, value], scratch, timeout=5, check=False)
-        assert result.returncode == expected
-    evaluation = evaluate_dataset(dataset, 'rax <= 0',
-                                  cache_dir=tmp_path / 'evaluation-cache', workers=2)
-    replay = verify_built_candidate(dataset, built, evaluation, workers=2)
-    assert replay['status'] == 'matched'
-    assert replay['summary']['matched'] == len(evaluation['cases']) > 0
-    assert all(set(case['observations']) == {'fixed', 'selectable_id0', 'selectable_id1'}
-               for case in replay['cases'])
-    assert original.read_bytes() == original_bytes
-    assert replay['verified'] is False and replay['binradar_verification'] == 'not_run'
+    prepared = prepare_fixture(tmp_path / 'caller')
+    dataset = load_dataset(prepared['dataset'])
+    binary = dataset.artifact('fixture.brcached')
+    original_bytes = binary.read_bytes()
+    capfd.readouterr()
+    assert main(['--dataset', str(dataset.root), '--predicate', 'rax <= 0',
+                 '--output', str(tmp_path / 'candidate'), '--execution-workers', '2']) == 0
+    result = json.loads(capfd.readouterr().out)
+    candidate = result['candidate']
+    assert candidate['artifact']['path'] == str(binary)
+    assert candidate['artifact']['sha256'] == hashlib.sha256(original_bytes).hexdigest()
+    assert result['publication_status'] == 'published'
+    assert result['objective']['candidate_target_crashes'] == 0
+    assert result['objective']['branch_regressions'] == 0
+    verification = verify_fixture(tmp_path / 'caller', result)
+    assert verification['status'] == 'passed'
+    assert {case['mode'] for case in verification['cases']} == {
+        'original', 'cached-neutral', 'cached-candidate'}
+    assert binary.read_bytes() == original_bytes
+    assert result['verified'] is False and result['binradar_verification'] == 'not_run'

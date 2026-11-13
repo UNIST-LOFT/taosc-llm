@@ -1,4 +1,4 @@
-"""Settled Pi rounds, isolated family builds and actual host evaluation feedback."""
+"""Settled Pi rounds, cached predicate publication and actual host evaluation feedback."""
 import asyncio
 import hashlib
 import os
@@ -12,7 +12,7 @@ from .context import SynthesisContext, canonical, prepare_context
 from .poc import poc_observation
 from .presentation import feedback as predicate_feedback
 from .provider import ProviderConfig, load_provider
-from .publication import build_candidate
+from .publication import publish_candidate
 
 
 def write_record(path: Path, value: object) -> None:
@@ -247,20 +247,20 @@ async def synthesize_context(context: SynthesisContext, provider: ProviderConfig
                                           termination="abstained")
                         round_result["status"] = "abstained"
                     else:
-                        candidate = run_dir / "candidates" / str(index + 1) / "build-workdir"
+                        candidate_dir = run_dir / "candidates" / str(index + 1)
                         try:
-                            build = await build_candidate(current.dataset, proposal['predicate'], candidate)
+                            candidate = await _blocking(publish_candidate, current.dataset, proposal['predicate'])
                         except (ValueError, RuntimeError, OSError) as error:
-                            round_result.update(status="build_failed", reason=str(error))
+                            round_result.update(status="publication_failed", reason=str(error))
                             raise
-                        round_result["build"] = build
-                        write_record(candidate.parent / "build-result.json", build)
+                        round_result["candidate"] = candidate
+                        write_record(candidate_dir / "candidate.json", candidate)
                         from .evaluation import evaluate_dataset
                         evaluation = await _blocking(evaluate_dataset, current.dataset, proposal["predicate"],
                             workers=current.workers, execute=True,
                             cache_dir=current.cache_dir or current.run_dir / "cache",
                             replay_socket=current.replay_socket)
-                        write_record(candidate.parent / "evaluation.json", evaluation)
+                        write_record(candidate_dir / "evaluation.json", evaluation)
                         result_id = hashlib.sha256(canonical(evaluation)).hexdigest()
                         public_result_id = current.reference(result_id, kind="r")
                         prior_results[public_result_id] = evaluation
@@ -272,7 +272,8 @@ async def synthesize_context(context: SynthesisContext, provider: ProviderConfig
                         round_result["selection"] = selection
                         if selected:
                             incumbent = round_result
-                            result.update(build=build, evaluation=evaluation, proposal=proposal,
+                            result.update(candidate=candidate, publication_status="published",
+                                          evaluation=evaluation, proposal=proposal,
                                           objective=objective, quality=evaluation.get("quality"),
                                           selected_round=index + 1)
                 if not abstained:
@@ -353,7 +354,7 @@ async def synthesize_context(context: SynthesisContext, provider: ProviderConfig
 
 def generate_manual(dataset: Path, predicate: str, *, execution_workers=1, output: Path | None = None,
                     replay_socket: Path | None = None, cache_dir: Path | None = None) -> dict:
-    """Build and evaluate a host-provided family predicate without any model call."""
+    """Publish and evaluate a host-provided predicate on the frozen cached runtime."""
     _check_output(output)
     from .family import parse_candidate
     context = prepare_context(dataset, run_dir=output, workers=execution_workers,
@@ -372,7 +373,9 @@ def generate_manual(dataset: Path, predicate: str, *, execution_workers=1, outpu
         write_record(run_dir / "context.json", context.projection)
         try:
             await _blocking(_check_replay, context)
-            result["build"] = await build_candidate(context.dataset, parsed.expression, run_dir / "build-workdir")
+            result["candidate"] = await _blocking(publish_candidate, context.dataset, parsed.expression)
+            result["publication_status"] = "published"
+            write_record(run_dir / "candidate.json", result["candidate"])
             result["evaluation"] = await _blocking(evaluate_dataset, context.dataset, parsed.expression,
                 workers=context.workers, execute=True,
                 cache_dir=context.cache_dir or context.run_dir / "cache",
