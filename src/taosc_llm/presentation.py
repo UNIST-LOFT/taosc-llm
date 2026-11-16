@@ -186,8 +186,8 @@ def feedback(dataset, evaluation):
     """
     records = case_records(dataset, evaluation)
     case_sets = selection_case_sets(evaluation)
-    groups = {key: [] for key in ('crash_regressions', 'other_crashes', 'unavailable',
-                                  'baseline_gaps', 'unproven')}
+    groups = {key: [] for key in ('crash_regressions', 'other_crashes', 'same_branch_other_crashes',
+                                  'unavailable', 'baseline_gaps', 'unproven')}
     for record in records:
         quality = record['report'].get('quality') or classify_quality(record['report'])
         for facet in quality['facets']:

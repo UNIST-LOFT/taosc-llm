@@ -10,6 +10,8 @@ import sbsv
 from binradar import binradar_feedback
 from binradar.binradar_verifier import CONCRETE_ORACLE
 
+from .collection_metrics import normal_branch_comparison
+
 
 _OUTCOMES = ('target_crash', 'normal', 'other_crash', 'unknown')
 _ACTIVATIONS = ('fired', 'not_fired', 'zero_hits', 'trapped', 'unknown')
@@ -324,7 +326,8 @@ def _offline_prediction(dataset, evaluated, metadata):
 
 
 _QUALITY_COUNTS = ('improved', 'preserved_normal', 'target_misses', 'crash_regressions',
-                   'branch_regressions', 'other_crashes', 'unavailable', 'baseline_gaps', 'unproven')
+                   'branch_regressions', 'other_crashes', 'same_branch_other_crashes',
+                   'unavailable', 'baseline_gaps', 'unproven')
 
 
 def classify_quality(report):
@@ -365,9 +368,16 @@ def classify_quality(report):
             reasons.append('original-neutral-disagreement')
     if baseline_gap:
         facets.append('baseline_gaps')
-    crash_regression = compatible and baseline == 'normal' and outcome in ('target_crash', 'other_crash')
-    branch_regression = (compatible and baseline == outcome == 'normal' and actual
-                         and actual_comparison and comparison.get('status') == 'different')
+    branch_status = normal_branch_comparison(report)
+    branch_regression = branch_status == 'different'
+    crash_regression = (compatible and baseline == 'normal'
+                        and (outcome == 'target_crash'
+                             or outcome == 'other_crash' and branch_regression))
+    if outcome == 'other_crash' and branch_status == 'equal':
+        facets.append('same_branch_other_crashes')
+        reasons.append('normal-other-crash-with-equal-branches')
+    elif compatible and baseline == 'normal' and outcome == 'other_crash' and branch_status == 'unavailable':
+        reasons.append('normal-other-crash-branch-comparison-unavailable')
     if crash_regression:
         facets.append('crash_regressions')
         reasons.append('neutral-normal-to-candidate-crash')
@@ -416,9 +426,9 @@ def summarize_quality(reports):
     qualities = [report.get('quality') or classify_quality(report) for report in reports]
     counts = {'total': len(qualities), **{key: sum(key in quality['facets'] for quality in qualities)
                                         for key in _QUALITY_COUNTS}}
-    status = ('rejected' if counts['target_misses'] or counts['crash_regressions'] or counts['other_crashes'] else
+    status = ('rejected' if counts['target_misses'] or counts['crash_regressions'] else
               'incomplete' if counts['unavailable'] or counts['baseline_gaps'] or not qualities else
-              'unproven' if counts['unproven'] or not counts['improved'] else
+              'unproven' if counts['unproven'] or counts['other_crashes'] or not counts['improved'] else
               'improved_with_regressions' if counts['branch_regressions'] else 'improved')
     reasons = sorted({reason for quality in qualities for reason in quality['reasons']})
     if not qualities:
@@ -512,6 +522,12 @@ def _project_case(dataset, case, evaluated, *, metadata=None, descriptor=None):
                            'fired_and_target_to_normal': activation['status'] == 'fired' and neutral_transition == 'target_crash->normal'},
             'warnings': warnings, 'mutation': _mutation(dataset, case),
             'evidence_source': candidate['evidence_source']}
+    if neutral_compatible and neutral['outcome'] == 'normal' and candidate['outcome'] == 'other_crash':
+        branch_status = normal_branch_comparison(report)
+        report['diagnostic'] = {'kind': 'normal-to-other-crash', 'branches': branch_status}
+        warnings.append({'equal': 'normal_other_crash_same_branches',
+                         'different': 'normal_other_crash_branch_regression',
+                         'unavailable': 'normal_other_crash_branch_unavailable'}[branch_status])
     report['quality'] = classify_quality(report)
     return report
 

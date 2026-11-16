@@ -252,6 +252,77 @@ def test_silent_preload_failure_is_not_an_observation(tmp_path, monkeypatch, ori
             execution.execute_capture(dataset, case, 'p0', tmp_path / 'owned')
 
 
+@pytest.mark.parametrize('original', [False, True])
+@pytest.mark.parametrize('failure', ['deadline', 'probe-timeout', 'infrastructure', 'missing-probe'])
+def test_target_timeouts_preserve_reason_without_admitting_partial_capture(
+        tmp_path, monkeypatch, original, failure):
+    dataset = FixtureDataset(tmp_path)
+    case = {'input_path': 'input', 'input_sha256': execution.sha256(tmp_path / 'input')}
+    class Runner:
+        def __init__(self, directory, binary, test_cmd, patch_loc, metadata, kind, stack, timeout):
+            self.dir = directory
+            self.brcache_stack_size = stack
+        def load_instruction_map(self, binary):
+            pass
+        def e9_metadata_for_binary(self, binary):
+            return '', []
+        def _test_with_capture(self, *args, **kwargs):
+            self.run_results = SimpleNamespace(success=failure != 'infrastructure',
+                                               timed_out=failure == 'deadline')
+            probe = (None if failure in ('deadline', 'missing-probe') else
+                     SimpleNamespace(exit_info='timeout' if failure == 'probe-timeout' else 'ok'))
+            return probe, b'partial patch', b'partial BRCH'
+    monkeypatch.setattr(execution.verifier.BinRadarQemuRunner, 'from_env',
+                        lambda directory, environment: SimpleNamespace(
+                            dir=directory, binary='fixture', test_cmd='@@', patch_loc='0x10',
+                            e9_metadata={}, patch_kind='generic-erm', brcache_stack_size=0, exec_timeout=5))
+    monkeypatch.setattr(execution, '_PrivateRunner', Runner)
+    expected = 'timeout' if failure in ('deadline', 'probe-timeout') else 'execution-unavailable'
+    with pytest.raises(execution.ExecutionUnavailable, match=f'^{expected}$'):
+        if original:
+            execution.execute_original(dataset, case, tmp_path / 'owned')
+        else:
+            execution.execute_capture(dataset, case, 'p0', tmp_path / 'owned')
+    assert list((tmp_path / 'owned').iterdir()) == []
+
+
+@pytest.mark.parametrize('reason', ['timeout', 'unsupported-external-state',
+                                    'qasan-library-unavailable', 'execution-unavailable'])
+def test_host_evaluation_preserves_ignored_reason_without_success_or_cache(
+        tmp_path, monkeypatch, reason):
+    from taosc_llm import evaluation
+    from test_evaluation import Dataset
+    dataset = Dataset(tmp_path)
+    monkeypatch.setattr(evaluation, 'execution_identity', lambda: {'fixture': True})
+    def unavailable(*args):
+        raise execution.ExecutionUnavailable(reason)
+    monkeypatch.setattr(evaluation, 'execute_capture', unavailable)
+    cache = tmp_path / 'cache'
+    result = evaluation.evaluate_dataset(dataset, '0', include_poc=False, cache_dir=cache)
+    row = result['cases'][0]
+    assert row['reason'] == row['neutral_baseline']['reason'] == reason
+    assert row['status'] == row['neutral_baseline']['status'] == 'unavailable'
+    assert row.get('ignored', False) == (reason in ('timeout', 'unsupported-external-state'))
+    assert row.get('capture') is None and row['branches'] is None and row.get('outcome') is None
+    assert row['report']['candidate']['outcome'] == 'unknown'
+    assert row['report']['neutral_baseline']['outcome'] == 'unknown'
+    assert result['quality']['counts']['improved'] == 0
+    assert not list(cache.rglob('*.representatives.json'))
+    assert not list(cache.rglob('*.brch'))
+
+
+def test_unexpected_execution_contract_error_is_not_ignored_timeout(tmp_path, monkeypatch):
+    from taosc_llm import evaluation
+    from test_evaluation import Dataset
+    dataset = Dataset(tmp_path)
+    monkeypatch.setattr(evaluation, 'execution_identity', lambda: {'fixture': True})
+    def broken(*args):
+        raise RuntimeError('broken execution contract')
+    monkeypatch.setattr(evaluation, 'execute_capture', broken)
+    with pytest.raises(RuntimeError, match='broken execution contract'):
+        evaluation.evaluate_dataset(dataset, '0', include_poc=False, cache_dir=tmp_path / 'cache')
+
+
 @pytest.mark.parametrize('destination', [0, 0x20])
 def test_pie_candidate_capability_is_explicit_not_false_execution(tmp_path, destination):
     dataset = FixtureDataset(tmp_path)

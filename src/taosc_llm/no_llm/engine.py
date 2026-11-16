@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 
+from ..collection_metrics import compare_selection, selection_objective
 from ..dataset import canonical
 from ..family import parse_candidate
 from .model import SearchStopped
@@ -74,22 +75,28 @@ class SearchEngine:
             self._scores[canonical(branch["evaluation"])] = score
             self._validate_branch(branch, evaluated, score)
         self.best_score = self.score
-        saved = self.state["best_result"]
-        if saved is not None:
-            evaluated = backend.load(saved["evaluation"])
-            self.best_score = Score.from_evaluation(self.population, evaluated)
-            self._validate_incumbent(saved["clauses"], evaluated, self.best_score)
-            self._scores[canonical(saved["evaluation"])] = self.best_score
-        else:
-            self.state["best_result"] = {"clauses": [], "evaluation": backend.baseline_ref}
+        self.best_evaluation = self.baseline
+        self.best_sets = None
+        if self.state["best_result"] is not None:
+            self._authenticate_best()
+
+    def _validate_archive(self, saved, evaluated, score):
+        """Bind an evaluated program independently of optional search proofs."""
+        program = tuple(tuple(row) for row in saved["program"])
+        expression = self.space.expression(program)
+        expected = parse_candidate(self.family, expression)
+        if (evaluated["predicate"] != expected.expression
+                or evaluated["descriptor"] != expected.descriptor
+                or saved["predicate"] != expected.expression):
+            raise ValueError("checkpoint archive expression/evidence mismatch")
+        if saved["clauses"]:
+            if _clauses(saved["clauses"]) != program:
+                raise ValueError("checkpoint archive proof program mismatch")
+            self._validate_incumbent(saved["clauses"], evaluated, score)
 
     def _validate_incumbent(self, clauses, current, score):
         """A durable checkpoint is not itself proof of ownership or execution."""
         self.space.expression(_clauses(clauses))
-        if not self.population.normals <= score.known_normals:
-            raise ValueError("checkpoint lost required normal observations")
-        if score.target_failures & self.population.normals:
-            raise ValueError("checkpoint introduced a normal crash")
         required = set()
         ids = set()
         for clause in clauses:
@@ -114,9 +121,7 @@ class SearchEngine:
             matches(introduced, prefix + (tuple(clause["introduced_factors"]),))
             before_score = Score.from_evaluation(self.population, before)
             introduction_score = Score.from_evaluation(self.population, introduced)
-            if (not self.population.normals <= before_score.known_normals
-                    or not self.population.normals <= introduction_score.known_normals
-                    or not (required - owners) <= before_score.covered
+            if (not (required - owners) <= before_score.covered
                     or not required <= introduction_score.covered
                     or new_owners(before_score, introduction_score) != owners):
                 raise ValueError("checkpoint introduction does not establish owners")
@@ -134,9 +139,8 @@ class SearchEngine:
                 if (not len(ids) <= len(refined_program) <= len(clauses)
                         or refined_program[len(ids) - 1] != tuple(clause["factors"])
                         or frozenset(refinement["required"]) != historical_owners
-                        or not historical_owners <= global_score.covered
-                        or not self.population.normals <= global_score.known_normals):
-                    raise ValueError("checkpoint refinement lost global owners or normal evidence")
+                        or not historical_owners <= global_score.covered):
+                    raise ValueError("checkpoint refinement lost global owners")
                 matches(local, prefix + (tuple(clause["factors"]),))
                 local_witnesses = self._witnesses(prefix, clause["factors"], local, owners)
                 if (not owners <= Score.from_evaluation(self.population, local).covered
@@ -175,6 +179,7 @@ class SearchEngine:
         score = Score.from_evaluation(self.population, result)
         reference = self.journal.store(result)
         self._scores[canonical(reference)] = score
+        self._archive(clauses, result, score, reference)
         # At most one entry per admitted descriptor (bounded by the evaluation
         # budget). Reusing an old outcome must not roll prediction state back to
         # that descriptor's earlier capture or restart an exhausted frontier.
@@ -355,24 +360,26 @@ class SearchEngine:
             witnesses = self._witnesses(prefix, best["factors"], candidate, owners) if owners else None
             if (candidate["descriptor"] != expected.descriptor or not owners
                     or owners != frozenset(best["owners"]) or not required <= after.covered
-                    or not self.population.normals <= after.known_normals
                     or witnesses is None or witnesses != best["witnesses"]):
                 raise ValueError("draft introduction does not establish owners")
 
-    def _result_rank(self, clauses, score):
-        program = _clauses(clauses)
-        return (len(self.population.crashes - score.covered), len(score.regressions),
-                _cost(program), compose(self.family, program) or "")
+    def _archive(self, program, result, score, reference):
+        after = score.selection
+        accepted, _ = compare_selection(self.best_sets, after)
+        if not accepted:
+            return
+        self.state["best_result"] = {
+            "program": [list(row) for row in program], "predicate": result["predicate"],
+            "clauses": [], "evaluation": reference}
+        self.best_score, self.best_evaluation, self.best_sets = score, result, after
 
-    def _remember_best(self, clauses, score, reference):
-        if (not self.population.normals <= score.known_normals
-                or score.target_failures & self.population.normals):
-            return
+    def _remember_proofs(self, clauses, reference):
+        """Attach established search proofs without changing observed selection."""
         saved = self.state["best_result"]
-        if saved is not None and self._result_rank(clauses, score) >= self._result_rank(saved["clauses"], self.best_score):
-            return
-        self.state["best_result"] = {"clauses": copy.deepcopy(clauses), "evaluation": reference}
-        self.best_score = score
+        if (saved is not None and saved["evaluation"] == reference
+                and tuple(tuple(row) for row in saved["program"]) == _clauses(clauses)
+                and not saved["clauses"]):
+            saved["clauses"] = copy.deepcopy(clauses)
 
     def _branch_score(self, branch):
         key = canonical(branch["evaluation"])
@@ -468,9 +475,7 @@ class SearchEngine:
         owners = new_owners(self.score, score)
         if (current["descriptor"] != expected.descriptor or not owners
                 or owners != frozenset(best["owners"])
-                or not self._required() <= score.covered
-                or not self.score.known_normals <= score.known_normals
-                or score.target_failures & self.population.normals):
+                or not self._required() <= score.covered):
             raise ValueError("draft introduction does not establish owners")
         witnesses = self._witnesses(prefix, best["factors"], current, owners)
         if witnesses is None or witnesses != best["witnesses"]:
@@ -484,7 +489,7 @@ class SearchEngine:
         self.state["evaluation"] = best["evaluation"]
         self.current = current
         self.score = score
-        self._remember_best(self.state["clauses"], score, best["evaluation"])
+        self._remember_proofs(self.state["clauses"], best["evaluation"])
         self.state.update(draft=None, blocked=[], phase="cover", exhausted_revision=None,
                           revision=self.state["revision"] + 1)
         self.state["visited_branches"][self._branch_key(self.state)] = self.state["prediction_revision"]
@@ -505,7 +510,7 @@ class SearchEngine:
         self.state["evaluation"] = reference
         self.current = result
         self.score = Score.from_evaluation(self.population, result)
-        self._remember_best(self.state["clauses"], self.score, reference)
+        self._remember_proofs(self.state["clauses"], reference)
         self.state.update(draft=None, refine_progress=True, revision=self.state["revision"] + 1)
         self.state["visited_branches"][self._branch_key(self.state)] = self.state["prediction_revision"]
         self._save(commit="refine")
@@ -535,9 +540,7 @@ class SearchEngine:
             if tested is not None:
                 score, result, reference = tested
                 owners = new_owners(self.score, score)
-                if (owners and self._required() <= score.covered
-                        and self.population.normals <= score.known_normals
-                        and not (score.target_failures & self.population.normals)):
+                if owners and self._required() <= score.covered:
                     witnesses = self._witnesses(program, factors, result, owners)
                     if witnesses is not None:
                         rank = (len(score.regressions), -len(owners), _cost((tuple(factors),)), tuple(factors))
@@ -547,7 +550,7 @@ class SearchEngine:
                                      "evaluation": reference, "owners": sorted(owners),
                                      "witnesses": witnesses}
                         records = self.state["clauses"] + [self._introduction_record(candidate)]
-                        self._remember_best(records, score, reference)
+                        self._remember_proofs(records, reference)
                         if old_rank is None or rank < old_rank:
                             draft["best"] = candidate
                         # Consume this operation before forking. Its continuation
@@ -577,11 +580,9 @@ class SearchEngine:
                 tested = self._run(tuple(modified)) if witnesses is not None else None
                 if tested is not None:
                     score, result, reference = tested
-                    if (preserves(frozenset(clause["owners"]), local[0], self._required(), score)
-                            and self.population.normals <= score.known_normals
-                            and not score.target_failures & self.population.normals):
+                    if preserves(frozenset(clause["owners"]), local[0], self._required(), score):
                         records = self._refined_records(draft, factors, reference, local[2], witnesses)
-                        self._remember_best(records, score, reference)
+                        self._remember_proofs(records, reference)
                         if improves(self.score, score, old_cost=_cost(program), new_cost=_cost(modified)):
                             draft["seen"].append(list(factors))
                             draft["offset"] += 1
@@ -616,11 +617,15 @@ class SearchEngine:
 
     def _authenticate_best(self):
         saved = self.state["best_result"]
+        if saved is None:
+            return
         evaluated = self.backend.load(saved["evaluation"])
         score = Score.from_evaluation(self.population, evaluated)
-        self._validate_incumbent(saved["clauses"], evaluated, score)
+        self._validate_archive(saved, evaluated, score)
         self.backend.check_operation()
-        self.best_score = score
+        self.best_score, self.best_evaluation = score, evaluated
+        self.best_sets = score.selection
+        self._scores[canonical(saved["evaluation"])] = score
 
     def _exhaustion_reason(self):
         score = self.best_score
@@ -693,17 +698,22 @@ class SearchEngine:
         return self.result()
 
     def result(self, *, interrupted=False):
-        if interrupted or self.state["termination"] == "interrupted":
-            selected, score = self.state, self.score
+        if (interrupted or self.state["termination"] == "interrupted"
+                or self.state["best_result"] is None):
+            selected, score, evaluated = self.state, self.score, self.current
+            program = _clauses(selected["clauses"])
+            predicate = compose(self.family, program) if program else None
         else:
-            selected, score = self.state["best_result"], self.best_score
-        clauses = _clauses(selected["clauses"])
+            selected, score, evaluated = self.state["best_result"], self.best_score, self.best_evaluation
+            program = tuple(tuple(row) for row in selected["program"])
+            predicate = selected["predicate"]
         return {"schema_version": 1, "engine": "taosc-llm-no-llm",
                 "dataset_id": self.backend.dataset.dataset_id,
                 "termination": self.state["termination"], "verified": False,
                 "binradar_verification": "not_run", "run_directory": str(self.journal.directory),
-                "predicate": compose(self.family, clauses) if clauses else None,
+                "predicate": predicate, "program": [list(row) for row in program],
                 "clauses": copy.deepcopy(selected["clauses"]), "population": self.population.to_dict(),
                 "evaluation": selected["evaluation"], "score": score.summary(self.population),
+                "objective": selection_objective(evaluated if predicate is not None else None),
                 "budgets": {"elapsed": self.backend.elapsed, "evaluations": self.backend.evaluations},
                 "limits": self.limits.to_dict()}

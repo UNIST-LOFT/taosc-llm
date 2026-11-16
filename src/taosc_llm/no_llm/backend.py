@@ -18,7 +18,7 @@ def session_identity(dataset: PreparedDataset, limits: SearchLimits, *, workers:
     sources = Path(__file__).parent
     implementation = sorted(sources.glob("*.py")) + [sources.parent / name for name in (
         "dataset.py", "evaluation.py", "evidence.py", "family.py", "poc.py", "replay.py",
-        "publication.py", "native.py")]
+        "publication.py", "native.py", "collection_metrics.py")]
     return {"schema_version": 1, "engine": "taosc-llm-no-llm",
             "dataset_id": dataset.dataset_id, "manifest": dataset.manifest,
             "environment": dataset.execution_environment(), "runtime": execution_identity(),
@@ -105,8 +105,8 @@ class Backend:
         """Authenticate saved evidence even when finalization exhausted time.
 
         This permits no new evaluation admission and never replenishes a budget.
-        The engine may re-gate and commit an already fully evaluated draft at a
-        budget boundary. Cancellation and complete capture validation still apply.
+        No working draft is promoted. Cancellation and complete capture
+        validation still apply.
         """
         previous = self._restoring
         self._restoring = self.baseline_ref is not None
@@ -171,9 +171,28 @@ class Backend:
         return preserved
 
     def _validate_result(self, dataset, result):
-        """Retain all actual, representative and offline full-vector mirrors."""
+        """Authenticate predicate/report binding and every full-vector mirror."""
+        from ..evidence import _project_case
+        from ..poc import poc_case
+        descriptor = result["descriptor"]
+        if (result["dataset_id"] != dataset.dataset_id
+                or (descriptor == "p0" and result["predicate"] is not None)
+                or (descriptor != "p0" and parse_candidate(dataset.patch_format, result["predicate"]).descriptor != descriptor)):
+            raise ValueError("journal evaluation identity mismatch")
+        metadata = evaluation._capture_metadata(dataset)
+        poc = poc_case(dataset)
+        seen = set()
         for item in result["cases"]:
             self.check_operation()
+            identifier = item["case_id"]
+            if identifier in seen or item["descriptor"] != descriptor:
+                raise ValueError("journal case predicate identity mismatch")
+            seen.add(identifier)
+            case = poc if poc is not None and identifier == poc["id"] else dataset.case(identifier)
+            if "original_observation" in item:
+                case = {**case, "observation": item["original_observation"]["outcome"]}
+            if item["report"] != _project_case(dataset, case, item, metadata=metadata, descriptor=descriptor):
+                raise ValueError("journal case report mismatch")
             for record in (item, item.get("neutral_baseline", {})):
                 capture = record.get("capture")
                 if capture and capture.get("complete") is True:
@@ -259,18 +278,13 @@ class Backend:
         if candidate.descriptor in self.result_refs:
             return self.load(self.result_refs[candidate.descriptor])
         self.check()
-        ids = sorted(self.population.active) if self.population is not None else None
         with self.dataset.validation(check=self.check_operation) as dataset:
             if self.socket is not None:
                 self._connect_policy()
             self.admit_evaluation()
-            from ..poc import poc_case
-            poc = poc_case(dataset)
-            include_poc = poc is not None and (ids is None or poc["id"] in ids)
             result = evaluation._evaluate(dataset, candidate, candidate.descriptor,
-                                          case_ids=ids, workers=self.workers, execute=True,
+                                          case_ids=None, workers=self.workers, execute=True,
                                           cache_dir=self.cache_dir, replay_socket=self.socket,
-                                          include_poc=include_poc,
                                           operation_check=self.check_operation)
             result = self._preserve(result, dataset)
             reference = self.journal.store(result)

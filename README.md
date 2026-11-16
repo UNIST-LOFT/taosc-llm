@@ -158,8 +158,14 @@ uv run --project utils/taosc-llm taosc-llm \
   endpoint; the CLI rejects `--offline` combined with `--replay-socket`.
 - Per-case target-oracle diagnostics keep the existing vocabulary: `target-crash` (the artifact's
   committed attempt-1 oracle) is `reject_same_crash`; `normal` and `other-crash`
-  are `not_rejected`; cancellation, timeout, trap, unsupported external state and
-  incomplete observation are `unavailable`. Every result keeps
+  are `not_rejected`; cancellation, trap and incomplete observation are `unavailable`.
+  Native `ignored` is reserved for unsupported-external-state and child timeout:
+  host evidence stays unavailable with `ignored:true` and the original reason,
+  excluded from scores without claiming repair. Terminal replay counts separate
+  `ignored` from `unavailable`; either means partial coverage. Python and tracer
+  require resident protocol `0x41464C08` together (ordinary v5 is unchanged).
+  Nonretained function cases remain offline even with a live bridge, so offline
+  branch-divergence remains possible. Every result keeps
   `verified=false`; nothing is FINAL verification.
 - `busy` is retried within a bounded admission window so a debugging CLI
   evaluation can finish first. Any other protocol error aborts the batch.
@@ -231,12 +237,20 @@ output=..., limits=SearchLimits(...), execution_workers=..., cache_dir=...,
 replay_socket=..., resume=...)`; `SearchEngine` accepts the host execution backend,
 not CLI arguments or a model session.
 
-The objective is **case-level branch selection**, separate from existing model
-feedback. A reached normal case selecting repair is a regression even if it
-exits normally. A target case is covered only with a compatible target-crashing
-neutral control, an actual normal candidate outcome and a complete vector with
-repair selected. Other-location crashes, traps, unknown/missing observations and
-normal-without-repair supply no coverage. Original/neutral outcome or reachability
+Final selection shares provider mode's **target-first, branch-second objective**
+and `collection_metrics.compare_selection`, over the full evaluated dataset.
+Compare target counts only on shared known outcomes, then branch differences on
+shared authenticated comparable vectors; ties retain the incumbent. There is no
+all-normal-evidence veto or expression-cost tiebreak. Unsupported external state
+and timeout are skipped, never successful repairs. Normal→other-crash uses the
+same whole ordered vector comparison as normal→normal: different is a regression,
+equal is diagnostic, unavailable is neither.
+
+Search-internal clause coverage remains stricter than the final observed objective:
+a target case is covered only with a compatible target-crashing neutral control,
+an actual normal candidate outcome and a complete vector with repair selected.
+Other-location crashes, traps, unknown/missing observations and normal-without-repair
+supply no ownership proof. Original/neutral outcome or reachability
 disagreement remains a baseline gap, not an excluded target. A POC absent from
 the producer inventory receives separate original and neutral observations.
 Known baseline no-hit cases are excluded; missing captures are never zero hits.
@@ -255,16 +269,16 @@ states preserve caches; only genuine new evidence reopens exhausted work.
 Each branch keeps immutable clause-introduction owners, prefix evaluations and
 decisive-hit witnesses. Refinement preserves both local obligations without later
 clauses and that branch’s global owners; selecting a different branch never
-transfers ownership. Losing normal evidence or crashing an admitted normal is
-not an improvement.
+transfers ownership. Losing evidence alone cannot improve final selection, but
+unrelated gaps cannot veto a supported improvement.
 
-An independent best-result archive ranks eligible, actually evaluated programs
-by unresolved target count, then branch regression count, expression cost and
-stable expression. This retains better partial repairs as well as full repairs,
-even if the working branch has fewer regressions. The archive does not force an
-always-repair seed to own every target in the exploratory branches. Normal/budget
-termination reauthenticates the selected program’s evaluation and ownership
-proofs without new execution or overwriting the working frontier. Artifact
+An independent best-result archive uses the common final comparator, without
+requiring clause owners. The first actually evaluated nonneutral program can be
+selected, including a generic constant-1 seed with no owners; no candidate is
+invented for an unsupported grammar. The archive persists its exact program,
+expression and evaluation separately from working-branch metadata. Normal/budget
+termination reauthenticates that evidence without new execution or overwriting the
+working frontier; ownership proofs remain required only for branch commits. Artifact
 publication binds that selected predicate to the evaluated cached artifact, not a newly linked binary.
 Cancellation never promotes a draft.
 
@@ -286,12 +300,14 @@ admission and persists across interruption. In-flight evaluation drains under
 existing per-execution limits. Finalization is separate from search admission,
 remains cancellable under native limits, and may finish after the search deadline;
 it does not reset spent search time. A time/evaluation-budget stop selects the
-already evaluated best-result archive after reauthenticating its evidence, owners
-and marginal witnesses; it does not commit a draft or admit new evaluation.
+already evaluated best-result archive after reauthenticating its exact program
+and evaluation; it does not commit a working draft or admit new evaluation.
 Cancellation never promotes a draft; positive branch regressions remain visible. Search stop reasons
 distinguish goals, budgets, bounded exhaustion,
 interruption and evidence gaps; no global optimum or out-of-corpus repair is
-claimed. `coverage=complete` means complete observations, not all targets repaired.
+claimed. `coverage` retains the admitted search population's evidence-completeness
+diagnostic, not all-target repair or full-dataset completeness. Read the full-dataset
+known/unknown and comparable denominators from the shared `objective`.
 
 The output is a private, single-writer schema-1 session: immutable `identity.json`,
 `segments/*.jsonl`, content-addressed `payloads/` and private `cache/`. The published
@@ -326,7 +342,9 @@ fail the changed implementation identity; start a fresh result directory.
 
 Exit status: **0** for every completed search outcome, including remaining
 crashes/regressions, no candidate, exhausted budget/grammar and partial evidence; **130** interrupted; **1** input/storage/engine/publication failure.
-Invalid CLI usage remains nonzero. Judge repair from `score`, `termination`,
+Invalid CLI usage remains nonzero. `objective` is the same collector projection
+used by provider mode; `score` also retains search coverage/ownership diagnostics.
+Judge observed results from `objective`, `score`, `termination`,
 `coverage`, `publication_status` and the artifacts, never process exit alone.
 Acceptance and remaining representative-corpus/live-replay gates are recorded in
 the [implementation record](../../agent-docs/taosc-llm/memo/patch-synthesizer/README.md).
@@ -384,9 +402,13 @@ oracle. See [POC evidence](../../agent-docs/taosc-llm/PROMPTS_AND_EVIDENCE.md#or
 Candidate proposals require evaluation of the exact expression. Context and
 `list_cases` show at most three crash/three normal examples. Feedback's authoritative
 `objective` reports observed designated-target crashes first, then authenticated
-normal→normal complete-vector branch regressions, with system/function denominators.
-Other crashes, observation/control gaps and legacy strict quality are separate
-`diagnostics`, never rejection criteria or selection tiebreakers. Target→other crash
+normal-control→normal/other-crash complete-vector branch regressions, with
+system/function denominators. Equal-vector normal→other-crash is diagnostic only;
+different vectors count as regression errors. Private `cases[].report.diagnostic`
+and warnings preserve equal/different/unavailable comparisons for later analysis.
+Other crashes without a branch regression, observation/control gaps and legacy
+strict quality are separate `diagnostics`, never additional rejection criteria or
+selection tiebreakers. Target→other crash
 removes the designated target; it is not evidence of general functional correctness.
 Failure groups have counts and at most three examples; optional scoped filters
 retrieve more. Hashes and private paths stay host-only. Static `function` views
@@ -647,9 +669,10 @@ experiment discovery and does not select a new candidate.
 
 ### Independent result axes
 
-Collection deliberately does **not** use the producer's stricter `quality` or
-no-LLM `score` to classify a patch. Its primary objective is **only the designated
-target crash**, not eliminating every other crash or proving complete evidence.
+Collection recomputes the same observed `objective` used by provider and no-LLM
+final selection, rather than trusting saved `quality` or search ownership `score`.
+`target_status` describes **only the designated target crash**; branch regressions
+and observation gaps remain separate axes, not a claim of complete repair.
 
 | `target_status` | Meaning |
 |---|---|
@@ -661,15 +684,17 @@ target crash**, not eliminating every other crash or proving complete evidence.
 These labels describe the **observed cohort**, not universal repair or causal
 attribution. Unknown cases do not turn `target_absent` into an incomplete patch,
 but remain explicitly counted. Baseline gaps, other crashes and branch differences
-never reject a patch in this collector. Existing synthesis/selection algorithms,
-model feedback, stored strict quality and exit policies are unchanged.
+do not change `target_status`. Branch differences still count in the shared
+selection objective. Collection never reranks saved candidates or rewrites reports;
+historical outputs retain their original selection policy.
 
 | Axis | Important fields / interpretation |
 |---|---|
 | Target outcomes | `candidate_known`, `candidate_unknown`, `candidate_target_crashes`; `candidate_other_crashes` is informational only. |
 | Target transitions | `target_baselines = target_fixed + target_remaining + target_unobserved`. System cases use the applicable original; function cases use the neutral when the original is inapplicable. Unknown originals never borrow neutral outcomes. Target→normal **or other crash** counts as `target_fixed`, even with a known original/neutral mismatch; this is an observed transition, not proof that the predicate caused it. |
-| Regression | `branch_regressions / branch_comparable` counts authenticated normal→normal complete-vector differences. `new_target_failures` compares compatible neutral-normal→candidate-target, not an instrumentation-induced original/neutral change. No other-crash penalty or automatic cross-run ranking is added. |
-| Comparison limits | `branch_comparison_unavailable` is all cases outside that normal→normal denominator, including inapplicable transitions. It is not a count of crashing cases. `candidate_capture_incomplete` can coexist with a known normal/crash outcome. |
+| Regression | `branch_regressions / branch_comparable` counts authenticated complete-vector differences from normal controls to normal or other-crash candidates. `new_target_failures` compares compatible neutral-normal→candidate-target, not an instrumentation-induced original/neutral change. No unconditional other-crash penalty or automatic cross-run ranking is added. |
+| Comparison limits | `branch_comparison_unavailable` is all cases outside that denominator, including inapplicable transitions. `candidate_capture_incomplete` can coexist with a known normal/crash outcome. `same_branch_other_crashes` and `other_crash_branch_unavailable` separate equal-vector normal→other crashes from uncomparable ones. |
+| Ignored observations | `candidate_ignored` counts unknown outcomes with reason `unsupported-external-state` or `timeout`; they remain visible in `candidate_unknown`, never known outcomes, penalties or successful repairs. |
 | Baseline diagnostics | `baseline_gaps` records unavailable/incompatible source/control/oracle evidence; known original/neutral disagreements are separately `original_neutral_mismatches`. Neither vetoes observed target transitions or an independently valid neutral branch comparison. These are recomputed diagnostics, not copies of the legacy quality facets. |
 | Execution / storage | `lifecycle`, `exit_code`, `run_error` describe the producer. `collection_status`/`collection_error` describe reading its results. `legacy_quality`, publication and verification fields remain separately visible. |
 
@@ -961,6 +986,13 @@ npm --prefix utils/taosc-llm/thirdparty/pi ci --ignore-scripts --no-audit --no-f
 uv run --project utils/taosc-llm taosc-llm-fixture \
   --directory /tmp/taosc-llm-example --rea /path/to/rea
 ```
+
+Pass the installed REA executable, not a mise shim: resolve it with
+`(cd utils/taosc-llm && mise which rea)`. Analysis launches from private scratch
+with a restricted environment; the shim can exit before the MCP handshake
+(`REA exited with 1; native cleanup was not confirmed`). An explicit installed
+path completed setup in the harmless shared-policy smoke. If preparation stopped
+there, reuse the already generated workdir/concrete run and rerun only setup.
 
 The directory must not exist. Add `--provider-env /absolute/path/to/provider.env`
 and `--pi-sdk-root utils/taosc-llm/thirdparty/pi` to opt into a real model request

@@ -7,7 +7,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from .bridge import adapter_command, review_max_tokens, run_adapter
-from .collection_metrics import selection_case_sets, selection_objective
+from .collection_metrics import compare_selection, selection_case_sets, selection_objective
 from .context import SynthesisContext, canonical, prepare_context
 from .poc import poc_observation
 from .presentation import feedback as predicate_feedback
@@ -108,27 +108,9 @@ def _observed_minimum(objective: dict) -> bool:
 
 def _select_candidate(previous: dict | None, candidate: dict) -> tuple[bool, dict]:
     """Compare targets first, then branches, on shared observed support only."""
-    if previous is None:
-        return True, {"accepted": True, "reason": "first-evaluated-candidate"}
-    before = selection_case_sets(previous["evaluation"])
-    after = selection_case_sets(candidate["evaluation"])
-    known = before["known"] & after["known"]
-    comparable = before["branch_comparable"] & after["branch_comparable"]
-    targets = (len(before["target_crashes"] & known), len(after["target_crashes"] & known))
-    branches = (len(before["branch_regressions"] & comparable),
-                len(after["branch_regressions"] & comparable))
-    if targets[1] != targets[0]:
-        better = targets[1] < targets[0]
-        reason = "target-crashes-reduced" if better else "target-crashes-increased"
-    elif branches[1] != branches[0]:
-        better = branches[1] < branches[0]
-        reason = "branch-regressions-reduced" if better else "branch-regressions-increased"
-    else:
-        better, reason = False, "no-objective-improvement"
-    return better, {"accepted": better, "reason": reason, "comparison": {
-        "shared_known": len(known), "shared_branch_comparable": len(comparable),
-        "previous_target_crashes": targets[0], "candidate_target_crashes": targets[1],
-        "previous_branch_regressions": branches[0], "candidate_branch_regressions": branches[1]}}
+    return compare_selection(
+        selection_case_sets(previous["evaluation"]) if previous is not None else None,
+        selection_case_sets(candidate["evaluation"]))
 
 
 def _repeated_result(patch_format: str, previous: dict, current: dict) -> bool:

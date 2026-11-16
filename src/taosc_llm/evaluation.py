@@ -439,8 +439,11 @@ def _case_result(dataset, case, candidate, descriptor, execute, root, base_ident
                     'status': 'reject_same_crash' if same is True else ('not_rejected' if same is False else 'unavailable'),
                     'reason': 'same-crash' if same is True else ('observed-not-same-crash' if same is False else 'oracle-unavailable'),
                     'outcome': capture['outcome'], 'capture': capture}
-        except (OSError, ValueError, RuntimeError, KeyError) as error:
-            return {**base, 'reason': _reason(error)}
+        except (OSError, ValueError, ExecutionUnavailable, KeyError) as error:
+            reason = _reason(error)
+            return {**base, 'reason': reason,
+                    **({'ignored': True} if isinstance(error, ExecutionUnavailable)
+                       and reason in ('timeout', 'unsupported-external-state') else {})}
 
 
 def _replay_evaluate(dataset, candidate, *, case_ids, socket_path, operation_check=None):
@@ -519,6 +522,9 @@ def _evaluate(dataset, candidate, descriptor, *, case_ids, workers, execute, cac
     # A dataset with a mutation run can still retain zero useful cases.  The
     # bridge then has nothing to evaluate, and concrete cases take their normal
     # path instead of failing the whole candidate.
+    if replay_socket is not None and live_cases:
+        retained_ids = {case['id'] for case in replay.retained_cases(dataset)}
+        live_cases = [case for case in live_cases if case['id'] in retained_ids]
     use_replay = replay_socket is not None and bool(live_cases)
     cache_base = Path(cache_dir) if cache_dir is not None else Path.home() / '.cache' / 'taosc-llm'
     root = cache_base / 'evaluation-v2' / _digest(dataset.dataset_id)

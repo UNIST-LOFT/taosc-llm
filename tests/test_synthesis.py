@@ -553,6 +553,20 @@ def test_target_crash_can_move_between_cases_when_shared_target_count_improves()
     assert selected is True and comparison['reason'] == 'target-crashes-reduced'
 
 
+@pytest.mark.parametrize(('before_diff', 'after_diff', 'accepted', 'reason'), [
+    (False, True, False, 'branch-regressions-increased'),
+    (True, False, True, 'branch-regressions-reduced'),
+    (False, False, False, 'no-objective-improvement'),
+])
+def test_provider_selects_other_crashes_by_normal_control_branch_evidence(before_diff, after_diff, accepted, reason):
+    previous = quality_round(**{'branches' if before_diff else 'normals': ('n1',)})
+    candidate = quality_round(**{'branches' if after_diff else 'normals': ('n1',)})
+    candidate['evaluation']['cases'][0]['report']['candidate']['outcome'] = 'other_crash'
+    selected, comparison = synthesis._select_candidate(previous, candidate)
+    assert selected is accepted and comparison['reason'] == reason
+    assert comparison['comparison']['shared_branch_comparable'] == 1
+
+
 def test_target_count_drop_from_observation_loss_is_not_improvement():
     previous = quality_round(misses=('target',), branches=('n1',))
     candidate = quality_round(missing=('target', 'n1'))
@@ -653,7 +667,7 @@ def test_provider_retains_crash_repair_before_minimizing_residual_branches(
     ({"repaired": ("target",), "normals": ("normal",)}, "not_rejected", "improved"),
     ({"repaired": ("target",), "branches": ("normal",)}, "not_rejected", "improved_with_regressions"),
     ({"misses": ("target",)}, "reject_same_crash", "rejected"),
-    ({"others": ("other",)}, "not_rejected", "rejected"),
+    ({"others": ("other",)}, "not_rejected", "unproven"),
     ({"missing": ("target",)}, "unavailable", "incomplete"),
     ({"normals": ("normal",)}, "not_rejected", "unproven"),
     ({}, "unavailable", "incomplete"),

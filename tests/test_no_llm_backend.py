@@ -382,3 +382,45 @@ def test_preservation_interruption_never_publishes_evaluation(prepared, tmp_path
         assert not backend.result_refs
         assert not any(event["kind"] in ("baseline", "evaluation", "commit") for event in journal.events)
         assert len(list((journal.directory / "payloads").glob("*.brch"))) == 1
+
+
+def test_candidate_scoring_keeps_all_dataset_cases_outside_search_population(prepared, tmp_path, monkeypatch):
+    from taosc_llm.no_llm.score import Population
+
+    evaluate = evaluation._evaluate
+    calls = []
+
+    def offline(dataset, candidate, descriptor, **kwargs):
+        calls.append(kwargs["case_ids"])
+        kwargs["execute"] = False
+        return evaluate(dataset, candidate, descriptor, **kwargs)
+
+    monkeypatch.setattr(evaluation, "_evaluate", offline)
+    with Journal(tmp_path / "search", {"case": "global-support"}) as journal:
+        backend = Backend(prepared, journal, SearchLimits())
+        backend.population = Population({})
+        result = backend.evaluate("0")
+        assert calls == [None]
+        assert {row["case_id"] for row in result["cases"]} == {case["id"] for case in prepared.cases()}
+        reference = backend.result_refs[result["descriptor"]]
+        assert backend.load(reference) == result
+
+
+@pytest.mark.parametrize("corruption", ["dataset", "predicate", "case-descriptor", "report-outcome", "report-comparison"])
+def test_saved_evaluation_authenticates_predicate_report_binding(prepared, tmp_path, corruption):
+    result = offline_result(prepared, tmp_path / "cache")
+    if corruption == "dataset":
+        result["dataset_id"] = "different-dataset"
+    elif corruption == "predicate":
+        result["predicate"] = "1"
+    elif corruption == "case-descriptor":
+        result["cases"][0]["descriptor"] = parse_candidate(prepared.patch_format, "1").descriptor
+    elif corruption == "report-outcome":
+        candidate = result["cases"][0]["report"]["candidate"]
+        candidate["outcome"] = "normal" if candidate["outcome"] == "target_crash" else "target_crash"
+    else:
+        result["cases"][0]["report"]["branch_comparison"]["status"] = "different"
+    with Journal(tmp_path / "search", {"case": "report-binding", "corruption": corruption}) as journal:
+        backend = Backend(prepared, journal, SearchLimits())
+        with pytest.raises(ValueError):
+            backend.load(journal.store(result))

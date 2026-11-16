@@ -127,7 +127,10 @@ def _execute(dataset, case: dict, descriptor: str, directory: Path, *, original=
                 'libqasan.so' in line and 'cannot be preloaded' in line
                 for line in getattr(execution, 'stderr', '').splitlines()):
             raise ExecutionUnavailable('qasan-preload-unavailable')
-        if (execution is None or not execution.success or execution.timed_out
+        if ((execution is not None and execution.timed_out)
+                or (probe is not None and probe.exit_info == 'timeout')):
+            raise ExecutionUnavailable('timeout')
+        if (execution is None or not execution.success
                 or probe is None or probe.exit_info not in ('ok', 'crash')):
             raise ExecutionUnavailable('execution-unavailable')
         if original:

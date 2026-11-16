@@ -15,7 +15,8 @@ _FIELDS = (
     'target_baselines', 'target_fixed', 'target_remaining', 'target_unobserved',
     'branch_regressions', 'branch_comparable', 'branch_comparison_unavailable',
     'new_target_failures', 'baseline_gaps', 'original_neutral_mismatches',
-    'candidate_capture_incomplete', 'predicate_traps',
+    'candidate_capture_incomplete', 'predicate_traps', 'candidate_ignored',
+    'same_branch_other_crashes', 'other_crash_branch_unavailable',
 )
 METRIC_FIELDS: tuple[str, ...] = tuple(
     prefix + field for prefix in ('', 'system_', 'function_') for field in _FIELDS
@@ -110,7 +111,8 @@ def _branch_evidence(report: dict) -> tuple[bool, bool, bool, bool]:
     neutral_complete = _object(neutral, 'capture').get('status') in ('complete', 'zero_hits')
     comparison = _object(report, 'branch_comparison')
     comparable = (compatible and actual and neutral_complete
-                  and neutral.get('outcome') == candidate.get('outcome') == 'normal'
+                  and neutral.get('outcome') == 'normal'
+                  and candidate.get('outcome') in ('normal', 'other_crash')
                   and comparison.get('basis') == 'actual_complete_vectors'
                   and comparison.get('status') in ('equal', 'different'))
     return control_compatible, compatible, capture_complete, comparable
@@ -135,6 +137,35 @@ def selection_case_sets(evaluation: dict | None) -> dict[str, frozenset[str]]:
     return {key: frozenset(ids) for key, ids in result.items()}
 
 
+def compare_selection(before: dict[str, frozenset[str]] | None,
+                      after: dict[str, frozenset[str]]) -> tuple[bool, dict]:
+    """Compare observed targets, then branches, without rewarding evidence loss."""
+    if before is None:
+        return True, {'accepted': True, 'reason': 'first-evaluated-candidate'}
+    known = before['known'] & after['known']
+    comparable = before['branch_comparable'] & after['branch_comparable']
+    targets = (len(before['target_crashes'] & known), len(after['target_crashes'] & known))
+    branches = (len(before['branch_regressions'] & comparable),
+                len(after['branch_regressions'] & comparable))
+    if targets[1] != targets[0]:
+        better = targets[1] < targets[0]
+        reason = 'target-crashes-reduced' if better else 'target-crashes-increased'
+    elif branches[1] != branches[0]:
+        better = branches[1] < branches[0]
+        reason = 'branch-regressions-reduced' if better else 'branch-regressions-increased'
+    else:
+        better, reason = False, 'no-objective-improvement'
+    return better, {'accepted': better, 'reason': reason, 'comparison': {
+        'shared_known': len(known), 'shared_branch_comparable': len(comparable),
+        'previous_target_crashes': targets[0], 'candidate_target_crashes': targets[1],
+        'previous_branch_regressions': branches[0], 'candidate_branch_regressions': branches[1]}}
+
+
+def normal_branch_comparison(report: dict) -> str:
+    """Return the authenticated normal-control comparison, including other crashes."""
+    return report['branch_comparison']['status'] if _branch_evidence(report)[3] else 'unavailable'
+
+
 def _summarize(reports: list[tuple[str, dict]] | None, candidate_present: bool) -> dict:
     result = {field: None if reports is None else 0 for field in _FIELDS}
     result['target_status'] = 'not_observed' if candidate_present else 'no_candidate'
@@ -155,6 +186,8 @@ def _summarize(reports: list[tuple[str, dict]] | None, candidate_present: bool) 
         neutral_outcome = neutral.get('outcome', 'unknown')
         result['candidate_total'] += 1
         result['candidate_unknown' if outcome == 'unknown' else 'candidate_known'] += 1
+        if outcome == 'unknown' and candidate.get('reason') in ('unsupported-external-state', 'timeout'):
+            result['candidate_ignored'] += 1
         outcome_field = {'normal': 'candidate_normal', 'target_crash': 'candidate_target_crashes',
                          'other_crash': 'candidate_other_crashes'}.get(outcome)
         if outcome_field is not None:
@@ -173,6 +206,11 @@ def _summarize(reports: list[tuple[str, dict]] | None, candidate_present: bool) 
             result['branch_regressions'] += comparison['status'] == 'different'
         else:
             result['branch_comparison_unavailable'] += 1
+        if control_compatible and neutral_outcome == 'normal' and outcome == 'other_crash':
+            if comparable and comparison['status'] == 'equal':
+                result['same_branch_other_crashes'] += 1
+            elif not comparable:
+                result['other_crash_branch_unavailable'] += 1
         if not capture_complete:
             result['candidate_capture_incomplete'] += 1
         if activation == 'trapped':
@@ -214,8 +252,9 @@ def collect_metrics(evaluation: dict | None, *, candidate_present: bool) -> dict
 
     Target transitions use an applicable original, otherwise the neutral. Branch
     counts require matching artifact identities, a compatible neutral, complete
-    actual normal captures and the saved actual-vector comparison. Their
-    unavailable count is the complement of that denominator across all cases.
+    actual normal-control/candidate captures and the saved actual-vector
+    comparison, including normal-to-other-crash observations. Their unavailable
+    count is the complement of that denominator across all cases.
     ``candidate_capture_incomplete`` counts missing/invalid/partial captures;
     a complete trapped capture is instead recorded by ``predicate_traps``.
     """

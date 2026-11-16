@@ -1,3 +1,6 @@
+import pytest
+
+from taosc_llm.collection_metrics import selection_case_sets
 from taosc_llm.no_llm.score import Population, Score, improves, new_owners, preserves
 
 
@@ -5,8 +8,13 @@ def row(key, baseline="target_crash", candidate="normal", activation="fired", *,
     return {"case_id": key, "domain": "system", "report": {
         "original_baseline": {"outcome": baseline, "applicable": True},
         "neutral_baseline": {"outcome": baseline, "compatible_control": compatible,
+                             "artifact_sha256": "fixture",
                              "capture": {"status": "complete" if hits else "zero_hits", "total_hits": hits}},
-        "candidate": {"outcome": candidate, "reason": "observed"},
+        "candidate": {"outcome": candidate, "reason": "observed", "artifact_sha256": "fixture",
+                      "capture": {"status": "complete" if hits else "zero_hits"}},
+        "oracle": {"evaluation_artifact_sha256": "fixture"},
+        "branch_comparison": {"basis": "actual_complete_vectors",
+                              "status": "different" if activation == "fired" else "equal"},
         "activation": {"status": activation, "repair_hits": hits if activation == "fired" else 0}}}
 
 
@@ -42,11 +50,12 @@ def test_target_after_normal_baseline_is_failure_and_nonfiring_normal_is_not_rep
     assert score.ignored["system:1"] == "normal-without-repair"
 
 
-def test_trap_does_not_supply_a_valid_failure_or_repair_comparison():
+def test_trap_cannot_prove_repair_or_erase_observed_target():
     population = Population.from_evaluation({"cases": [row("system:0")]})
     score = Score.from_evaluation(population, {"cases": [
         row("system:0", candidate="target_crash", activation="trapped")]})
-    assert not score.covered and not score.target_failures
+    assert not score.covered
+    assert score.target_failures == {"system:0"}
     assert score.ignored == {"system:0": "candidate-trapped"}
 
 
@@ -92,3 +101,31 @@ def test_original_neutral_disagreement_is_evidence_gap():
     assert not population.crashes
     assert population.gaps == {"system:0"}
     assert population.cases["system:0"]["reason"] == "original-neutral-disagreement"
+
+
+@pytest.mark.parametrize("comparison,regression", [("different", True), ("equal", False), ("unavailable", False)])
+def test_normal_other_crash_uses_only_shared_actual_vector_objective(comparison, regression):
+    population = Population.from_evaluation({"cases": [row("system:0", "normal")]})
+    case = row("system:0", "normal", "other_crash", "fired" if regression else "not_fired")
+    case["report"]["branch_comparison"]["status"] = comparison
+    if comparison == "unavailable":
+        case["report"]["candidate"]["capture"]["status"] = "unavailable"
+        case["report"]["activation"]["status"] = "unknown"
+    evaluation = {"cases": [case]}
+    score = Score.from_evaluation(population, evaluation)
+    shared = selection_case_sets(evaluation)
+    assert score.regressions == shared["branch_regressions"]
+    assert bool(score.regressions) is regression
+    assert score.covered == set()
+    assert score.ignored == {"system:0": "other-crash"}
+
+
+def test_shared_target_objective_includes_cases_outside_search_population():
+    baseline = row("system:0")
+    baseline["report"]["original_baseline"]["outcome"] = "unknown"
+    population = Population.from_evaluation({"cases": [baseline]})
+    evaluation = {"cases": [row("system:0", candidate="target_crash")]}
+    score = Score.from_evaluation(population, evaluation)
+    assert not population.active
+    assert score.target_failures == selection_case_sets(evaluation)["target_crashes"] == {"system:0"}
+    assert not score.covered

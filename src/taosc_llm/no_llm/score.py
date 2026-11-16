@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from ..collection_metrics import selection_case_sets
+
 
 @dataclass(frozen=True)
 class Population:
@@ -71,10 +73,12 @@ class Score:
     target_failures: frozenset[str] = frozenset()
     known_normals: frozenset[str] = frozenset()
     ignored: dict[str, str] = field(default_factory=dict)
+    selection: dict[str, frozenset[str]] = field(default_factory=dict)
 
     @classmethod
     def from_evaluation(cls, population: Population, evaluation: dict) -> "Score":
-        covered, regressions, failures, known = set(), set(), set(), set()
+        objective = selection_case_sets(evaluation)
+        covered, known = set(), set()
         normals = population.normals
         active = population.crashes | normals
         ignored = {key: "candidate-not-evaluated" for key in active}
@@ -93,7 +97,6 @@ class Score:
             if activation == "trapped":
                 ignored[key] = "candidate-trapped"
             elif outcome == "target_crash":
-                failures.add(key)
                 ignored.pop(key)
             elif outcome == "other_crash":
                 ignored[key] = "other-crash"
@@ -104,8 +107,6 @@ class Score:
             elif key in normals:
                 ignored.pop(key)
                 known.add(key)
-                if activation == "fired":
-                    regressions.add(key)
             else:
                 control = report["neutral_baseline"]
                 if control.get("compatible_control") is not True or control.get("outcome") != "target_crash":
@@ -115,19 +116,13 @@ class Score:
                     covered.add(key)
                 else:
                     ignored[key] = "normal-without-repair"
-        return cls(frozenset(covered), frozenset(regressions), frozenset(failures),
-                   frozenset(known), ignored)
+        return cls(frozenset(covered), objective["branch_regressions"], objective["target_crashes"],
+                   frozenset(known), ignored, objective)
 
     def to_dict(self) -> dict:
         return {"covered": sorted(self.covered), "branch_regressions": sorted(self.regressions),
                 "target_failures": sorted(self.target_failures), "known_normals": sorted(self.known_normals),
                 "ignored": dict(sorted(self.ignored.items()))}
-
-    @classmethod
-    def from_dict(cls, value: dict) -> "Score":
-        return cls(*(frozenset(value[key]) for key in
-                     ("covered", "branch_regressions", "target_failures", "known_normals")),
-                   dict(value["ignored"]))
 
     def complete(self, population: Population) -> bool:
         return not population.gaps and not self.ignored and self.known_normals == population.normals
@@ -160,11 +155,9 @@ def preserves(owners: frozenset[str], local: Score, required: frozenset[str], gl
 
 def improves(before: Score, after: Score, *, old_cost: int, new_cost: int) -> bool:
     """No credit for hiding a known normal behind ignored/unavailable evidence."""
-    if not before.known_normals <= after.known_normals:
-        return False
     if after.target_failures - before.target_failures:
         return False
     common = before.known_normals & after.known_normals
     old = len(before.regressions & common)
     new = len(after.regressions & common)
-    return new < old or (new == old and new_cost < old_cost)
+    return new < old or (new == old and bool(common) and new_cost < old_cost)

@@ -33,15 +33,14 @@ RESPONSE_LIMIT = 16 * 1024 * 1024
 WAIT_INTERVAL = 0.25
 STATES = ("starting", "generating", "ready", "evaluating", "stopping")
 SOURCES = ("cache", "executed")
-OUTCOMES = ("normal", "target-crash", "other-crash", "unavailable")
+OUTCOMES = ("normal", "target-crash", "other-crash", "unavailable", "ignored")
 REASONS = (
     "unknown-mutation",
     "invalid-descriptor",
-    "unsupported-external-state",
     "cancelled",
-    "timeout",
     "incomplete-observation",
 )
+IGNORED_REASONS = ("unsupported-external-state", "timeout")
 BUSY = "busy"
 
 
@@ -291,10 +290,13 @@ def _validate_row(value: dict) -> dict:
     if outcome not in OUTCOMES:
         raise ReplayError(f"replay case {mutation} has unknown outcome")
     reason = value.get("reason")
-    if outcome == "unavailable":
-        if reason not in REASONS:
+    if outcome in ("unavailable", "ignored"):
+        allowed = IGNORED_REASONS if outcome == "ignored" else REASONS
+        if reason not in allowed:
             raise ReplayError(
-                f"replay case {mutation} is unavailable without a known reason")
+                f"replay case {mutation} is {outcome} without a known reason")
+        if value["source"] != "executed" or value.get("capture") is not None:
+            raise ReplayError(f"unobserved replay case {mutation} carries cache evidence")
     elif reason is not None:
         raise ReplayError(
             f"replay case {mutation} carries a reason for an available outcome")
@@ -302,19 +304,22 @@ def _validate_row(value: dict) -> dict:
 
 
 def _validate_done(value: dict) -> dict:
-    _reject_extra(value, {"done", "cases", "unavailable", "patches", "mutations",
+    _reject_extra(value, {"done", "cases", "unavailable", "ignored", "patches", "mutations",
                           "coverage"}, "replay terminal row")
     if value.get("done") is not True:
         raise ReplayError("replay terminal row is not done=true")
-    for name in ("cases", "unavailable", "patches", "mutations"):
+    for name in ("cases", "unavailable", "ignored", "patches", "mutations"):
         _integer(value.get(name), positive=name in ("patches", "mutations"),
                  what=f"terminal {name}")
     if value["coverage"] not in ("complete", "partial"):
         raise ReplayError("replay terminal row has unknown coverage")
-    expected = "complete" if value["unavailable"] == 0 else "partial"
+    if (value["cases"] != value["patches"] * value["mutations"]
+            or value["unavailable"] + value["ignored"] > value["cases"]):
+        raise ReplayError("replay terminal counts do not conserve cases")
+    expected = "partial" if value["unavailable"] or value["ignored"] else "complete"
     if value["coverage"] != expected:
         raise ReplayError(
-            "replay terminal coverage disagrees with its unavailable count")
+            "replay terminal coverage disagrees with its unobserved counts")
     return value
 
 
@@ -324,9 +329,9 @@ def _capture(dataset, row: dict, candidate) -> dict | None:
     from .evaluation import _capture_metadata, _memo, _validated_snapshots, _vector
 
     identity = row.get("capture")
-    if row["outcome"] == "unavailable":
+    if row["outcome"] in ("unavailable", "ignored"):
         if identity is not None:
-            raise ReplayError("unavailable replay case carries candidate state")
+            raise ReplayError("unobserved replay case carries candidate state")
         return None
     fields = {"mutation", "path", "sha256", "descriptor", "patch_id", "reuse"}
     if not isinstance(identity, dict) or set(identity) != fields:
@@ -421,7 +426,8 @@ def _case_result(dataset, row: dict, candidate) -> dict:
         "reuse": row["capture"]["reuse"] if capture is not None else None,
         "offline_branches": None,
         "first_divergence": None,
-        "outcome": {"outcome": outcome},
+        "outcome": {"outcome": "unavailable" if outcome == "ignored" else outcome},
+        **({"ignored": True} if outcome == "ignored" else {}),
         "verified": False,
     }
 
@@ -476,7 +482,7 @@ def _evaluate_replay(dataset, candidate, *, socket_path, admission_timeout,
             "summary": {"total": 0, "reject_same_crash": 0,
                         "not_rejected": 0, "unavailable": 0},
             "replay": {"socket": str(path), "coverage": "empty",
-                       "mutations": 0, "unavailable": 0},
+                       "mutations": 0, "unavailable": 0, "ignored": 0},
         }
     objects = _exchange(path, candidate.source_predicate,
                         admission_timeout=admission_timeout,
@@ -510,7 +516,8 @@ def _evaluate_replay(dataset, candidate, *, socket_path, admission_timeout,
         raise ReplayError("replay mutation set does not match the frozen dataset")
     if terminal["cases"] != len(rows) or terminal["patches"] != 1 or \
             terminal["mutations"] != len(cases) or \
-            terminal["unavailable"] != sum(row["outcome"] == "unavailable" for row in rows):
+            terminal["unavailable"] != sum(row["outcome"] == "unavailable" for row in rows) or \
+            terminal["ignored"] != sum(row["outcome"] == "ignored" for row in rows):
         raise ReplayError("replay terminal counts disagree with streamed cases")
     by_mutation = {row["mutation"]: row for row in rows}
     results = []
@@ -530,6 +537,7 @@ def _evaluate_replay(dataset, candidate, *, socket_path, admission_timeout,
             "coverage": terminal["coverage"],
             "mutations": terminal["mutations"],
             "unavailable": terminal["unavailable"],
+            "ignored": terminal["ignored"],
         },
     }
 

@@ -99,10 +99,10 @@ def test_feedback_counts_actual_targets_and_separates_strict_diagnostics(dataset
     objective = response['objective']
     assert objective == {
         'target_status': 'target_present', 'candidate_known': 17, 'candidate_unknown': 1,
-        'candidate_target_crashes': 15, 'branch_comparable': 0, 'branch_regressions': 0,
+        'candidate_target_crashes': 15, 'branch_comparable': 1, 'branch_regressions': 0,
         'domains': {
             'system': {'target_status': 'target_present', 'candidate_known': 16, 'candidate_unknown': 1,
-                       'candidate_target_crashes': 14, 'branch_comparable': 0, 'branch_regressions': 0},
+                       'candidate_target_crashes': 14, 'branch_comparable': 1, 'branch_regressions': 0},
             'function': {'target_status': 'target_present', 'candidate_known': 1, 'candidate_unknown': 0,
                          'candidate_target_crashes': 1, 'branch_comparable': 0, 'branch_regressions': 0},
         },
@@ -114,10 +114,10 @@ def test_feedback_counts_actual_targets_and_separates_strict_diagnostics(dataset
     diagnostics = response['diagnostics']
     quality = diagnostics['quality']
     assert quality['status'] == 'rejected'
-    assert quality['counts']['crash_regressions'] == 6
+    assert quality['counts']['crash_regressions'] == 5
     assert quality['counts']['other_crashes'] == 1
     other = diagnostics['examples']['other_crashes'][0]
-    assert (other['case_id'], other['outcome'], other['category']) == ('system:60', 'other_crash', 'crash_regression')
+    assert (other['case_id'], other['outcome'], other['category']) == ('system:60', 'other_crash', 'other_crash')
     assert quality['counts']['unavailable'] == 1
     assert quality['counts']['unproven'] == 1
     assert isinstance(diagnostics['warning'], str)
@@ -183,13 +183,13 @@ def test_target_free_other_crashes_are_diagnostic_not_rejection(dataset):
     assert response['objective']['target_status'] == 'target_absent'
     assert response['objective']['candidate_known'] == 1
     assert response['objective']['candidate_target_crashes'] == 0
-    assert response['diagnostics']['quality']['status'] == 'rejected'
+    assert response['diagnostics']['quality']['status'] == 'unproven'
     assert response['diagnostics']['quality']['counts']['other_crashes'] == 1
     assert response['diagnostics']['examples']['other_crashes'][0]['outcome'] == 'other_crash'
     assert 'rejected' not in json.dumps(response['objective'])
 
 
-@pytest.mark.parametrize('limitation', ['artifact', 'control', 'capture', 'activity', 'prediction', 'other_crash'])
+@pytest.mark.parametrize('limitation', ['artifact', 'control', 'capture', 'activity', 'prediction'])
 def test_branch_counterexamples_require_authenticated_actual_normal_comparison(dataset, limitation):
     row = report(0, neutral='normal', original='normal', candidate='normal', activity='fired')
     row['branch_comparison'] = {
@@ -205,13 +205,31 @@ def test_branch_counterexamples_require_authenticated_actual_normal_comparison(d
         row['activation']['status'] = 'trapped'
     elif limitation == 'prediction':
         row['branch_comparison']['basis'] = 'offline_prediction'
-    else:
-        row['candidate']['outcome'] = 'other_crash'
     row['quality'] = {'category': 'branch_regression', 'facets': ['branch_regressions'], 'reasons': [],
                       'known_normal': True, 'observed_normal': True}
     response = feedback(dataset, evaluation_for(dataset, [row]))
     assert response['objective']['branch_comparable'] == response['objective']['branch_regressions'] == 0
     assert response['branch_regressions'] == {'count': 0, 'examples': []}
+
+
+@pytest.mark.parametrize('status', ['equal', 'different'])
+def test_other_crash_feedback_shares_branch_objective_and_keeps_diagnostics(dataset, status):
+    row = report(0, neutral='normal', original='normal', candidate='other_crash', activity='fired')
+    row['branch_comparison'] = {
+        'status': status, 'basis': 'actual_complete_vectors', 'first_difference': 0,
+        'neutral_branch': 0, 'candidate_branch': 1, 'neutral_hits': 1, 'candidate_hits': 1}
+    response = feedback(dataset, evaluation_for(dataset, [row]))
+    assert response['objective']['candidate_target_crashes'] == 0
+    assert response['objective']['branch_comparable'] == 1
+    assert response['objective']['branch_regressions'] == (status == 'different')
+    assert response['branch_regressions']['count'] == (status == 'different')
+    diagnostics = response['diagnostics']
+    assert diagnostics['quality']['counts']['same_branch_other_crashes'] == (status == 'equal')
+    assert diagnostics['quality']['counts']['crash_regressions'] == (status == 'different')
+    if status == 'equal':
+        assert diagnostics['examples']['same_branch_other_crashes'][0]['case_id'] == 'system:0'
+    else:
+        assert response['branch_regressions']['examples'][0]['outcome'] == 'other_crash'
 
 
 def test_branch_witnesses_do_not_depend_on_legacy_quality_facets(dataset):

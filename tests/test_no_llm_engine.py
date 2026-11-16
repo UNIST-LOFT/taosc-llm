@@ -14,6 +14,19 @@ from taosc_llm.family import parse_candidate
 from taosc_llm.no_llm.engine import SearchEngine
 from taosc_llm.no_llm.journal import Journal
 from taosc_llm.no_llm.model import SearchLimits, SearchStopped
+from taosc_llm.collection_metrics import compare_selection, selection_case_sets, selection_objective
+
+
+def observed_report(original, outcome, branch):
+    return {
+        "original_baseline": {"outcome": original, "applicable": True},
+        "neutral_baseline": {"outcome": original, "compatible_control": True,
+                             "artifact_sha256": "fixture", "capture": {"status": "complete", "total_hits": 1}},
+        "candidate": {"outcome": outcome, "artifact_sha256": "fixture", "capture": {"status": "complete"}},
+        "oracle": {"evaluation_artifact_sha256": "fixture"},
+        "branch_comparison": {"basis": "actual_complete_vectors",
+                              "status": "unavailable" if branch == 2 else "different" if branch else "equal"},
+        "activation": {"status": "trapped" if branch == 2 else "fired" if branch else "not_fired"}}
 
 
 class FiniteExecution:
@@ -47,11 +60,7 @@ class FiniteExecution:
             branch = evaluate_cached_predicate(candidate.parsed, [state])[0]
             outcome = "normal" if branch == 1 else original
             rows.append({"case_id": f"system:{index}", "domain": "system", "value": value, "branch": branch,
-                         "report": {"original_baseline": {"outcome": original, "applicable": True},
-                                    "neutral_baseline": {"outcome": original, "compatible_control": True,
-                                                         "capture": {"status": "complete", "total_hits": 1}},
-                                    "candidate": {"outcome": outcome},
-                                    "activation": {"status": "trapped" if branch == 2 else "fired" if branch else "not_fired"}}})
+                         "report": observed_report(original, outcome, branch)})
         return {"cases": rows, "predicate": source, "descriptor": candidate.descriptor}
 
     def baseline(self):
@@ -127,12 +136,7 @@ class PartitionExecution(FiniteExecution):
             branch = evaluate_cached_predicate(candidate.parsed, [CachedSnapshot(0, 0, registers)])[0]
             rows.append({"case_id": f"system:{index}", "domain": "system",
                          "registers": list(registers), "branch": branch,
-                         "report": {
-                             "original_baseline": {"outcome": original, "applicable": True},
-                             "neutral_baseline": {"outcome": original, "compatible_control": True,
-                                                  "capture": {"status": "complete", "total_hits": 1}},
-                             "candidate": {"outcome": "normal" if branch == 1 and repairable else original},
-                             "activation": {"status": "trapped" if branch == 2 else "fired" if branch else "not_fired"}}})
+                         "report": observed_report(original, "normal" if branch == 1 and repairable else original, branch)})
         return {"cases": rows, "predicate": source, "descriptor": candidate.descriptor}
 
     def snapshots(self, result):
@@ -335,7 +339,7 @@ def test_archived_result_checkpoint_requires_introduction_proof(tmp_path):
 
 
 @pytest.mark.parametrize("location", ["archive", "pending"])
-@pytest.mark.parametrize("corruption", ["none", "owners", "witnesses", "evaluation", "empty-program", "normal-unavailable", "normal-crash"])
+@pytest.mark.parametrize("corruption", ["none", "owners", "witnesses", "evaluation", "predicate", "program"])
 def test_resume_authenticates_archive_and_scheduled_branch_proofs(tmp_path, location, corruption):
     limits = SearchLimits(max_evaluations=1, operand_depth=1)
     output = tmp_path / "search"
@@ -360,15 +364,16 @@ def test_resume_authenticates_archive_and_scheduled_branch_proofs(tmp_path, loca
             saved["clauses"][0]["witnesses"] = {}
         elif corruption == "evaluation":
             saved["evaluation"] = backend.baseline_ref
-        elif corruption == "empty-program":
-            saved["clauses"] = []
-        elif corruption != "none":
-            evidence = deepcopy(backend.load(saved["evaluation"]))
-            # Preserve the descriptor and target repairs: only the admitted
-            # normal outcome changes, so missing-normal guards must catch it.
-            evidence["cases"][1]["report"]["candidate"] = {
-                "outcome": "unavailable" if corruption == "normal-unavailable" else "target_crash"}
-            saved["evaluation"] = journal.store(evidence)
+        elif corruption == "predicate":
+            if location == "archive":
+                saved["predicate"] = "rax == 0"
+            else:
+                saved["clauses"][0]["factors"] = ["rax == 0"]
+        elif corruption == "program":
+            if location == "archive":
+                saved["program"] = [["rax == 0"]]
+            else:
+                saved["clauses"] = []
         engine._save()
     with Journal(output, identity, resume=True) as journal:
         if corruption == "none":
@@ -381,27 +386,106 @@ def test_resume_authenticates_archive_and_scheduled_branch_proofs(tmp_path, loca
                 SearchEngine(FiniteExecution(journal, limits))
 
 
-@pytest.mark.parametrize("normal_outcome", ["unavailable", "target_crash", "other_crash"])
-def test_ineligible_normal_outcomes_cannot_win_the_result_archive(tmp_path, finite_grammar, normal_outcome):
-    finite_grammar("rax != 0")
-
-    class LostNormalExecution(FiniteExecution):
+@pytest.mark.parametrize("reason", ["unsupported-external-state", "timeout"])
+@pytest.mark.parametrize("target_outcome", ["normal", "other_crash", "unknown"])
+def test_ignored_normals_do_not_veto_evaluated_archive_or_resume(tmp_path, reason, target_outcome):
+    class IgnoredExecution(FiniteExecution):
         def _result(self, source):
             result = super()._result(source)
-            # Both targets still repair, and the zero-valued normal stops
-            # firing. Hiding its outcome would falsely improve three known
-            # regressions to two, without sacrificing any target coverage.
-            if source != "0" and result["cases"][2]["branch"] == 0:
-                result["cases"][2]["report"]["candidate"] = {"outcome": normal_outcome}
+            if source != "0":
+                for row in result["cases"]:
+                    report = row["report"]
+                    if report["original_baseline"]["outcome"] == "normal":
+                        report["candidate"].update(outcome="unknown", reason=reason, capture={"status": "unavailable"})
+                        report["activation"]["status"] = "unknown"
+                        report["branch_comparison"]["status"] = "unavailable"
+                    else:
+                        report["candidate"]["outcome"] = target_outcome
             return result
 
-    limits = SearchLimits(max_evaluations=8, max_clauses=1, max_factors=1, operand_depth=1)
-    with Journal(tmp_path / "search", {"case": "normal-evidence", "outcome": normal_outcome}) as journal:
-        result = SearchEngine(LostNormalExecution(journal, limits)).run()
+    limits = SearchLimits(max_evaluations=1, operand_depth=1)
+    output = tmp_path / "search"
+    identity = {"case": "ignored-archive", "reason": reason, "target": target_outcome}
+    with Journal(output, identity) as journal:
+        engine = SearchEngine(IgnoredExecution(journal, limits))
+        result = engine.run()
         evidence = journal.load(result["evaluation"])
-    assert result["score"]["covered"] == ["system:0", "system:4"]
-    assert result["score"]["branch_regressions"] == ["system:1", "system:2", "system:3"]
-    assert evidence["cases"][2]["report"]["candidate"]["outcome"] == "normal"
+        assert result["predicate"] == evidence["predicate"]
+        assert parse_candidate("ERM generic", result["predicate"]).expression == "(1)"
+        assert result["objective"] == selection_objective(evidence)
+        if target_outcome == "normal":
+            assert result["clauses"][0]["owners"] == ["system:0", "system:4"]
+        else:
+            assert engine.state["clauses"] == []
+            assert result["clauses"] == []
+            assert result["score"]["covered"] == []
+    prior = {path: path.read_bytes() for folder in ("segments", "payloads")
+             for path in (output / folder).iterdir()}
+    with Journal(output, identity, resume=True) as journal:
+        backend = IgnoredExecution(journal, limits)
+        backend.evaluations = 1
+        restored = SearchEngine(backend)
+        resumed = restored.run()
+        assert backend.requests == []
+        assert resumed["predicate"] == result["predicate"]
+        assert resumed["evaluation"] == result["evaluation"]
+        assert resumed["clauses"] == result["clauses"]
+        assert resumed["objective"] == result["objective"]
+    assert all(path.read_bytes() == data for path, data in prior.items())
+
+
+def test_refinement_retains_real_owners_without_all_normal_evidence(tmp_path):
+    atom = "rax * rax >= 4"
+
+    class RefinementExecution(FiniteExecution):
+        def _result(self, source):
+            result = super()._result(source)
+            if atom in source:
+                report = result["cases"][1]["report"]
+                report["candidate"].update(outcome="unknown", reason="timeout", capture={"status": "unavailable"})
+                report["activation"]["status"] = "unknown"
+                report["branch_comparison"]["status"] = "unavailable"
+            return result
+
+    limits = SearchLimits(operand_depth=1)
+    output = tmp_path / "search"
+    identity = {"case": "refinement-ignored-normal"}
+    with Journal(output, identity) as journal:
+        engine = SearchEngine(RefinementExecution(journal, limits))
+        engine._start_draft("introduce", "system:0")
+        engine._step_draft()
+        engine._accept_introduction(engine.state["draft"]["best"])
+        engine._start_draft("refine", "system:0", index=0)
+        engine.state["draft"]["queue"] = [[atom]]
+        engine._step_draft()
+        assert engine.state["clauses"][0]["factors"] == [atom]
+        assert engine._required() == {"system:0", "system:4"}
+        assert engine.state["best_result"]["clauses"][0]["refinement"]
+        engine._authenticate_best()
+    with Journal(output, identity, resume=True) as journal:
+        restored = SearchEngine(RefinementExecution(journal, limits))
+        assert restored._required() == {"system:0", "system:4"}
+        assert restored.best_score.regressions == set()
+        assert restored.best_score.ignored == {"system:1": "timeout"}
+
+
+def test_unknown_disappearance_does_not_improve_archive(tmp_path):
+    limits = SearchLimits(operand_depth=1)
+    with Journal(tmp_path / "search", {"case": "unknown-tie"}) as journal:
+        backend = FiniteExecution(journal, limits)
+        engine = SearchEngine(backend)
+        engine._run(((),))
+        first = deepcopy(engine.state["best_result"])
+        candidate = backend._result("rax != 0")
+        candidate["cases"][2]["report"]["candidate"].update(outcome="unknown", capture={"status": "unavailable"})
+        candidate["cases"][2]["report"]["activation"]["status"] = "unknown"
+        candidate["cases"][2]["report"]["branch_comparison"]["status"] = "unavailable"
+        previous = selection_case_sets(engine.best_evaluation)
+        after = selection_case_sets(candidate)
+        assert compare_selection(previous, after)[0] is False
+        score = type(engine.best_score).from_evaluation(engine.population, candidate)
+        engine._archive((("rax != 0",),), candidate, score, journal.store(candidate))
+        assert engine.state["best_result"] == first
 
 
 def test_interrupted_search_resumes_without_rewriting_prior_evidence(tmp_path):
@@ -454,7 +538,8 @@ def test_budget_stop_has_no_fabricated_incumbent(tmp_path):
     with Journal(tmp_path / "search", {"case": "budget"}) as journal:
         result = SearchEngine(NoRepairExecution(journal, limits)).run()
     assert result["termination"] == "evaluation-budget-reached"
-    assert result["predicate"] is None
+    assert result["predicate"] is not None
+    assert result["clauses"] == []
     assert result["score"]["target_failures"] == ["system:0", "system:4"]
 
 
@@ -585,7 +670,7 @@ def test_cancellation_during_budget_revalidation_never_commits(tmp_path, monkeyp
 
 
 class UnavailableAnchorExecution(FiniteExecution):
-    anchor_outcome = "unavailable"
+    anchor_outcome = "unknown"
 
     def _result(self, source):
         result = super()._result(source)
@@ -596,7 +681,7 @@ class UnavailableAnchorExecution(FiniteExecution):
         return result
 
 
-@pytest.mark.parametrize("anchor_outcome", ["unavailable", "target_crash"])
+@pytest.mark.parametrize("anchor_outcome", ["unknown", "target_crash"])
 def test_unrepairable_first_anchor_does_not_veto_other_validated_repairs(tmp_path, anchor_outcome):
     limits = SearchLimits(max_evaluations=1, operand_depth=1)
     with Journal(tmp_path / "search", {"case": "unrepairable-anchor", "outcome": anchor_outcome}) as journal:
@@ -611,7 +696,7 @@ def test_unrepairable_first_anchor_does_not_veto_other_validated_repairs(tmp_pat
     assert result["clauses"][0]["owners"] == ["system:4"]
     assert result["score"]["covered"] == ["system:4"]
     assert result["score"]["unresolved_targets"] == ["function:0"]
-    if anchor_outcome == "unavailable":
+    if anchor_outcome == "unknown":
         assert result["score"]["ignored"] == {"function:0": "offline-divergence"}
         assert result["score"]["coverage"] == "partial"
     else:

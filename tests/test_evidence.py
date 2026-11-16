@@ -274,6 +274,37 @@ def test_normal_complete_vector_differences_have_exact_counterexamples(
     assert summarize_quality([report])['status'] == 'unproven'  # normal-only cases do not establish repair
 
 
+@pytest.mark.parametrize(('branches', 'complete', 'status'), [
+    ((0, 0), True, 'equal'),
+    ((0, 1), True, 'different'),
+    ((0,), True, 'different'),
+    ((0, 0), False, 'unavailable'),
+])
+def test_normal_other_crash_records_full_vector_diagnostic(dataset, branches, complete, status):
+    case = dataset.rows[0]
+    neutral = capture(dataset, branches=(0, 0), values=(0, 0), normal=True)
+    case['observation'] = neutral['outcome']
+    candidate = capture(dataset, branches=branches, values=branches,
+                        descriptor=parse_candidate(dataset.patch_format, 'rax != 0').descriptor)
+    candidate['outcome']['fault_addr'] = 44
+    candidate['complete'] = complete
+    report = project_case(dataset, case, {**observed(candidate, same=False),
+                                         'neutral_baseline': observed(neutral, same=False)})
+    assert report['candidate']['outcome'] == 'other_crash'
+    assert report['diagnostic'] == {'kind': 'normal-to-other-crash', 'branches': status}
+    facets = report['quality']['facets']
+    assert ('crash_regressions' in facets) is (status == 'different')
+    assert ('branch_regressions' in facets) is (status == 'different')
+    assert ('same_branch_other_crashes' in facets) is (status == 'equal')
+    warning = {'equal': 'normal_other_crash_same_branches',
+               'different': 'normal_other_crash_branch_regression',
+               'unavailable': 'normal_other_crash_branch_unavailable'}[status]
+    assert warning in report['warnings']
+    if status == 'different':
+        assert report['quality']['branch_difference']['first_difference'] == 1
+        assert report['quality']['branch_difference']['candidate_branch'] == (1 if len(branches) == 2 else None)
+
+
 @pytest.mark.parametrize('kind', ['predicted', 'partial', 'invalid', 'wrong-artifact',
                                   'unmatched-control', 'wrong-case', 'wrong-domain', 'wrong-control-case'])
 def test_inference_or_incompatible_capture_never_establishes_branch_regression(dataset, kind):
@@ -310,7 +341,7 @@ def test_inference_or_incompatible_capture_never_establishes_branch_regression(d
     (False, 'normal', 'rax / 0', 'unproven', {'unproven'}),
     (False, 'other', '1', 'other_crash', {'other_crashes'}),
     (False, 'target', '1', 'target_miss', {'target_misses'}),
-    (True, 'other', '1', 'crash_regression', {'crash_regressions', 'other_crashes'}),
+    (True, 'other', '1', 'crash_regression', {'crash_regressions', 'branch_regressions', 'other_crashes'}),
     (True, 'target', '1', 'crash_regression', {'crash_regressions'}),
     (True, 'normal', '0', 'preserved_normal', {'preserved_normal'}),
 ])
@@ -334,7 +365,7 @@ def test_quality_separates_target_misses_other_faults_traps_and_unproven_normals
 @pytest.mark.parametrize(('extra', 'expected'), [
     (None, 'improved_with_regressions'),
     ('target', 'rejected'),
-    ('other', 'rejected'),
+    ('other', 'unproven'),
     ('normal-to-target', 'rejected'),
     ('normal-to-other', 'rejected'),
     ('crash-and-gap', 'rejected'),
@@ -389,7 +420,8 @@ def test_soft_branches_require_repair_and_never_override_crashes_or_evidence_gap
         reports.append(actual(3, **options[extra]))
     quality = summarize_quality(reports)
     assert quality['status'] == expected
-    assert quality['counts']['branch_regressions'] == (2 if extra == 'baseline-gap' else 1)
+    assert quality['counts']['branch_regressions'] == (2 if extra in (
+        'baseline-gap', 'normal-to-other', 'crash-and-gap') else 1)
     assert quality['counts']['improved'] == (0 if extra == 'no-repair' else 1)
     assert quality['counts']['preserved_normal'] == 1
     if extra == 'no-repair':

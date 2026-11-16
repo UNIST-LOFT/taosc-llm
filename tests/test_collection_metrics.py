@@ -3,7 +3,7 @@ from copy import deepcopy
 
 import pytest
 
-from taosc_llm.collection_metrics import collect_metrics, selection_case_sets, selection_objective
+from taosc_llm.collection_metrics import collect_metrics, compare_selection, selection_case_sets, selection_objective
 
 
 ARTIFACT = 'a' * 64
@@ -44,13 +44,17 @@ def test_target_to_normal_or_other_is_target_fixed_despite_legacy_rejection(outc
     assert result['branch_comparable'] == result['branch_regressions'] == 0
 
 
-def test_preexisting_other_and_new_other_are_informational_only():
+@pytest.mark.parametrize('comparison', ['equal', 'different'])
+def test_normal_other_crash_compares_branches_but_preexisting_other_is_diagnostic(comparison):
     result = metrics(case(0, original='other_crash', neutral='other_crash', outcome='other_crash'),
-                     case(1, original='normal', neutral='normal', outcome='other_crash'))
+                     case(1, original='normal', neutral='normal', outcome='other_crash', comparison=comparison))
     assert result['target_status'] == 'target_absent'
     assert result['candidate_other_crashes'] == 2
     assert result['target_baselines'] == result['new_target_failures'] == 0
-    assert result['branch_regressions'] == result['branch_comparable'] == 0
+    assert result['branch_comparable'] == 1
+    assert result['branch_regressions'] == (comparison == 'different')
+    assert result['same_branch_other_crashes'] == (comparison == 'equal')
+    assert result['other_crash_branch_unavailable'] == 0
 
 
 @pytest.mark.parametrize('capture_status', ['unavailable', 'incomplete', 'invalid'])
@@ -70,6 +74,39 @@ def test_partial_capture_and_baseline_gap_cannot_erase_known_outcomes(capture_st
     assert result['target_baselines'] == 1
     assert result['target_fixed'] == (outcome != 'target_crash')
     assert result['target_remaining'] == (outcome == 'target_crash')
+
+
+@pytest.mark.parametrize('reason', ['unsupported-external-state', 'timeout', 'branch-divergence'])
+def test_skipped_observations_are_not_known_outcomes_or_regressions(reason):
+    row = case(original='normal', neutral='normal', outcome='unknown')
+    row['report']['candidate']['reason'] = reason
+    result = metrics(row)
+    assert result['candidate_unknown'] == 1
+    assert result['candidate_ignored'] == (reason != 'branch-divergence')
+    assert result['candidate_known'] == result['candidate_target_crashes'] == 0
+    assert result['branch_comparable'] == result['branch_regressions'] == 0
+    assert result['target_status'] == 'not_observed'
+
+
+@pytest.mark.parametrize('improved', [False, True])
+def test_shared_selection_neither_rewards_nor_vetoes_unrelated_evidence_loss(improved):
+    before = selection_case_sets({'cases': [case(0, outcome='target_crash'),
+        case(1, original='normal', neutral='normal')]})
+    after = selection_case_sets({'cases': [case(0, outcome='normal' if improved else 'target_crash'),
+        case(1, original='normal', neutral='normal', outcome='unknown')]})
+    accepted, detail = compare_selection(before, after)
+    assert accepted is improved
+    assert detail['reason'] == ('target-crashes-reduced' if improved else 'no-objective-improvement')
+    assert detail['comparison']['shared_known'] == 1
+    assert detail['comparison']['shared_branch_comparable'] == 0
+
+
+def test_missing_other_crash_vectors_do_not_establish_equal_branches():
+    row = case(original='normal', neutral='normal', outcome='other_crash', comparison='equal')
+    row['report']['candidate']['capture']['status'] = 'incomplete'
+    result = metrics(row)
+    assert result['other_crash_branch_unavailable'] == 1
+    assert result['same_branch_other_crashes'] == result['branch_regressions'] == 0
 
 
 def test_residual_target_dominates_normal_other_and_unknown_cases():
@@ -159,7 +196,7 @@ def test_branch_denominator_preserves_actual_neutral_pairs_despite_original_gaps
 @pytest.mark.parametrize('kind', [
     'predicted', 'unavailable', 'partial', 'invalid', 'unmatched-control',
     'wrong-neutral-artifact', 'wrong-candidate-artifact', 'wrong-oracle-artifact',
-    'partial-neutral', 'trap', 'activation-unknown', 'other-outcome', 'unknown-outcome',
+    'partial-neutral', 'trap', 'activation-unknown', 'unknown-outcome',
 ])
 def test_unavailable_or_predicted_branch_pairs_cannot_enter_denominator(kind):
     row = case(original='normal', neutral='normal')
@@ -184,8 +221,6 @@ def test_unavailable_or_predicted_branch_pairs_cannot_enter_denominator(kind):
         report['activation']['status'] = 'trapped'
     elif kind == 'activation-unknown':
         report['activation']['status'] = 'unknown'
-    elif kind == 'other-outcome':
-        report['candidate']['outcome'] = 'other_crash'
     else:
         report['candidate']['outcome'] = 'unknown'
     result = metrics(row)

@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from taosc_llm import evaluation, replay
+from taosc_llm.evidence import project_case
 from taosc_llm.family import parse_candidate
 from taosc_llm.no_llm.backend import Backend
 from taosc_llm.no_llm.journal import Journal
@@ -96,7 +97,7 @@ class FakeServer:
                     connection.sendall(json.dumps(item).encode() + b"\n")
 
     def _capture(self, request, row):
-        if row["outcome"] == "unavailable":
+        if row["outcome"] in ("unavailable", "ignored"):
             return None
         from binradar import binradar_taosc_predicates as predicates
         from binradar.binradar_replay import lower_predicate
@@ -171,10 +172,10 @@ def rows(mutations=(2, 3), *, patch=1, outcome="normal", reason=None):
              "outcome": outcome, "reason": reason} for mutation in mutations]
 
 
-def done(mutations=2, *, unavailable=0, patches=1):
+def done(mutations=2, *, unavailable=0, ignored=0, patches=1):
     return {"done": True, "cases": mutations, "unavailable": unavailable,
-            "patches": patches, "mutations": mutations,
-            "coverage": "complete" if unavailable == 0 else "partial"}
+            "ignored": ignored, "patches": patches, "mutations": mutations,
+            "coverage": "partial" if unavailable or ignored else "complete"}
 
 
 def serve(run_dir, responses, **kwargs):
@@ -432,16 +433,19 @@ def test_failed_connect_closes_its_socket(tmp_path, monkeypatch):
     ("normal", "executed", "not_rejected", "observed-not-same-crash"),
     ("target-crash", "executed", "reject_same_crash", "same-crash"),
     ("other-crash", "cache", "not_rejected", "observed-not-same-crash"),
-    ("unavailable", "executed", "unavailable", "unsupported-external-state"),
+    ("unavailable", "executed", "unavailable", "incomplete-observation"),
+    ("ignored", "executed", "unavailable", "unsupported-external-state"),
+    ("ignored", "executed", "unavailable", "timeout"),
 ])
 def test_outcome_mapping_matches_the_existing_evaluation_vocabulary(
         run_dir, dataset, outcome, source, status, reason):
     server = serve(run_dir, [[
         {"mutation": 2, "patch": 1, "source": source, "outcome": outcome,
-         "reason": "unsupported-external-state" if outcome == "unavailable" else None},
+         "reason": reason if outcome in ("unavailable", "ignored") else None},
         {"mutation": 3, "patch": 1, "source": source, "outcome": outcome,
-         "reason": "unsupported-external-state" if outcome == "unavailable" else None},
-        done(unavailable=2 if outcome == "unavailable" else 0),
+         "reason": reason if outcome in ("unavailable", "ignored") else None},
+        done(unavailable=2 if outcome == "unavailable" else 0,
+             ignored=2 if outcome == "ignored" else 0),
     ]])
     try:
         result = replay.evaluate_replay(dataset, parse_candidate("ERM generic", "rax <= 0"))
@@ -451,6 +455,14 @@ def test_outcome_mapping_matches_the_existing_evaluation_vocabulary(
     assert {case["reason"] for case in result["cases"]} == {reason}
     assert result["status"] == ("reject_same_crash" if status == "reject_same_crash" else "not_rejected")
     assert result["summary"]["unavailable"] == (2 if status == "unavailable" else 0)
+    assert result["replay"]["ignored"] == (2 if outcome == "ignored" else 0)
+    assert result["replay"]["unavailable"] == (2 if outcome == "unavailable" else 0)
+    if status == "unavailable":
+        assert all(case["capture"] is None and case["branches"] is None
+                   and case["outcome"] == {"outcome": "unavailable"}
+                   for case in result["cases"])
+    assert all(case.get("ignored", False) == (outcome == "ignored")
+               for case in result["cases"])
     assert result["replay"]["coverage"] == ("partial" if status == "unavailable" else "complete")
     assert status_requests(server) == [{"op": "status"}]
     assert evaluate_requests(server)[0]["patches"] == [
@@ -529,6 +541,59 @@ def test_malformed_or_incomplete_replay_batches_are_rejected(
     try:
         with pytest.raises(replay.ReplayError, match=match):
             replay.evaluate_replay(dataset, parse_candidate("ERM generic", "1"))
+    finally:
+        server.close()
+
+
+@pytest.mark.parametrize("outcome,reason,source,capture", [
+    ("ignored", None, "executed", None),
+    ("ignored", "cancelled", "executed", None),
+    ("ignored", "incomplete-observation", "executed", None),
+    ("ignored", "timeout", "cache", None),
+    ("ignored", "timeout", "executed", {"unexpected": True}),
+    ("unavailable", "timeout", "executed", None),
+    ("unavailable", "unsupported-external-state", "executed", None),
+    ("unknown", "timeout", "executed", None),
+    ("ignored", "made-up-reason", "executed", None),
+])
+def test_ignored_wire_rows_require_exact_contract(outcome, reason, source, capture):
+    with pytest.raises(replay.ReplayError):
+        replay._validate_row({"mutation": 2, "patch": 1, "outcome": outcome,
+                              "reason": reason, "source": source, "capture": capture})
+
+
+@pytest.mark.parametrize("change", [
+    {"ignored": True}, {"ignored": -1}, {"ignored": 3}, {"ignored": None},
+    {"ignored": 1, "coverage": "complete"}, {"cases": 0},
+    {"mutations": 0}, {"patches": 0},
+])
+def test_ignored_terminal_counts_are_strict_and_conserved(change):
+    with pytest.raises(replay.ReplayError):
+        replay._validate_done({**done(), **change})
+
+
+def test_old_terminal_without_ignored_count_is_rejected():
+    terminal = done()
+    del terminal["ignored"]
+    with pytest.raises(replay.ReplayError, match="terminal ignored"):
+        replay._validate_done(terminal)
+
+
+@pytest.mark.parametrize("ignored,unavailable", [(0, 2), (1, 1), (2, 0)])
+def test_ignored_terminal_counts_must_match_streamed_outcomes(
+        run_dir, dataset, ignored, unavailable):
+    response = rows((2,), outcome="ignored", reason="timeout") + rows(
+        (3,), outcome="unavailable", reason="incomplete-observation")
+    server = serve(run_dir, [response + [done(ignored=ignored, unavailable=unavailable)]])
+    try:
+        if ignored == unavailable == 1:
+            result = replay.evaluate_replay(dataset, parse_candidate("ERM generic", "1"))
+            assert result["summary"]["unavailable"] == 2
+            assert result["replay"]["ignored"] == result["replay"]["unavailable"] == 1
+            assert result["replay"]["coverage"] == "partial"
+        else:
+            with pytest.raises(replay.ReplayError, match="counts disagree"):
+                replay.evaluate_replay(dataset, parse_candidate("ERM generic", "1"))
     finally:
         server.close()
 
@@ -707,7 +772,11 @@ def test_nonretained_crashes_remain_selected_offline_evidence(
         assert by_id["function:3"]["status"] == "unavailable"
         assert by_id["function:3"]["reason"] == "branch-divergence"
     assert result["summary"]["total"] == len(expected)
-    assert result["replay"]["mutations"] == 1
+    if selected == ["function:3"]:
+        assert server.requests == []
+        assert "replay" not in result
+    else:
+        assert result["replay"]["mutations"] == 1
 
 
 def test_normal_and_target_crash_replay_but_other_crash_stays_offline(dataset, run_dir, tmp_path):
@@ -731,6 +800,26 @@ def test_normal_and_target_crash_replay_but_other_crash_stays_offline(dataset, r
     assert result["replay"]["mutations"] == 2
 
 
+@pytest.mark.parametrize("predicate", ["0", "1"])
+def test_nonretained_unknown_function_case_never_contacts_replay(
+        dataset, run_dir, tmp_path, monkeypatch, predicate):
+    case = dataset.cases("function")[0]
+    case = {**case, "observation": {}, "capture": {**case["capture"],
+            "outcome": {"outcome": "unavailable"}, "same_crash": None}}
+    dataset = rewrite_cases(dataset, [case])
+    monkeypatch.setattr(replay, "status", lambda *a, **k: pytest.fail("nonretained socket access"))
+    monkeypatch.setattr(evaluation, "execute_capture",
+                        lambda *a, **k: pytest.fail("function concrete fallback"))
+    result = evaluation.evaluate_dataset(
+        dataset, predicate, include_poc=False, cache_dir=tmp_path / "cache",
+        replay_socket=run_dir / replay.SOCKET_NAME)
+    row = result["cases"][0]
+    assert "replay" not in result
+    assert row["status"] == "unavailable"
+    assert row["reason"] == ("branch-divergence" if predicate == "1" else "oracle-unavailable")
+    assert row["report"]["candidate"]["outcome"] == "unknown"
+
+
 def test_zero_retained_keeps_offline_cases_and_empty_live_coverage(dataset, run_dir, tmp_path):
     cases = [{**case, "capture": {**case["capture"],
               "outcome": {"outcome": "crash"}, "same_crash": False}}
@@ -743,9 +832,8 @@ def test_zero_retained_keeps_offline_cases_and_empty_live_coverage(dataset, run_
             replay_socket=run_dir / replay.SOCKET_NAME)
     finally:
         server.close()
-    assert evaluate_requests(server) == []
-    assert result["replay"]["coverage"] == "empty"
-    assert result["replay"]["mutations"] == 0
+    assert server.requests == []
+    assert "replay" not in result
     assert result["summary"]["total"] == 2
     assert all(case["source"] == "offline" for case in result["cases"])
 
@@ -791,7 +879,7 @@ def capture_row(dataset, run_dir, *, branches=(1, 1), selector=1,
 @pytest.mark.parametrize("reuse", ["fresh", "exact-descriptor", "full-vector-equivalent"])
 def test_complete_replay_capture_is_available_to_standard_state_reader(
         tmp_path, run_dir, patch_format, reuse):
-    dataset = make_dataset(tmp_path / "states", patch_format=patch_format, binradar_run=run_dir)
+    dataset = make_dataset(tmp_path / "states", count=3, patch_format=patch_format, binradar_run=run_dir)
     candidate = parse_candidate(patch_format,
         "s->rbx >= i->begin && s->rbx < i->end" if patch_format == "ERM CWE-805" else "rax < 0")
     row = capture_row(dataset, run_dir, reuse=reuse, descriptor=candidate.descriptor)
@@ -804,14 +892,19 @@ def test_complete_replay_capture_is_available_to_standard_state_reader(
     with Journal(tmp_path / "search", {"dataset": dataset.dataset_id}) as journal:
         backend = Backend(dataset, journal, SearchLimits())
         with dataset.validation() as view:
-            saved = backend._preserve({"cases": [result]}, view)
+            saved = backend._preserve({
+                "dataset_id": dataset.dataset_id,
+                "predicate": candidate.expression, "descriptor": candidate.descriptor,
+                "cases": [{**result, "report": project_case(
+                    dataset, dataset.case(result["case_id"]), result, predicate=candidate.expression)}],
+            }, view)
         restored = backend.load(journal.store(saved))
         assert [state.branch for state in backend.snapshots(restored)["function:2"]] == [1, 1]
 
 
 @pytest.mark.parametrize("patch_format", ["ERM generic", "ERM CWE-805"])
 def test_vector_reuse_keeps_neutral_descriptor_and_original_selector(tmp_path, run_dir, patch_format):
-    dataset = make_dataset(tmp_path / "states", patch_format=patch_format, binradar_run=run_dir)
+    dataset = make_dataset(tmp_path / "states", count=3, patch_format=patch_format, binradar_run=run_dir)
     candidate = parse_candidate(patch_format,
         "s->rax >= i->begin && s->rax < i->end" if patch_format == "ERM CWE-805" else "rax > 0")
     row = capture_row(dataset, run_dir, branches=(0, 0), selector=0,
@@ -824,7 +917,12 @@ def test_vector_reuse_keeps_neutral_descriptor_and_original_selector(tmp_path, r
     with Journal(tmp_path / "search", {"dataset": dataset.dataset_id}) as journal:
         backend = Backend(dataset, journal, SearchLimits())
         with dataset.validation() as view:
-            saved = backend._preserve({"cases": [result]}, view)
+            saved = backend._preserve({
+                "dataset_id": dataset.dataset_id,
+                "predicate": candidate.expression, "descriptor": candidate.descriptor,
+                "cases": [{**result, "report": project_case(
+                    dataset, dataset.case(result["case_id"]), result, predicate=candidate.expression)}],
+            }, view)
         restored = backend.load(journal.store(saved))
         record = restored["cases"][0]
         assert record["descriptor"] == candidate.descriptor != record["capture"]["descriptor"]
