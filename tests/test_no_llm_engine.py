@@ -759,6 +759,127 @@ def test_new_capture_revision_reopens_frontier_and_cached_capture_cannot_rewind_
         assert restored.state["blocked"] == ["system:0", "system:4"]
 
 
+class OutsideTrapExecution(FiniteExecution):
+    trap_domain = "system"
+
+    def _result(self, source):
+        result = super()._result(source)
+        branch = 0 if source == "0" else 2
+        report = observed_report("other_crash", "other_crash", branch)
+        if branch == 2:
+            # The repair hit does not cancel a trap at a later visit.
+            report["activation"].update(repair_hits=1, trap_hits=1)
+        result["cases"].append({
+            "case_id": self.trap_domain + ":99", "domain": self.trap_domain,
+            "value": 9, "branch": branch, "branches": [0] if branch == 0 else [1, 2],
+            "report": report})
+        return result
+
+
+@pytest.mark.parametrize("domain", ["system", "function"])
+def test_all_unsafe_results_have_no_final_candidate_even_with_valid_working_owners(tmp_path, domain):
+    limits = SearchLimits(max_evaluations=4, max_factors=1, operand_depth=1, beam_width=2)
+    with Journal(tmp_path / "search", {"case": "all-trapped", "domain": domain}) as journal:
+        class TrapExecution(OutsideTrapExecution):
+            trap_domain = domain
+
+        engine = SearchEngine(TrapExecution(journal, limits))
+        engine._start_draft("introduce", "system:0")
+        engine.state["draft"]["queue"] = [["rax < -1"]]
+        engine._step_draft()
+        result = engine.run()
+        assert engine.population.cases[domain + ":99"]["label"] == "excluded"
+        assert any(journal.load(event["data"]["state"])["clauses"]
+                   for event in journal.events if event["kind"] == "commit")
+        assert engine.state["best_result"] is None
+        assert result["predicate"] is None
+        assert result["program"] == result["clauses"] == []
+        assert result["publication_status"] == "no_candidate"
+        assert result["admission"]["status"] == "not_evaluated"
+
+
+def test_unsafe_better_target_objective_preserves_eligible_incumbent(tmp_path):
+    from taosc_llm.no_llm.score import Score
+
+    with Journal(tmp_path / "search", {"case": "unsafe-better"}) as journal:
+        engine = SearchEngine(FiniteExecution(journal, SearchLimits(operand_depth=1)))
+        engine._run((("rax < -1",),))
+        saved = deepcopy(engine.state["best_result"])
+        unsafe = engine.backend._result("(1)")
+        unsafe["cases"][1]["report"]["activation"]["status"] = "trapped"
+        score = Score.from_evaluation(engine.population, unsafe)
+        assert len(score.target_failures) < len(engine.best_score.target_failures)
+        engine._archive(((),), unsafe, score, journal.store(unsafe))
+        assert engine.state["best_result"] == saved
+        assert engine.result()["evaluation"] == saved["evaluation"]
+
+
+def test_new_incumbent_trap_evidence_revokes_final_selection(tmp_path):
+    from taosc_llm.no_llm.score import Score
+
+    with Journal(tmp_path / "search", {"case": "new-incumbent-trap"}) as journal:
+        engine = SearchEngine(FiniteExecution(journal, SearchLimits(operand_depth=1)))
+        _, evaluated, _ = engine._run((("rax < -1",),))
+        unsafe = deepcopy(evaluated)
+        unsafe["cases"][1]["report"]["activation"]["status"] = "trapped"
+        engine._archive((("rax < -1",),), unsafe,
+                        Score.from_evaluation(engine.population, unsafe), journal.store(unsafe))
+        assert engine.state["best_result"] is None
+        assert engine.best_sets is None
+        assert engine.result()["predicate"] is None
+        assert engine.result()["publication_status"] == "no_candidate"
+
+
+def test_guard_first_search_retains_dangerous_atom_and_selects_eligible_composition(tmp_path, finite_grammar):
+    guard, dangerous = "rax != 0", "1 / rax != 0"
+    finite_grammar(guard, dangerous)
+
+    class DivisionExecution(PartitionExecution):
+        cases = (((1,), "target_crash", True), ((0,), "normal", True), ((2,), "normal", True))
+
+    limits = SearchLimits(max_evaluations=24, max_clauses=1, max_factors=2,
+                          operand_depth=1, beam_width=4)
+    with Journal(tmp_path / "search", {"case": "guarded-division"}) as journal:
+        backend = DivisionExecution(journal, limits)
+        engine = SearchEngine(backend)
+        # Standalone danger and guard-after-danger are genuinely evaluated and
+        # rejected, not removed from the atom pool or rewritten into safety.
+        engine._run(((dangerous,),))
+        engine._run(((dangerous, guard),))
+        assert engine.state["best_result"] is None
+        assert dangerous in engine.space.atoms
+        result = engine.run()
+        assert result["program"] == [[guard, dangerous]]
+        assert result["score"]["covered"] == ["system:0"]
+        assert result["score"]["branch_regressions"] == []
+        assert result["score"]["selection"]["predicate_traps"] == []
+        assert result["admission"]["status"] == "eligible"
+        assert backend.evaluations <= limits.max_evaluations
+        assert dangerous in engine.space.atoms
+
+
+@pytest.mark.parametrize("stored_claim", ["eligible", "published"])
+def test_resume_rechecks_saved_archive_evaluation_despite_eligible_scalars(tmp_path, stored_claim):
+    output = tmp_path / "search"
+    identity = {"case": "forged-final-admission", "claim": stored_claim}
+    limits = SearchLimits(operand_depth=1)
+    with Journal(output, identity) as journal:
+        engine = SearchEngine(FiniteExecution(journal, limits))
+        _, evaluated, _ = engine._run((("rax < -1",),))
+        unsafe = deepcopy(evaluated)
+        unsafe["cases"][1]["report"]["activation"]["status"] = "trapped"
+        saved = engine.state["best_result"]
+        saved.update(evaluation=journal.store(unsafe),
+                     admission={"status": "eligible", "predicate_traps": 0, "trap_cases": []},
+                     score={"selection": {"predicate_traps": []}}, publication_status=stored_claim)
+        engine._save()
+        journal.append("publication", {"predicate": saved["predicate"],
+                                       "record": journal.store({"candidate": {"status": "published"}})})
+    with Journal(output, identity, resume=True) as journal:
+        with pytest.raises(ValueError, match="checkpoint archive rejected predicate trap"):
+            SearchEngine(FiniteExecution(journal, limits))
+
+
 def test_budget_promotion_cannot_replace_an_existing_owner(tmp_path):
     limits = SearchLimits(operand_depth=1)
     with Journal(tmp_path / "search", {"case": "owner-preservation"}) as journal:

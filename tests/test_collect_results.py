@@ -126,6 +126,51 @@ def no_llm(root, *, runner=False):
     return reference
 
 
+@pytest.mark.parametrize('mode', ['provider', 'manual'])
+def test_historical_trapped_publication_keeps_raw_metrics_but_loses_final_admission(tmp_path, mode):
+    trapped = case(outcome='normal')
+    trapped['report']['activation'].update(status='trapped', repair_hits=1, trap_hits=1)
+    root = (provider(tmp_path / 'run', cases=[trapped]) if mode == 'provider'
+            else manual(tmp_path / 'run', cases=[trapped]))
+    path = root / 'run.json'
+    record = json.loads(path.read_text())
+    (record['synthesis'] if mode == 'provider' else record)['publication_status'] = 'published'
+    save(path, record)
+    original = path.read_bytes()
+    row = collect(root)
+    assert row['collection_error'] is None
+    assert row['final_admission'] == 'rejected-predicate-trap'
+    assert row['target_status'] == 'no_candidate'
+    assert row['publication_status'] == 'published'
+    assert row['candidate_known'] == row['target_fixed'] == row['predicate_traps'] == 1
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize('runner', [False, True])
+def test_rejected_provider_proposal_collects_diagnostics_not_a_final_candidate(tmp_path, runner):
+    root = tmp_path / 'run'
+    result_root = root / 'result' if runner else root
+    trapped = case(outcome='unknown', capture='unavailable')
+    trapped['report']['candidate']['reason'] = 'predicate-trap'
+    result = {'schema_version': 2, 'provider': {}, 'rounds': [], 'status': 'no_candidate',
+              'proposal': {'decision': 'candidate', 'predicate': 'rax < 0'},
+              'evaluation': evaluation(cases=[trapped])}
+    save(result_root / 'run.json', result)
+    if runner:
+        save(root / 'run.json', {'engine': 'taosc-llm-run', 'mode': 'provider',
+                                'status': 'finished', 'exit_code': 0,
+                                'result_directory': str(result_root),
+                                'synthesis': {'status': 'no_candidate'}})
+    row = collect(root)
+    assert row['collection_error'] is None
+    assert row['lifecycle'] == 'finished'
+    assert row['target_status'] == 'no_candidate'
+    assert row['final_admission'] == 'rejected-predicate-trap'
+    assert row['predicate_traps'] == 1
+    assert row['selected_round'] is None
+    assert row['publication_status'] is None
+
+
 def test_selected_round_not_last_failed_candidate(tmp_path):
     root = provider(tmp_path / "run with spaces", selected=2,
                     cases=[case(outcome="other_crash")])
@@ -338,7 +383,7 @@ def test_tabular_columns_are_stable_and_quote_special_paths(tmp_path, output_for
     assert "subject_id" not in row
     if verbose == "compact":
         assert reader.fieldnames == [
-            "subject", "mode", "predicate", "candidate_known", "candidate_normal",
+            "subject", "mode", "predicate", "final_admission", "candidate_known", "candidate_normal",
             "system_candidate_target_crashes", "function_candidate_target_crashes",
             "branch_comparable", "branch_regressions",
         ]

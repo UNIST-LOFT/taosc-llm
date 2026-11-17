@@ -158,12 +158,14 @@ uv run --project utils/taosc-llm taosc-llm \
   endpoint; the CLI rejects `--offline` combined with `--replay-socket`.
 - Per-case target-oracle diagnostics keep the existing vocabulary: `target-crash` (the artifact's
   committed attempt-1 oracle) is `reject_same_crash`; `normal` and `other-crash`
-  are `not_rejected`; cancellation, trap and incomplete observation are `unavailable`.
+  are `not_rejected`; cancellation and incomplete observation are `unavailable`.
+  Authenticated `unavailable/predicate-trap` becomes `reject_predicate_trap` in
+  the host evaluator and blocks final admission, without a reusable capture.
   Native `ignored` is reserved for unsupported-external-state and child timeout:
   host evidence stays unavailable with `ignored:true` and the original reason,
   excluded from scores without claiming repair. Terminal replay counts separate
   `ignored` from `unavailable`; either means partial coverage. Python and tracer
-  require resident protocol `0x41464C08` together (ordinary v5 is unchanged).
+  require resident protocol `0x41464C09` together; old resident peers are rejected (ordinary v5 is unchanged).
   Nonretained function cases remain offline even with a live bridge, so offline
   branch-divergence remains possible. Every result keeps
   `verified=false`; nothing is FINAL verification.
@@ -272,8 +274,18 @@ clauses and that branch’s global owners; selecting a different branch never
 transfers ownership. Losing evidence alone cannot improve final selection, but
 unrelated gaps cannot veto a supported improvement.
 
+All modes share `candidate_admission`: a known predicate trap anywhere in the
+full evaluation (system, function or original POC, including mixed `[1,2]` hits)
+rejects final selection before target/branch ranking. `admission` reports
+`eligible|rejected-predicate-trap|not_evaluated` and trap case IDs/counts. Eligibility
+means no known trap, not totality or repair proof. Trap-capable atoms/drafts remain
+available for ordered short-circuit composition; re-evaluate the complete guarded
+expression. Unknown/timeout/unsupported evidence is not itself a trap. An offline
+trap can reject only on the matching representative prefix, before or at first
+divergence; later reference-state predictions cannot establish reachable traps.
+
 An independent best-result archive uses the common final comparator, without
-requiring clause owners. The first actually evaluated nonneutral program can be
+requiring clause owners. The first eligible actually evaluated nonneutral program can be
 selected, including a generic constant-1 seed with no owners; no candidate is
 invented for an unsupported grammar. The archive persists its exact program,
 expression and evaluation separately from working-branch metadata. Normal/budget
@@ -320,7 +332,10 @@ Directory/file locks, restrictive permissions, symlink rejection and fsync order
 protect publication. The best-result archive, active and pending branches,
 scheduling order, capture revision, atom order, owner proofs and spent budgets
 are restored. Different dataset/artifact/oracle,
-implementation, limits, workers or replay policy refuses resume. SIGINT/TERM
+implementation, limits, workers or replay policy refuses resume. Identity also
+includes `final_admission_policy=reject-known-predicate-traps-v1`; pre-policy
+checkpoints require a fresh output. Saved evaluations are rechecked for trap
+admission before restoring final selection or reusing a publication. SIGINT/TERM
 stop admission and drain registered children. SIGKILL cannot report its stop time:
 the interval since the last durable budget timestamp, including downtime, is
 conservatively charged; cleanly closed sessions do not charge downtime.
@@ -333,8 +348,11 @@ A missing old replay server allows offline/concrete continuation; an endpoint
 replacement cannot rebind old mutation IDs. BRCH is not a process checkpoint.
 A completed `publication` event stores the selected predicate binding to the exact
 frozen `.brcached` path/hash and its explicit activation. Resume reauthenticates
-the dataset, runtime bytes, descriptor and activation; it does not rebuild or
-compare different executable layouts. `publication_status=published` means the
+the dataset, runtime bytes, descriptor, activation and complete evaluation;
+publication schema 2 binds its canonical SHA-256. Both publication APIs require
+`evaluation=` with all dataset cases and the applicable original POC, matching
+candidate descriptors and eligible admission. They do not rebuild or compare
+different executable layouts. `publication_status=published` means the
 binding is durable, not that targets or regressions are absent. Mutation evidence
 remains bound to its original cached artifact and replay limitations. Every result
 retains `verified=false` and `binradar_verification=not_run`. Older search sessions
@@ -399,7 +417,11 @@ from the original artifact. Saved QASAN diagnostics are summarized inline; deepe
 frames/allocation/free histories require bounded `get_patch_context(view="poc_log")`
 pages. Neither saved-log addresses nor site values replace the configured target
 oracle. See [POC evidence](../../agent-docs/taosc-llm/PROMPTS_AND_EVIDENCE.md#original-poc-diagnostic-summary).
-Candidate proposals require evaluation of the exact expression. Context and
+Candidate proposals require evaluation of the exact expression. The shared
+`admission` hard gate rejects known predicate traps before objective ranking;
+`predicate_traps` provides a count and at most three counterexamples. A guarded
+composition is evaluated as a new complete expression, not rejected merely
+because one of its parts previously trapped. Context and
 `list_cases` show at most three crash/three normal examples. Feedback's authoritative
 `objective` reports observed designated-target crashes first, then authenticated
 normal-control→normal/other-crash complete-vector branch regressions, with
@@ -414,8 +436,14 @@ Failure groups have counts and at most three examples; optional scoped filters
 retrieve more. Hashes and private paths stay host-only. Static `function` views
 default to available facets; select a facet/address for local CFG/value-flow evidence.
 
-Strict parsing, authenticated publication and actual evaluations feed provider refinement
-(`--max-rounds` 1–16, default 4); manual mode rejects provider-only options.
+Provider refinement (`--max-rounds` 1–16, default 4) parses, evaluates, applies
+shared admission, then selects an incumbent. Only the terminal eligible incumbent
+is published; round proposals/evaluations are diagnostic, never published
+candidates. A trap cannot displace an eligible incumbent or trigger the observed
+minimum. All evaluated proposals rejected by admission yield `status=no_candidate`;
+manual trap rejection yields `status=reject_predicate_trap`. Both retain diagnostics
+without `candidate` or `publication_status=published`, and exit 0. Manual mode
+rejects provider-only options.
 Incumbent selection compares target-crash counts on case IDs whose outcomes are
 known in **both** evaluations. A strict target improvement takes precedence over
 branch differences. Otherwise it compares branch-regression counts on case IDs
@@ -505,9 +533,11 @@ Stdout contains one JSON result; diagnostics go to stderr. Common CLI exits:
 | 2 | Invalid CLI arguments, not candidate quality |
 | 130 | Interrupted; local cleanup does not prove remote provider completion |
 
-`evaluation.status` remains the target-only diagnostic: any same-target crash
-rejects, otherwise a nonempty case set is `not_rejected`, including unavailable
-cases; an empty set is `unavailable`. Do not aggregate this field as repair
+`evaluation.status` is `reject_predicate_trap` if any case has a confirmed
+predicate trap, otherwise `reject_same_crash` if any same-target crash remains.
+Otherwise a nonempty case set is `not_rejected`, including unavailable cases;
+an empty set is `unavailable`. Per-case status and summary counts preserve the
+trap/target distinction. The shared `admission` is independent of raw outcomes. Do not aggregate this field as repair
 success. Provider/manual result `objective` is the observed target/branch view;
 its run status distinguishes `target_present`, `target_absent` and `not_observed`
 as `reject_same_crash`, `not_rejected` and `unavailable`. The separate legacy
@@ -534,7 +564,9 @@ model projection or a tool result, and it is not a patch field.
 Without it, synthesis allocates one temporary directory. Model results go directly
 into `run.json` (including private `context_provenance`), `context.json`, private
 preflight `poc.json`, `trials/<round>/` journals/final text, and
-`candidates/<round>/candidate.json` and `evaluation.json`.
+`candidates/<round>/evaluation.json`. Only final publication creates root
+`candidate.json`; no round-level candidate binding is emitted. Rejected proposals
+remain in round/evaluation diagnostics, not the final candidate field.
 Optional review writes `session-feedback.md` in that same root. Manual results use
 `candidate.json`, `context.json` and `run.json` directly under `--output`.
 Protocol `run_id` remains metadata; use returned `run_directory`, never append
@@ -556,6 +588,7 @@ taosc-llm-out-00000/result/
   run.json
   context.json
   poc.json
+  candidate.json               # only for terminal eligible publication
   session-feedback.md          # only with successful --session-feedback
   trials/
   candidates/
@@ -567,6 +600,7 @@ taosc-llm-out-00000/result/
 | `predicate`, `source_predicate`, `descriptor` | Canonical candidate, family polarity and runtime descriptor |
 | `activation` | Explicit `PATCH_ID=0`, `TAOSC_PRED=<descriptor>`, `BRCACHE_STACK_SIZE` |
 | `dataset_id`, `patch_location`, `patch_destination` | Immutable evidence and existing repair-site/action binding |
+| `evaluation_sha256` | Canonical complete evaluation bound by publication schema 2; rechecked with admission on resume |
 
 Keep the frozen dataset with the result. Apply all `candidate.activation` entries
 when executing `candidate.artifact.path` with the original target arguments.
@@ -686,7 +720,12 @@ attribution. Unknown cases do not turn `target_absent` into an incomplete patch,
 but remain explicitly counted. Baseline gaps, other crashes and branch differences
 do not change `target_status`. Branch differences still count in the shared
 selection objective. Collection never reranks saved candidates or rewrites reports;
-historical outputs retain their original selection policy.
+historical outputs retain their original raw publication and outcome counts.
+`final_admission` separately reports current known-trap eligibility; a historical
+trapped publication or newly rejected proposal has `target_status=no_candidate`,
+not a successful final candidate. Evidence without case reports remains
+`not_evaluated` rather than certified trap-free. Compact output includes this
+admission column; raw target/branch counters remain available for diagnosis.
 
 | Axis | Important fields / interpretation |
 |---|---|

@@ -155,7 +155,7 @@ def verify_fixture(directory: Path, result: dict) -> dict:
     from .publication import validate_publication
     candidate = result["candidate"]
     dataset = load_dataset(directory / "dataset")
-    validate_publication(dataset, candidate, candidate["predicate"])
+    validate_publication(dataset, candidate, candidate["predicate"], evaluation=result["evaluation"])
     binary = Path(candidate["artifact"]["path"])
     scratch = directory / "verification-scratch"
     scratch.mkdir(mode=0o700, exist_ok=True)

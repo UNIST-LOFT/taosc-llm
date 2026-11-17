@@ -20,6 +20,7 @@ def session_identity(dataset: PreparedDataset, limits: SearchLimits, *, workers:
         "dataset.py", "evaluation.py", "evidence.py", "family.py", "poc.py", "replay.py",
         "publication.py", "native.py", "collection_metrics.py")]
     return {"schema_version": 1, "engine": "taosc-llm-no-llm",
+            "final_admission_policy": "reject-known-predicate-traps-v1",
             "dataset_id": dataset.dataset_id, "manifest": dataset.manifest,
             "environment": dataset.execution_environment(), "runtime": execution_identity(),
             "implementation": {str(path.relative_to(sources.parent)): sha256(path)

@@ -120,6 +120,24 @@ def test_normal_other_crash_uses_only_shared_actual_vector_objective(comparison,
     assert score.ignored == {"system:0": "other-crash"}
 
 
+@pytest.mark.parametrize("domain", ["system", "function"])
+def test_shared_trap_set_survives_score_serialization_outside_owners(domain):
+    trapped = row(domain + ":99", baseline="other_crash", activation="trapped")
+    trapped["domain"] = domain
+    trapped["report"]["activation"].update(repair_hits=1, trap_hits=1)
+    baseline = {"cases": [row("system:0"), trapped]}
+    population = Population.from_evaluation(baseline)
+    evaluated = {"cases": [row("system:0"), trapped]}
+    score = Score.from_evaluation(population, evaluated)
+    assert domain + ":99" not in population.active
+    assert score.covered == {"system:0"}
+    assert score.selection["predicate_traps"] == {domain + ":99"}
+    serialized = score.to_dict()["selection"]
+    assert serialized["predicate_traps"] == [domain + ":99"]
+    # Restoring scores authenticates the evaluation, not saved summary scalars.
+    assert Score.from_evaluation(population, evaluated).to_dict()["selection"] == serialized
+
+
 def test_shared_target_objective_includes_cases_outside_search_population():
     baseline = row("system:0")
     baseline["report"]["original_baseline"]["outcome"] = "unknown"

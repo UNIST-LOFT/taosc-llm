@@ -122,7 +122,8 @@ class Score:
     def to_dict(self) -> dict:
         return {"covered": sorted(self.covered), "branch_regressions": sorted(self.regressions),
                 "target_failures": sorted(self.target_failures), "known_normals": sorted(self.known_normals),
-                "ignored": dict(sorted(self.ignored.items()))}
+                "ignored": dict(sorted(self.ignored.items())),
+                "selection": {key: sorted(value) for key, value in sorted(self.selection.items())}}
 
     def complete(self, population: Population) -> bool:
         return not population.gaps and not self.ignored and self.known_normals == population.normals

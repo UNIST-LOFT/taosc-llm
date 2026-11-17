@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import copy
 
-from ..collection_metrics import compare_selection, selection_objective
+from ..collection_metrics import candidate_admission, compare_selection, selection_objective
 from ..dataset import canonical
 from ..family import parse_candidate
 from .model import SearchStopped
@@ -74,7 +74,7 @@ class SearchEngine:
             score = Score.from_evaluation(self.population, evaluated)
             self._scores[canonical(branch["evaluation"])] = score
             self._validate_branch(branch, evaluated, score)
-        self.best_score = self.score
+        self.best_score = Score.from_evaluation(self.population, self.baseline)
         self.best_evaluation = self.baseline
         self.best_sets = None
         if self.state["best_result"] is not None:
@@ -364,6 +364,18 @@ class SearchEngine:
                 raise ValueError("draft introduction does not establish owners")
 
     def _archive(self, program, result, score, reference):
+        # Reject only final promotion: the evaluated draft and its ordered
+        # factors still participate in ownership and bounded continuation work.
+        if candidate_admission(result)["status"] != "eligible":
+            if (self.state["best_result"] is not None
+                    and self.best_evaluation["descriptor"] == result["descriptor"]):
+                # New evidence for the incumbent cannot leave its older,
+                # apparently eligible observation selected.
+                self.state["best_result"] = None
+                self.best_evaluation = self.baseline
+                self.best_score = Score.from_evaluation(self.population, self.baseline)
+                self.best_sets = None
+            return
         after = score.selection
         accepted, _ = compare_selection(self.best_sets, after)
         if not accepted:
@@ -622,6 +634,8 @@ class SearchEngine:
         evaluated = self.backend.load(saved["evaluation"])
         score = Score.from_evaluation(self.population, evaluated)
         self._validate_archive(saved, evaluated, score)
+        if candidate_admission(evaluated)["status"] != "eligible":
+            raise ValueError("checkpoint archive rejected predicate trap")
         self.backend.check_operation()
         self.best_score, self.best_evaluation = score, evaluated
         self.best_sets = score.selection
@@ -629,7 +643,8 @@ class SearchEngine:
 
     def _exhaustion_reason(self):
         score = self.best_score
-        if (self.population.crashes <= score.covered and not score.regressions
+        if (self.best_sets is not None
+                and self.population.crashes <= score.covered and not score.regressions
                 and not score.target_failures and score.complete(self.population)):
             return "observed-goals-met"
         if score.ignored or self.population.gaps:
@@ -698,20 +713,29 @@ class SearchEngine:
         return self.result()
 
     def result(self, *, interrupted=False):
-        if (interrupted or self.state["termination"] == "interrupted"
-                or self.state["best_result"] is None):
+        if interrupted or self.state["termination"] == "interrupted":
             selected, score, evaluated = self.state, self.score, self.current
             program = _clauses(selected["clauses"])
             predicate = compose(self.family, program) if program else None
-        else:
+        elif self.state["best_result"] is not None:
             selected, score, evaluated = self.state["best_result"], self.best_score, self.best_evaluation
             program = tuple(tuple(row) for row in selected["program"])
             predicate = selected["predicate"]
+        else:
+            predicate = None
+        if predicate is None or candidate_admission(evaluated)["status"] != "eligible":
+            # A useful working branch may contain known traps outside its
+            # owners. It is never a fallback final candidate.
+            selected = {"clauses": [], "evaluation": self.backend.baseline_ref}
+            score, evaluated = Score.from_evaluation(self.population, self.baseline), self.baseline
+            program, predicate = (), None
         return {"schema_version": 1, "engine": "taosc-llm-no-llm",
                 "dataset_id": self.backend.dataset.dataset_id,
                 "termination": self.state["termination"], "verified": False,
                 "binradar_verification": "not_run", "run_directory": str(self.journal.directory),
                 "predicate": predicate, "program": [list(row) for row in program],
+                "admission": candidate_admission(evaluated if predicate is not None else None),
+                "publication_status": "not_published" if predicate is not None else "no_candidate",
                 "clauses": copy.deepcopy(selected["clauses"]), "population": self.population.to_dict(),
                 "evaluation": selected["evaluation"], "score": score.summary(self.population),
                 "objective": selection_objective(evaluated if predicate is not None else None),

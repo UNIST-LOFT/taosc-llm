@@ -40,7 +40,8 @@ def _run(label: str, operation) -> int:
             return 130
         # Process completion is independent of the observed repair quality.
         return 0 if status in ("prepared", "built", "abstained", "not_rejected", "warmed",
-                               "reject_same_crash", "rejected", "unavailable", "refinement_exhausted") else 1
+                               "reject_same_crash", "reject_predicate_trap", "rejected", "unavailable",
+                               "no_candidate", "refinement_exhausted") else 1
     except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as error:
         print(f"{label}: {error}", file=sys.stderr)
         return 1

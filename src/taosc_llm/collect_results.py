@@ -20,18 +20,18 @@ import stat
 import sys
 from typing import TextIO
 
-from .collection_metrics import METRIC_FIELDS, collect_metrics
+from .collection_metrics import METRIC_FIELDS, candidate_admission, collect_metrics
 
 
 ROW_FIELDS = (
     "subject", "run", "run_directory", "mode", "lifecycle",
     "exit_code", "run_error", "synthesis_status", "selected_round", "predicate",
-    "termination", "legacy_quality", "publication_status", "verified",
+    "termination", "legacy_quality", "publication_status", "final_admission", "verified",
     "binradar_verification", "evaluation_source", "collection_status", "collection_error",
 )
 COLUMNS = ROW_FIELDS + METRIC_FIELDS
 _COMPACT_COLUMNS = (
-    "subject", "mode", "predicate", "candidate_known", "candidate_normal",
+    "subject", "mode", "predicate", "final_admission", "candidate_known", "candidate_normal",
     "system_candidate_target_crashes", "function_candidate_target_crashes",
     "branch_comparable", "branch_regressions",
 )
@@ -143,9 +143,9 @@ def _compact(record: dict) -> dict:
     proposal = record.get("proposal")
     if isinstance(proposal, dict) and proposal.get("decision") == "candidate":
         result["predicate"] = proposal.get("predicate")
-    # Provider reports have a separately saved selected candidate. Manual
-    # reports are inline; no-LLM reports contain a content-addressed reference.
-    if "selected_round" not in record and "evaluation" in record:
+    # New provider/manual records keep final or rejected diagnostics inline;
+    # historical providers also have selected per-round evaluation files.
+    if "evaluation" in record:
         result["evaluation"] = record["evaluation"]
     if "provider" in record or "rounds" in record:
         result["mode"] = "provider"
@@ -259,14 +259,21 @@ def _collect_selected(row: dict, summary: dict, result_root: Path) -> None:
         if selected is not None:
             if type(selected) is not int or selected < 1:
                 raise ValueError("selected_round must be a positive integer")
-            source = result_root / "candidates" / str(selected) / "evaluation.json"
-            evaluation = _read_json(source)
+            evaluation = summary.get("evaluation")
+            source = result_root / "run.json"
+            if evaluation is None:
+                source = result_root / "candidates" / str(selected) / "evaluation.json"
+                evaluation = _read_json(source)
             predicate = evaluation.get("predicate")
             if not isinstance(predicate, str) or not predicate:
                 raise ValueError("selected candidate evaluation has no predicate")
             if row["predicate"] is not None and row["predicate"] != predicate:
                 raise ValueError("selected predicate disagrees with its saved evaluation")
             row["predicate"] = predicate
+        elif summary.get("status") == "no_candidate" and summary.get("evaluation") is not None:
+            evaluation = summary["evaluation"]
+            source = result_root / "run.json"
+            row["predicate"] = evaluation.get("predicate")
         elif row["predicate"] is not None:
             raise ValueError("provider candidate has no saved selected_round")
     else:
@@ -289,7 +296,15 @@ def _collect_selected(row: dict, summary: dict, result_root: Path) -> None:
     if evaluation is not None and evaluation.get("predicate") != row["predicate"]:
         raise ValueError("selected predicate disagrees with its saved evaluation")
     row["evaluation_source"] = str(source) if source is not None else None
-    row.update(collect_metrics(evaluation, candidate_present=row["predicate"] is not None))
+    admission = candidate_admission(evaluation)
+    row['final_admission'] = admission['status']
+    if (evaluation is not None and evaluation.get('cases')
+            and not any(case.get('report') for case in evaluation['cases'])):
+        row['final_admission'] = 'not_evaluated'
+    candidate_present = (row['predicate'] is not None
+                         and admission['status'] == 'eligible'
+                         and summary.get('status') not in ('no_candidate', 'reject_predicate_trap'))
+    row.update(collect_metrics(evaluation, candidate_present=candidate_present))
     if evaluation is not None and row["legacy_quality"] is None:
         quality = evaluation.get("quality")
         if isinstance(quality, dict):
@@ -327,7 +342,8 @@ def collect_run(spec: RunSpec) -> dict:
                     raise ValueError("runner synthesis summary must be an object")
                 # Compact provider summary names exactly the retained candidate;
                 # do not read either giant repeated synthesis report on this path.
-                if row["mode"] == "provider" and summary is not None:
+                if (row["mode"] == "provider" and summary is not None
+                        and summary.get('status') != 'no_candidate'):
                     pass
                 elif row["mode"] == "no-llm" and summary is not None and summary.get("result_record"):
                     pass
@@ -356,7 +372,8 @@ def collect_run(spec: RunSpec) -> dict:
                 status = record.get("status")
                 if row["mode"] == "no-llm":
                     row["lifecycle"] = "interrupted" if record.get("termination") == "interrupted" else "recorded"
-                elif status in ("not_rejected", "reject_same_crash", "rejected", "unavailable",
+                elif status in ("not_rejected", "reject_same_crash", "reject_predicate_trap", "no_candidate",
+                                "rejected", "unavailable",
                                 "abstained", "refinement_exhausted", "built"):
                     row["lifecycle"] = "finished"
                 elif status == "infrastructure_error":

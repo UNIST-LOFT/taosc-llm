@@ -8,7 +8,7 @@ from __future__ import annotations
 from binradar.binradar_taosc_predicates import REGISTER_TO_VAR
 
 from .cases import case_order, case_records, relevant_registers
-from .collection_metrics import selection_case_sets, selection_objective
+from .collection_metrics import candidate_admission, selection_case_sets, selection_objective
 from .evidence import classify_quality, project_case, summarize_quality
 
 
@@ -207,9 +207,12 @@ def feedback(dataset, evaluation):
         diagnostics['warning'] = (
             'Limited evidence: missing candidate observations, unmatched controls or unproven repair. '
             'These are diagnostic limitations, not selection penalties; missing data is not success.')
-    result = {'objective': selection_objective(evaluation), 'diagnostics': diagnostics}
+    admission = candidate_admission(evaluation)
+    result = {'objective': selection_objective(evaluation), 'diagnostics': diagnostics,
+              'admission': {key: admission[key] for key in ('status', 'predicate_traps')}}
     for public, private in (('missed_target_crashes', 'target_crashes'),
-                            ('branch_regressions', 'branch_regressions')):
+                            ('branch_regressions', 'branch_regressions'),
+                            ('predicate_traps', 'predicate_traps')):
         group = [record for record in records if record['report']['case_id'] in case_sets[private]]
         result[public] = {'count': len(case_sets[private]),
                           'examples': examples(group, branch=private == 'branch_regressions')}

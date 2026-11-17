@@ -294,6 +294,9 @@ class Journal:
         if (set(header) != {"schema", "identity", "sha256"}
                 or type(header["schema"]) is not int or header["schema"] != 1):
             raise JournalError("unsupported journal identity schema")
+        if (isinstance(header["identity"], dict)
+                and header["identity"].get("final_admission_policy") != self.identity.get("final_admission_policy")):
+            raise JournalError("journal identity mismatch: final admission policy changed; start a fresh output")
         if _canonical(header["identity"]) != self._identity_bytes:
             raise JournalError("journal identity mismatch")
 

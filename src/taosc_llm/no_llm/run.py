@@ -11,12 +11,12 @@ from .journal import Journal
 from .model import SearchLimits, SearchStopped
 
 
-def _existing_publication(journal, dataset, predicate, *, check=None):
+def _existing_publication(journal, dataset, predicate, *, evaluation, check=None):
     for event in reversed(journal.events):
         if event["kind"] != "publication" or event["data"]["predicate"] != predicate:
             continue
         record = journal.load(event["data"]["record"])
-        validate_publication(dataset, record['candidate'], predicate, check=check)
+        validate_publication(dataset, record['candidate'], predicate, evaluation=evaluation, check=check)
         return record
     return None
 
@@ -45,16 +45,17 @@ def synthesize(dataset, *, output: Path, limits: SearchLimits | None = None,
             result = engine.run()
             backend.check_cancelled()
             if result["predicate"] is not None and result["termination"] != "interrupted":
+                with backend.restoration():
+                    selected = backend.load(result["evaluation"])
+                if (selected['dataset_id'] != dataset.dataset_id
+                        or selected['predicate'] != result['predicate']):
+                    raise ValueError('selected evaluation identity mismatch')
                 publication = _existing_publication(journal, dataset, result["predicate"],
-                                                    check=backend.check_cancelled)
+                                                    evaluation=selected, check=backend.check_cancelled)
                 if publication is None:
                     backend.checkpoint_budget()
-                    with backend.restoration():
-                        selected = backend.load(result["evaluation"])
-                    if (selected['dataset_id'] != dataset.dataset_id
-                            or selected['predicate'] != result['predicate']):
-                        raise ValueError('selected evaluation identity mismatch')
-                    candidate = publish_candidate(dataset, result["predicate"], check=backend.check_cancelled)
+                    candidate = publish_candidate(dataset, result["predicate"], evaluation=selected,
+                                                  check=backend.check_cancelled)
                     backend.check_cancelled()
                     publication = {"candidate": candidate}
                     reference = journal.store(publication)

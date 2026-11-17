@@ -85,26 +85,29 @@ def test_parser_feedback_does_not_mask_real_build_failure(tmp_path, monkeypatch)
     monkeypatch.setattr(synthesis, "_model_round", model)
     # A changed frozen runtime must remain fatal after recoverable parser feedback.
     original_publish = synthesis.publish_candidate
-    def tampered(dataset, predicate):
+    def tampered(dataset, predicate, *, evaluation):
         dataset.artifact('fixture.brcached').write_bytes(b'changed runtime')
-        return original_publish(dataset, predicate)
+        return original_publish(dataset, predicate, evaluation=evaluation)
     monkeypatch.setattr(synthesis, 'publish_candidate', tampered)
     with pytest.raises((ValueError, RuntimeError, OSError)):
-        asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=3))
+        asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=2))
     result = json.loads((context.run_dir / "run.json").read_text())
     assert len(prompts) == 2
     assert [r["status"] for r in result["rounds"]] == ["parse_rejected", "publication_failed"]
     assert result["rounds"][-1]["proposal"]["predicate"] == "rax < 0"
     assert result["status"] == "infrastructure_error" and result["verified"] is False
     assert result["binradar_verification"] == "not_run"
-    assert "evaluation" not in result and "selected_round" not in result
+    assert result["evaluation"] == result["rounds"][-1]["evaluation"]
+    assert result["selected_round"] == 2
+    assert "candidate" not in result and "publication_status" not in result
+    assert not (context.run_dir / "candidate.json").exists()
 
 
 @pytest.mark.parametrize("error,status", [(RuntimeError("intentional benign abort"), "infrastructure_error"),
                                          (asyncio.CancelledError(), "cancelled")])
 def test_manual_failure_retains_unverified_run_record(tmp_path, monkeypatch, error, status):
     dataset = make_dataset(tmp_path / "dataset")
-    def abort_build(*args):
+    def abort_build(*args, **kwargs):
         raise error
     monkeypatch.setattr(synthesis, "publish_candidate", abort_build)
     with pytest.raises(type(error)):
@@ -118,7 +121,9 @@ def test_manual_failure_retains_unverified_run_record(tmp_path, monkeypatch, err
     assert result["run_directory"] == str(tmp_path / "runs")
     assert result["status"] == status and result["error_type"] == type(error).__name__
     assert result["verified"] is False and result["binradar_verification"] == "not_run"
-    assert "candidate" not in result and "evaluation" not in result
+    assert "candidate" not in result and "publication_status" not in result
+    assert result["evaluation"] and result["admission"]["status"] == "eligible"
+    assert not record.with_name("candidate.json").exists()
     assert json.loads(record.with_name("context.json").read_text())["context_id"] == result["context_id"]
 
 
@@ -275,7 +280,7 @@ def test_feedback_follows_final_host_outcome_only(tmp_path, monkeypatch, outcome
                 "request_count": 1, "usage": None}
         return response
 
-    def build(*args):
+    def build(*args, **kwargs):
         return {"status": "published", "verified": False}
 
     def evaluate(*args, **kwargs):
@@ -401,7 +406,7 @@ def test_manual_mode_does_not_run_provider_preflight(tmp_path, monkeypatch):
     def forbidden(*args, **kwargs):
         pytest.fail("manual generation must not run provider POC preflight")
 
-    def stop(*args):
+    def stop(*args, **kwargs):
         raise RuntimeError("stop before publication")
 
     monkeypatch.setattr(synthesis, "poc_observation", forbidden)
@@ -441,7 +446,7 @@ def test_refinement_uses_same_minimal_feedback_as_review(tmp_path, monkeypatch):
             assert forbidden not in public
         return terminal(current, proposal(current, decision="abstain", predicate=None), [])
 
-    def build(*args):
+    def build(*args, **kwargs):
         return {"status": "published", "verified": False}
 
     from taosc_llm import evaluation
@@ -457,7 +462,7 @@ def test_refinement_uses_same_minimal_feedback_as_review(tmp_path, monkeypatch):
 
 
 def quality_round(*, repaired=(), normals=(), branches=(), misses=(), missing=(), others=(), gaps=(),
-                  predicate="rax < 0"):
+                  traps=(), predicate="rax < 0"):
     """Saved report boundary fixtures with actual outcomes, not quality-only scores."""
     from test_collection_metrics import case
     from taosc_llm.evidence import summarize_quality
@@ -465,7 +470,8 @@ def quality_round(*, repaired=(), normals=(), branches=(), misses=(), missing=()
     rows = []
     for ids, facet in ((repaired, "improved"), (normals, "preserved_normal"),
                        (branches, "branch_regressions"), (misses, "target_misses"),
-                       (missing, "unavailable"), (others, "other_crashes"), (gaps, "baseline_gaps")):
+                       (missing, "unavailable"), (others, "other_crashes"), (gaps, "baseline_gaps"),
+                       (traps, "predicate_traps")):
         for identifier in ids:
             normal = facet in ("preserved_normal", "branch_regressions")
             row = case(int.from_bytes(identifier.encode(), 'big'),
@@ -476,6 +482,9 @@ def quality_round(*, repaired=(), normals=(), branches=(), misses=(), missing=()
                        comparison='different' if facet == 'branch_regressions' else 'equal')
             if facet == 'baseline_gaps':
                 row['report']['neutral_baseline']['compatible_control'] = False
+            if facet == 'predicate_traps':
+                row['report']['activation']['status'] = 'trapped'
+                row['report']['candidate']['outcome'] = 'unknown'
             row['report']['quality'] = {
                 'category': facet, 'facets': [facet], 'known_normal': normal,
                 'observed_normal': normal, 'reasons': []}
@@ -632,7 +641,10 @@ def test_provider_retains_crash_repair_before_minimizing_residual_branches(
         predicate = "rax &&" if index == 3 and ending == "malformed" else predicates[index]
         return terminal(current, proposal(current, predicate=predicate), [predicate])
 
-    def build(dataset, predicate):
+    def build(dataset, predicate, *, evaluation):
+        assert len(model_calls) == round_count
+        assert evaluation == repaired["evaluation"]
+        assert not (context.run_dir / "candidate.json").exists()
         build_calls.append(predicate)
         return {"status": "published", "verified": False, "predicate": predicate}
 
@@ -654,8 +666,12 @@ def test_provider_retains_crash_repair_before_minimizing_residual_branches(
     assert result["quality"]["counts"]["improved"] == 2
     assert result["quality"]["counts"]["branch_regressions"] == 2
     assert len(model_calls) == round_count and len(result["rounds"]) == round_count
-    assert build_calls == predicates[:3 if ending in ("abstain", "malformed", "repeat") else 4]
+    assert build_calls == ["rax <= 0"]
+    assert all("candidate" not in row for row in result["rounds"])
+    assert not list((context.run_dir / "candidates").rglob("candidate.json"))
+    assert json.loads((context.run_dir / "candidate.json").read_text()) == result["candidate"]
     assert result["rounds"][1]["selection"]["accepted"] is True
+    assert json.loads((context.run_dir / "candidates" / "2" / "evaluation.json").read_text()) == result["evaluation"]
     if ending != "repeat":
         assert result["rounds"][2]["selection"]["reason"] == "target-crashes-increased"
     assert result["candidate"]["predicate"] == "rax <= 0"
@@ -676,7 +692,7 @@ def test_manual_completed_quality_is_reported_without_runtime_error(tmp_path, mo
     dataset = make_dataset(tmp_path / "dataset")
     evaluated = quality_round(**cases)["evaluation"]
 
-    def build(*args):
+    def build(*args, **kwargs):
         return {"status": "published", "verified": False}
 
     from taosc_llm import evaluation
@@ -701,18 +717,20 @@ def test_provider_build_failure_cannot_become_abstention_or_exhaustion(tmp_path,
         calls.append(current)
         return terminal(current, proposal(current), ["rax < 0"])
 
-    def build(*args):
+    def build(*args, **kwargs):
         raise error
 
     monkeypatch.setattr(synthesis, "_model_round", model)
     monkeypatch.setattr(synthesis, "publish_candidate", build)
     with pytest.raises(type(error), match=str(error)):
-        asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=4))
+        asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=1))
     result = json.loads((context.run_dir / "run.json").read_text())
     assert len(calls) == 1 and result["status"] == "infrastructure_error"
     assert result["error_type"] == type(error).__name__
     assert result["rounds"][0]["status"] == "publication_failed"
-    assert "evaluation" not in result and "quality" not in result
+    assert "evaluation" in result and result["selected_round"] == 1
+    assert "candidate" not in result and "publication_status" not in result
+    assert not (context.run_dir / "candidate.json").exists()
     assert result["verified"] is False and result["binradar_verification"] == "not_run"
 
 
@@ -731,7 +749,7 @@ def test_real_failure_after_repair_is_not_masked_by_retained_incumbent(tmp_path,
         predicate = "rax < 0" if len(calls) == 1 else "rax <= 0"
         return terminal(current, proposal(current, predicate=predicate), [predicate])
 
-    def build(dataset, predicate):
+    def build(dataset, predicate, *, evaluation):
         if len(calls) == 2:
             raise RuntimeError("publication failed")
         return {"status": "published", "verified": False, "predicate": predicate}
@@ -743,12 +761,16 @@ def test_real_failure_after_repair_is_not_masked_by_retained_incumbent(tmp_path,
     monkeypatch.setattr(synthesis, "predicate_feedback", lambda dataset, value: {
         "objective": synthesis.selection_objective(value)})
     with pytest.raises(RuntimeError, match="provider request failed" if phase == "provider" else "publication failed"):
-        asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=4))
+        asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=2))
     result = json.loads((context.run_dir / "run.json").read_text())
     assert result["status"] == "infrastructure_error" and result["error_type"] == "RuntimeError"
     assert len(calls) == 2 and result["selected_round"] == 1
     assert result["quality"]["status"] == "improved_with_regressions"
-    assert result["evaluation"] == evaluated and result["candidate"]["predicate"] == "rax < 0"
+    assert result["evaluation"] == evaluated and result["proposal"]["predicate"] == "rax < 0"
+    assert "candidate" not in result and "publication_status" not in result
+    assert all("candidate" not in row for row in result["rounds"])
+    assert not (context.run_dir / "candidate.json").exists()
+    assert not list((context.run_dir / "candidates").rglob("candidate.json"))
     assert result["verified"] is False and result["binradar_verification"] == "not_run"
 
 
@@ -781,7 +803,7 @@ def test_provider_stop_uses_known_observed_objective_not_strict_quality(
             return terminal(current, proposal(current), ['rax < 0'])
         return terminal(current, proposal(current, decision='abstain', predicate=None), [])
 
-    def build(*args):
+    def build(*args, **kwargs):
         return {'status': 'published', 'verified': False}
 
     from taosc_llm import evaluation
@@ -823,6 +845,184 @@ def test_replay_binding_fails_before_provider_or_original_execution(tmp_path, mo
         asyncio.run(synthesis.synthesize_context(context, provider))
     saved = json.loads((context.run_dir / "run.json").read_text())
     assert saved["status"] == "infrastructure_error" and saved["rounds"] == []
+
+
+def test_provider_rejects_real_division_trap_then_publishes_guarded_complete_predicate(tmp_path, monkeypatch):
+    context = prepare_context(make_dataset(tmp_path / "dataset"), run_dir=tmp_path / "result")
+    provider = ProviderConfig(api_key="offline-only", base_url="https://example.invalid/v1", model="offline")
+    unsafe = "rax / rbx != 0"
+    guarded = "rbx != 0 && (rax / rbx != 0)"
+    calls = []
+
+    async def model(current, *args):
+        assert not (context.run_dir / "candidate.json").exists()
+        calls.append(current)
+        if len(calls) == 2:
+            update = json.loads(current._feedback)[-1]
+            assert update["admission"]["status"] == "rejected-predicate-trap"
+            assert update["admission"]["predicate_traps"] == 2
+            assert update["selection"]["accepted"] is False
+            assert "incumbent" not in update
+        predicate = unsafe if len(calls) == 1 else guarded
+        return terminal(current, proposal(current, predicate=predicate), [predicate])
+
+    monkeypatch.setattr(synthesis, "adapter_command", lambda _: ["not-executed"])
+    monkeypatch.setattr(synthesis, "_model_round", model)
+    # Real evaluator, prepared capture and publication; only the provider is substituted.
+    result = asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=2))
+    assert len(calls) == 2 and result["selected_round"] == 2
+    assert result["rounds"][0]["status"] == "reject_predicate_trap"
+    assert result["rounds"][0]["selection"]["accepted"] is False
+    assert result["rounds"][1]["selection"]["accepted"] is True
+    assert result["admission"]["status"] == "eligible"
+    assert result["candidate"]["predicate"] == guarded
+    assert result["publication_status"] == "published"
+    assert all("candidate" not in row for row in result["rounds"])
+    assert not list((context.run_dir / "candidates").rglob("candidate.json"))
+    assert json.loads((context.run_dir / "candidate.json").read_text()) == result["candidate"]
+
+
+@pytest.mark.parametrize("ending", ["round_limit", "repeat", "abstain", "malformed"])
+def test_zero_objective_trap_never_becomes_final_candidate_or_early_success(tmp_path, monkeypatch, ending):
+    context = prepare_context(make_dataset(tmp_path / "dataset"), run_dir=tmp_path / "result")
+    provider = ProviderConfig(api_key="offline-only", base_url="https://example.invalid/v1", model="offline")
+    evaluated = quality_round(repaired=("target",), traps=("normal",))["evaluation"]
+    assert synthesis._observed_minimum(synthesis.selection_objective(evaluated))
+    calls = []
+
+    async def model(current, *args):
+        calls.append(current)
+        if len(calls) > 1:
+            update = json.loads(current._feedback)[-1]
+            assert update["admission"]["status"] == "rejected-predicate-trap"
+            assert update["selection"]["accepted"] is False
+            assert "incumbent" not in update
+            if ending == "abstain":
+                return terminal(current, proposal(current, decision="abstain", predicate=None), [])
+            if ending == "malformed":
+                return terminal(current, proposal(current, predicate="rax &&"), [])
+        return terminal(current, proposal(current), ["rax < 0"])
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("known-trapping proposals must never reach publication")
+
+    from taosc_llm import evaluation
+    monkeypatch.setattr(synthesis, "adapter_command", lambda _: ["not-executed"])
+    monkeypatch.setattr(synthesis, "_model_round", model)
+    monkeypatch.setattr(synthesis, "publish_candidate", forbidden)
+    monkeypatch.setattr(evaluation, "evaluate_dataset", lambda *args, **kwargs: evaluated)
+    monkeypatch.setattr(synthesis, "predicate_feedback", lambda dataset, value: {
+        "objective": synthesis.selection_objective(value)})
+    result = asyncio.run(synthesis.synthesize_context(context, provider,
+        max_rounds=1 if ending == "round_limit" else 3 if ending == "repeat" else 2))
+    assert result["status"] == "no_candidate" and result["termination"] != "observed_objective_minimum"
+    assert len(calls) == (1 if ending == "round_limit" else 2)
+    if ending == "repeat":
+        assert result["termination"] == "repeated_result"
+    assert result["admission"]["status"] == "rejected-predicate-trap"
+    assert result["evaluation"] == evaluated
+    assert "selected_round" not in result and "candidate" not in result
+    assert "publication_status" not in result and "error_type" not in result
+    assert not (context.run_dir / "candidate.json").exists()
+    assert not list((context.run_dir / "candidates").rglob("candidate.json"))
+
+
+@pytest.mark.parametrize("ending", ["round_limit", "abstain"])
+def test_unsafe_better_objective_cannot_replace_eligible_provider_incumbent(tmp_path, monkeypatch, ending):
+    context = prepare_context(make_dataset(tmp_path / "dataset"), run_dir=tmp_path / "result")
+    provider = ProviderConfig(api_key="offline-only", base_url="https://example.invalid/v1", model="offline")
+    incumbent = quality_round(misses=("target",), normals=("normal",))["evaluation"]
+    unsafe = quality_round(repaired=("target",), traps=("normal",))["evaluation"]
+    evaluations = iter((incumbent, unsafe))
+    calls, publications = [], []
+
+    async def model(current, *args):
+        assert not (context.run_dir / "candidate.json").exists()
+        calls.append(current)
+        if len(calls) == 3:
+            update = json.loads(current._feedback)[-1]
+            assert update["selection"]["accepted"] is False
+            assert update["incumbent"]["predicate"] == "rax < 0"
+            return terminal(current, proposal(current, decision="abstain", predicate=None), [])
+        predicate = "rax < 0" if len(calls) == 1 else "rax <= 0"
+        return terminal(current, proposal(current, predicate=predicate), [predicate])
+
+    def publish(dataset, predicate, *, evaluation):
+        assert evaluation == incumbent and predicate == "rax < 0"
+        publications.append(predicate)
+        return {"status": "published", "predicate": predicate, "verified": False}
+
+    from taosc_llm import evaluation
+    monkeypatch.setattr(synthesis, "adapter_command", lambda _: ["not-executed"])
+    monkeypatch.setattr(synthesis, "_model_round", model)
+    monkeypatch.setattr(synthesis, "publish_candidate", publish)
+    monkeypatch.setattr(evaluation, "evaluate_dataset", lambda *args, **kwargs: next(evaluations))
+    monkeypatch.setattr(synthesis, "predicate_feedback", lambda dataset, value: {
+        "objective": synthesis.selection_objective(value)})
+    result = asyncio.run(synthesis.synthesize_context(context, provider,
+        max_rounds=3 if ending == "abstain" else 2))
+    assert result["status"] == "reject_same_crash"
+    assert result["selected_round"] == 1 and result["evaluation"] == incumbent
+    assert result["admission"]["status"] == "eligible"
+    assert result["rounds"][1]["status"] == "reject_predicate_trap"
+    assert result["rounds"][1]["selection"]["accepted"] is False
+    assert result["candidate"]["predicate"] == "rax < 0" and publications == ["rax < 0"]
+
+
+def test_manual_real_division_trap_retains_diagnostics_without_publication(tmp_path, monkeypatch):
+    dataset = make_dataset(tmp_path / "dataset")
+    def forbidden(*args, **kwargs):
+        pytest.fail("manual trap must be rejected before publication")
+    monkeypatch.setattr(synthesis, "publish_candidate", forbidden)
+    result = synthesis.generate_manual(dataset, "rax / rbx != 0", output=tmp_path / "result")
+    assert result["status"] == "reject_predicate_trap"
+    assert result["predicate"] == "rax / rbx != 0"
+    assert result["evaluation"]["status"] == "reject_predicate_trap"
+    assert result["admission"]["status"] == "rejected-predicate-trap"
+    assert result["admission"]["predicate_traps"] == 2
+    assert "candidate" not in result and "publication_status" not in result
+    assert "error_type" not in result and result["verified"] is False
+    assert not (tmp_path / "result" / "candidate.json").exists()
+    assert json.loads((tmp_path / "result" / "run.json").read_text()) == result
+
+
+def test_manual_trap_cli_is_normal_quality_rejection(tmp_path, capfd):
+    from taosc_llm.cli import main
+    dataset = make_dataset(tmp_path / "dataset")
+    assert main(["--dataset", str(dataset.root), "--predicate", "rax / rbx != 0",
+                 "--output", str(tmp_path / "result")]) == 0
+    result = json.loads(capfd.readouterr().out)
+    assert result["status"] == "reject_predicate_trap"
+    assert result["admission"]["predicate_traps"] == 2
+    assert "candidate" not in result and "publication_status" not in result
+
+
+@pytest.mark.parametrize("mode", ["manual", "provider"])
+def test_failed_full_evaluation_never_publishes_even_first_proposal(tmp_path, monkeypatch, mode):
+    dataset = make_dataset(tmp_path / "dataset")
+    def forbidden(*args, **kwargs):
+        pytest.fail("publication must happen only after complete evaluation")
+    def fail(*args, **kwargs):
+        raise OSError("evaluation storage failed")
+    from taosc_llm import evaluation
+    monkeypatch.setattr(synthesis, "publish_candidate", forbidden)
+    monkeypatch.setattr(evaluation, "evaluate_dataset", fail)
+    if mode == "provider":
+        context = prepare_context(dataset, run_dir=tmp_path / "result")
+        provider = ProviderConfig(api_key="offline-only", base_url="https://example.invalid/v1", model="offline")
+        async def model(current, *args):
+            return terminal(current, proposal(current), ["rax < 0"])
+        monkeypatch.setattr(synthesis, "adapter_command", lambda _: ["not-executed"])
+        monkeypatch.setattr(synthesis, "_model_round", model)
+    with pytest.raises(OSError, match="evaluation storage failed"):
+        if mode == "manual":
+            synthesis.generate_manual(dataset, "rax < 0", output=tmp_path / "result")
+        else:
+            asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=1))
+    saved = json.loads((tmp_path / "result" / "run.json").read_text())
+    assert saved["status"] == "infrastructure_error" and saved["error_type"] == "OSError"
+    assert "candidate" not in saved and "publication_status" not in saved
+    assert not (tmp_path / "result" / "candidate.json").exists()
 
 
 

@@ -121,6 +121,7 @@ def test_aggregate_rejection_preserves_case_availability(
         assert result['quality']['counts']['unavailable'] == len(observations)
     assert result['summary'] == {
         'total': len(observations),
+        'reject_predicate_trap': 0,
         'reject_same_crash': observations.count('target'),
         'not_rejected': observations.count('normal'),
         'unavailable': observations.count('missing'),
@@ -345,15 +346,45 @@ def test_representative_mirror_mismatch_not_reused(dataset, tmp_path):
     assert result['cases'][0]['reason'] == 'representative-evaluator-mismatch'
 
 
-def test_branch_two_is_unavailable_not_safe_original_branch(dataset, tmp_path):
+@pytest.mark.parametrize('predicate,values,branches', [
+    ('rax / 0', (0,), (2,)), ('1 / rax', (1, 0), (1, 2)),
+    ('min64 / rax', ((1 << 64) - 1,), (2,)),
+])
+def test_branch_two_is_unavailable_not_safe_original_branch(dataset, tmp_path, predicate, values, branches):
     from taosc_llm.family import parse_candidate
-    candidate = parse_candidate('ERM generic', 'rax / 0')
-    dataset.rows[0]['capture'] = capture(dataset, branches=(2,), descriptor=candidate.descriptor)
-    result = evaluation.evaluate_dataset(dataset, 'rax / 0', execute=False, cache_dir=tmp_path / 'cache')
-    assert result['status'] == 'not_rejected'
-    assert result['cases'][0]['status'] == 'unavailable'
-    assert result['cases'][0]['branches'] == [2]
+    candidate = parse_candidate('ERM generic', predicate)
+    dataset.rows[0]['capture'] = capture(dataset, values=values, branches=branches, descriptor=candidate.descriptor)
+    result = evaluation.evaluate_dataset(dataset, predicate, execute=False, cache_dir=tmp_path / 'cache')
+    assert result['status'] == result['cases'][0]['status'] == 'reject_predicate_trap'
+    assert result['cases'][0]['branches'] == list(branches)
     assert result['cases'][0]['reason'] == 'predicate-trap'
+    assert result['admission']['trap_cases'] == ['system:0']
+    assert result['summary']['reject_predicate_trap'] == 1
+
+
+@pytest.mark.parametrize('predicate,rejected', [
+    ('1 / rax', True), ('1 / rax && rax != 0', True),
+    ('rax != 0 && 1 / rax', False),
+])
+def test_guard_order_controls_reachable_offline_trap_rejection(dataset, tmp_path, predicate, rejected):
+    dataset.rows[0]['capture'] = capture(dataset, values=(0,), normal=True)
+    result = evaluation.evaluate_dataset(dataset, predicate, execute=False, cache_dir=tmp_path / 'cache')
+    assert result['status'] == ('reject_predicate_trap' if rejected else 'not_rejected')
+    assert result['admission']['predicate_traps'] == int(rejected)
+    if rejected:
+        row = result['cases'][0]
+        assert row['branches'] is None
+        assert row['report']['candidate']['outcome'] == 'unknown'
+        assert row['report']['activation']['status'] == 'unknown'
+
+
+def test_offline_later_trap_after_divergence_is_not_a_reachable_witness(dataset, tmp_path):
+    dataset.rows[0]['capture'] = capture(dataset, values=(1, 0), branches=(0, 0), normal=True)
+    result = evaluation.evaluate_dataset(dataset, '1 / rax', execute=False, cache_dir=tmp_path / 'cache')
+    assert result['cases'][0]['offline_branches'] == [1, 2]
+    assert result['cases'][0]['reason'] == 'branch-divergence'
+    assert result['status'] == 'not_rejected'
+    assert result['admission']['predicate_traps'] == 0
 
 
 def test_bounded_workers_and_duplicate_lock(dataset, tmp_path, monkeypatch):
@@ -666,8 +697,11 @@ def test_unusable_real_execution_is_not_published_as_representative(dataset, tmp
         candidates = [parse_candidate(dataset.patch_format, expression) for expression in expressions]
         values = ((1 << 64) - 1,) if cwe else (1,)
         branches = (2,)
-        dataset.rows[0]['capture'] = capture(dataset, values=values, branches=(0,), cwe=cwe)
+        # No neutral state may short-circuit the actual execution under test.
+        dataset.rows[0]['capture'] = None
     def run(ds, case, descriptor, directory):
+        if state == 'trap' and descriptor == 'p0':
+            raise evaluation.ExecutionUnavailable('capture-unavailable')
         result = capture(ds, values=values, branches=branches, descriptor=descriptor, normal=True, cwe=cwe)
         if state == 'timeout':
             result['outcome']['outcome'] = 'timeout'
@@ -677,8 +711,8 @@ def test_unusable_real_execution_is_not_published_as_representative(dataset, tmp
     monkeypatch.setattr(evaluation, 'execute_capture', run)
     cache = tmp_path / 'cache'
     first = evaluation.evaluate_dataset(dataset, expressions[0], cache_dir=cache)
-    assert first['status'] == 'not_rejected'
-    assert first['cases'][0]['status'] == 'unavailable'
+    assert first['status'] == ('reject_predicate_trap' if state == 'trap' else 'not_rejected')
+    assert first['cases'][0]['status'] == ('reject_predicate_trap' if state == 'trap' else 'unavailable')
     assert first['cases'][0]['source'] == 'executed'
     second = evaluation.evaluate_dataset(dataset, expressions[1], execute=False, cache_dir=cache)
     assert second['status'] == 'not_rejected'

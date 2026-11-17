@@ -434,6 +434,7 @@ def test_failed_connect_closes_its_socket(tmp_path, monkeypatch):
     ("target-crash", "executed", "reject_same_crash", "same-crash"),
     ("other-crash", "cache", "not_rejected", "observed-not-same-crash"),
     ("unavailable", "executed", "unavailable", "incomplete-observation"),
+    ("unavailable", "executed", "reject_predicate_trap", "predicate-trap"),
     ("ignored", "executed", "unavailable", "unsupported-external-state"),
     ("ignored", "executed", "unavailable", "timeout"),
 ])
@@ -453,20 +454,47 @@ def test_outcome_mapping_matches_the_existing_evaluation_vocabulary(
         server.close()
     assert [case["status"] for case in result["cases"]] == [status, status]
     assert {case["reason"] for case in result["cases"]} == {reason}
-    assert result["status"] == ("reject_same_crash" if status == "reject_same_crash" else "not_rejected")
+    assert result["status"] == (status if status.startswith("reject_") else "not_rejected")
+    assert result["summary"]["reject_predicate_trap"] == (2 if status == "reject_predicate_trap" else 0)
     assert result["summary"]["unavailable"] == (2 if status == "unavailable" else 0)
     assert result["replay"]["ignored"] == (2 if outcome == "ignored" else 0)
     assert result["replay"]["unavailable"] == (2 if outcome == "unavailable" else 0)
-    if status == "unavailable":
+    if outcome in ("unavailable", "ignored"):
         assert all(case["capture"] is None and case["branches"] is None
                    and case["outcome"] == {"outcome": "unavailable"}
                    for case in result["cases"])
     assert all(case.get("ignored", False) == (outcome == "ignored")
                for case in result["cases"])
-    assert result["replay"]["coverage"] == ("partial" if status == "unavailable" else "complete")
+    assert result["replay"]["coverage"] == ("partial" if outcome in ("unavailable", "ignored") else "complete")
     assert status_requests(server) == [{"op": "status"}]
     assert evaluate_requests(server)[0]["patches"] == [
         {"id": 1, "predicate": "(rax <= 0) == 0"}]
+
+
+def test_predicate_trap_overrides_same_crash_without_promoting_evidence(run_dir, dataset):
+    from taosc_llm.collection_metrics import candidate_admission
+    response = rows((2,), outcome="target-crash") + rows(
+        (3,), outcome="unavailable", reason="predicate-trap")
+    server = serve(run_dir, [response + [done(unavailable=1)]])
+    try:
+        result = replay.evaluate_replay(dataset, parse_candidate("ERM generic", "rax <= 0"))
+    finally:
+        server.close()
+    assert result["status"] == "reject_predicate_trap"
+    assert result["summary"] == {
+        "total": 2, "reject_same_crash": 1, "reject_predicate_trap": 1,
+        "not_rejected": 0, "unavailable": 0}
+    trapped = result["cases"][1]
+    assert trapped["reason"] == "predicate-trap"
+    assert trapped["capture"] is trapped["branches"] is None
+    assert trapped["outcome"] == {"outcome": "unavailable"}
+    assert not trapped.get("ignored", False)
+    for record in result["cases"]:
+        record["report"] = project_case(dataset, dataset.case(record["case_id"]),
+                                         record, predicate="rax <= 0")
+    admission = candidate_admission(result)
+    assert admission["status"] == "rejected-predicate-trap"
+    assert admission["trap_cases"] == ["function:3"]
 
 
 @pytest.mark.parametrize("patch_format,expression", [
@@ -549,6 +577,10 @@ def test_malformed_or_incomplete_replay_batches_are_rejected(
     ("ignored", None, "executed", None),
     ("ignored", "cancelled", "executed", None),
     ("ignored", "incomplete-observation", "executed", None),
+    ("ignored", "predicate-trap", "executed", None),
+    ("normal", "predicate-trap", "executed", None),
+    ("unavailable", "predicate-trap", "cache", None),
+    ("unavailable", "predicate-trap", "executed", {"unexpected": True}),
     ("ignored", "timeout", "cache", None),
     ("ignored", "timeout", "executed", {"unexpected": True}),
     ("unavailable", "timeout", "executed", None),
@@ -654,7 +686,8 @@ def test_evaluation_keeps_concrete_cases_on_their_own_path(run_dir, dataset, tmp
         "system:0": "unavailable", "function:2": "executed"}
     assert result["status"] == "not_rejected"
     assert result["summary"] == {
-        "total": 2, "reject_same_crash": 0, "not_rejected": 1, "unavailable": 1}
+        "total": 2, "reject_same_crash": 0, "reject_predicate_trap": 0,
+        "not_rejected": 1, "unavailable": 1}
     assert result["verified"] is False
     assert result["replay"]["mutations"] == 1
 

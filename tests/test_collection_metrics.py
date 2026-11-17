@@ -3,7 +3,7 @@ from copy import deepcopy
 
 import pytest
 
-from taosc_llm.collection_metrics import collect_metrics, compare_selection, selection_case_sets, selection_objective
+from taosc_llm.collection_metrics import candidate_admission, collect_metrics, compare_selection, selection_case_sets, selection_objective
 
 
 ARTIFACT = 'a' * 64
@@ -99,6 +99,34 @@ def test_shared_selection_neither_rewards_nor_vetoes_unrelated_evidence_loss(imp
     assert detail['reason'] == ('target-crashes-reduced' if improved else 'no-objective-improvement')
     assert detail['comparison']['shared_known'] == 1
     assert detail['comparison']['shared_branch_comparable'] == 0
+
+
+@pytest.mark.parametrize('domain', ['system', 'function'])
+@pytest.mark.parametrize('evidence', ['activation', 'reason'])
+@pytest.mark.parametrize('incumbent', [False, True])
+def test_trap_anywhere_rejects_first_or_improved_final_candidate(domain, evidence, incumbent):
+    trapped = case(99, domain=domain, original='normal', neutral='normal', outcome='unknown')
+    if evidence == 'activation':
+        trapped['report']['activation'].update(status='trapped', repair_hits=1, trap_hits=1)
+    else:
+        trapped['report']['candidate']['reason'] = 'predicate-trap'
+    after = {'cases': [case(0), trapped]}
+    before = selection_case_sets({'cases': [case(0, outcome='target_crash')]}) if incumbent else None
+    accepted, selection = compare_selection(before, selection_case_sets(after))
+    assert not accepted
+    assert selection['reason'] == 'predicate-trap'
+    assert candidate_admission(after) == {
+        'status': 'rejected-predicate-trap', 'predicate_traps': 1, 'trap_cases': [f'{domain}:99']}
+    assert collect_metrics(after, candidate_present=True)['predicate_traps'] == 1
+    # Preserve measured outcomes; zero observed targets cannot bypass admission.
+    assert selection_objective(after)['candidate_target_crashes'] == 0
+
+
+def test_trap_prediction_after_divergence_is_not_actual_candidate_trap():
+    row = case()
+    row['offline_branches'] = [1, 2]
+    row['report']['offline_prediction'] = {'branches': [1, 2], 'first_divergence': 0}
+    assert candidate_admission({'cases': [row]})['status'] == 'eligible'
 
 
 def test_missing_other_crash_vectors_do_not_establish_equal_branches():
@@ -354,7 +382,8 @@ def test_selection_sets_keep_actual_targets_and_authenticated_branch_support():
         'known': frozenset(('system:0', 'system:1', 'system:2', 'function:3', 'system:5')),
         'target_crashes': frozenset(('system:0',)),
         'branch_comparable': frozenset(('system:1', 'system:2')),
-        'branch_regressions': frozenset(('system:1',))}
+        'branch_regressions': frozenset(('system:1',)),
+        'predicate_traps': frozenset()}
     assert selection_case_sets(None) == selection_case_sets({'cases': []}) == {
         key: frozenset() for key in selected}
 

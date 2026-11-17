@@ -38,9 +38,10 @@ def test_search_cli_completion_preserves_scoped_evidence(tmp_path, monkeypatch, 
 
 @pytest.mark.parametrize("mode,status", [
     (mode, status) for mode in ("manual", "provider", "evaluate", "warm")
-    for status in (("not_rejected", "reject_same_crash", "unavailable")
+    for status in (("not_rejected", "reject_same_crash", "reject_predicate_trap", "unavailable")
                    if mode in ("evaluate", "warm") else
-                   ("not_rejected", "reject_same_crash", "rejected", "unavailable", "abstained", "refinement_exhausted"))
+                   ("not_rejected", "reject_same_crash", "reject_predicate_trap", "no_candidate",
+                    "rejected", "unavailable", "abstained", "refinement_exhausted"))
 ])
 def test_public_cli_completed_results_do_not_encode_quality(tmp_path, monkeypatch, capfd, mode, status):
     from taosc_llm import cli, synthesis
@@ -382,6 +383,91 @@ def test_preservation_interruption_never_publishes_evaluation(prepared, tmp_path
         assert not backend.result_refs
         assert not any(event["kind"] in ("baseline", "evaluation", "commit") for event in journal.events)
         assert len(list((journal.directory / "payloads").glob("*.brch"))) == 1
+
+
+@pytest.mark.parametrize("old_policy", [None, "allow-predicate-traps-v0"])
+def test_session_identity_explicitly_rejects_older_final_admission_policy(prepared, tmp_path, monkeypatch, old_policy):
+    from taosc_llm.no_llm.journal import JournalError
+
+    monkeypatch.setattr(module, "execution_identity", lambda: {"qemu": "fixture"})
+    identity = module.session_identity(prepared, SearchLimits(), workers=1, replay_socket=None)
+    assert identity["final_admission_policy"] == "reject-known-predicate-traps-v1"
+    old = deepcopy(identity)
+    if old_policy is None:
+        old.pop("final_admission_policy")
+    else:
+        old["final_admission_policy"] = old_policy
+    output = tmp_path / "search"
+    with Journal(output, old) as journal:
+        journal.append("publication", {"publication_status": "published", "predicate": "1"})
+    previous = {path: path.read_bytes() for path in output.rglob("*") if path.is_file()}
+    with pytest.raises(JournalError, match="final admission policy changed; start a fresh output"):
+        with Journal(output, identity, resume=True):
+            pytest.fail("old-policy publication must not restore")
+    assert all(path.read_bytes() == content for path, content in previous.items())
+
+
+@pytest.mark.parametrize("reuse", [False, True])
+@pytest.mark.parametrize("identity_mismatch", [False, True])
+def test_run_authenticates_selected_evaluation_before_publication_or_reuse(tmp_path, monkeypatch, reuse, identity_mismatch):
+    from contextlib import nullcontext
+    from taosc_llm.no_llm import run
+
+    dataset = SimpleNamespace(dataset_id="run-fixture")
+    parsed = parse_candidate("ERM generic", "rax != 0")
+    selected = {"dataset_id": dataset.dataset_id, "predicate": parsed.expression,
+                "descriptor": parsed.descriptor, "cases": []}
+    if identity_mismatch:
+        selected["dataset_id"] = "different-dataset"
+    result = {"predicate": parsed.expression, "evaluation": None,
+              "termination": "bounded-search-exhausted", "score": {}}
+    calls = []
+
+    class StoredBackend:
+        elapsed = evaluations = 0
+
+        def __init__(self, dataset, journal, limits, **kwargs):
+            self.journal = journal
+            result["evaluation"] = journal.store(selected)
+            if reuse:
+                publication = journal.store({"candidate": {"status": "published"}})
+                journal.append("publication", {"predicate": parsed.expression, "record": publication})
+
+        def restoration(self):
+            return nullcontext()
+
+        def load(self, reference):
+            calls.append("load")
+            return self.journal.load(reference)
+
+        def check_cancelled(self):
+            pass
+
+        def checkpoint_budget(self):
+            pass
+
+    def publish(dataset, predicate, *, evaluation, check):
+        assert evaluation == selected
+        calls.append("publish")
+        return {"status": "published"}
+
+    def validate(dataset, record, predicate, *, evaluation, check):
+        assert evaluation == selected
+        calls.append("validate")
+
+    monkeypatch.setattr(run, "session_identity", lambda *args, **kwargs: {"case": "publication-order"})
+    monkeypatch.setattr(run, "Backend", StoredBackend)
+    monkeypatch.setattr(run, "SearchEngine", lambda backend: SimpleNamespace(run=lambda: deepcopy(result)))
+    monkeypatch.setattr(run, "publish_candidate", publish)
+    monkeypatch.setattr(run, "validate_publication", validate)
+    if identity_mismatch:
+        with pytest.raises(ValueError, match="selected evaluation identity mismatch"):
+            run.synthesize(dataset, output=tmp_path / "search")
+        assert calls == ["load"]
+    else:
+        actual = run.synthesize(dataset, output=tmp_path / "search")
+        assert actual["publication_status"] == "published"
+        assert calls == ["load", "validate" if reuse else "publish"]
 
 
 def test_candidate_scoring_keeps_all_dataset_cases_outside_search_population(prepared, tmp_path, monkeypatch):

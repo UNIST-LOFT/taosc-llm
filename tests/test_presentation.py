@@ -178,6 +178,31 @@ def test_objective_uses_actual_outcomes_not_legacy_quality(dataset, candidate, s
     assert 'status' not in response and 'quality' not in response
 
 
+@pytest.mark.parametrize('capture_available', [False, True])
+def test_trap_feedback_is_a_hard_gate_even_without_target_failures(dataset, capture_available):
+    row = report(0, candidate='normal' if capture_available else 'unknown',
+                 activity='trapped' if capture_available else 'unknown')
+    row['candidate']['reason'] = 'predicate-trap'
+    response = feedback(dataset, evaluation_for(dataset, [row]))
+    assert response['admission']['status'] == 'rejected-predicate-trap'
+    assert response['predicate_traps']['count'] == 1
+    assert response['predicate_traps']['examples'][0]['case_id'] == 'system:0'
+    assert response['objective']['candidate_target_crashes'] == 0
+
+
+def test_large_trap_inventory_keeps_full_count_and_bounded_model_examples(dataset):
+    from taosc_llm.collection_metrics import compare_selection, selection_case_sets
+    rows = [report(index, candidate='unknown', activity='trapped') for index in range(10)]
+    evaluated = evaluation_for(dataset, rows)
+    accepted, selection = compare_selection(None, selection_case_sets(evaluated))
+    assert not accepted and selection['predicate_traps'] == 10
+    assert len(selection['trap_cases']) == 3
+    response = feedback(dataset, evaluated)
+    assert response['admission'] == {'status': 'rejected-predicate-trap', 'predicate_traps': 10}
+    assert response['predicate_traps']['count'] == 10
+    assert len(response['predicate_traps']['examples']) == 3
+
+
 def test_target_free_other_crashes_are_diagnostic_not_rejection(dataset):
     response = feedback(dataset, evaluation_for(dataset, [report(0, candidate='other_crash')]))
     assert response['objective']['target_status'] == 'target_absent'

@@ -398,6 +398,11 @@ def _case_result(dataset, case, candidate, descriptor, execute, root, base_ident
                 divergence = next((i for i, (a, b) in enumerate(zip(branches, actual)) if a != b), None)
                 base['first_divergence'] = divergence
                 if branches != actual:
+                    # The matching prefix reaches this trap on an authenticated
+                    # representative. Later old states after a different branch
+                    # are predictions only. Neither path borrows its outcome.
+                    if any(branches[i] == 2 for i in range(divergence + 1)):
+                        return {**base, 'source': 'offline', 'reason': 'predicate-trap'}
                     base['reason'] = 'branch-divergence'
                     continue
                 base['reuse'] = ('exact-descriptor' if descriptor == capture['descriptor']
@@ -457,8 +462,9 @@ def _replay_evaluate(dataset, candidate, *, case_ids, socket_path, operation_che
         selected = set(case_ids)
         result['cases'] = [item for item in result['cases'] if item['case_id'] in selected]
         counts = {status: sum(item['status'] == status for item in result['cases'])
-                  for status in ('reject_same_crash', 'not_rejected', 'unavailable')}
-        result['status'] = ('reject_same_crash' if counts['reject_same_crash'] else
+                  for status in ('reject_predicate_trap', 'reject_same_crash', 'not_rejected', 'unavailable')}
+        result['status'] = ('reject_predicate_trap' if counts['reject_predicate_trap'] else
+                            'reject_same_crash' if counts['reject_same_crash'] else
                             'unavailable' if not result['cases']
                             else 'not_rejected')
         result['summary'] = {'total': len(result['cases']), **counts}
@@ -581,16 +587,24 @@ def _evaluate(dataset, candidate, descriptor, *, case_ids, workers, execute, cac
         if operation_check is not None:
             operation_check()
         item['report'] = _project_case(dataset, case, item, metadata=metadata, descriptor=descriptor)
+    from .collection_metrics import candidate_admission
+    admission = candidate_admission({'cases': results})
+    trap_cases = set(admission['trap_cases'])
+    for item in results:
+        if item['case_id'] in trap_cases:
+            item['status'] = 'reject_predicate_trap'
     counts = {status: sum(c['status'] == status for c in results)
-              for status in ('reject_same_crash', 'not_rejected', 'unavailable')}
-    # Availability remains case-level evidence, not a candidate rejection.
-    # Even all-unavailable cases are nonrejecting; an empty selection is not.
-    status = ('reject_same_crash' if counts['reject_same_crash'] else
+              for status in ('reject_predicate_trap', 'reject_same_crash', 'not_rejected', 'unavailable')}
+    # Ordinary gaps remain nonrejecting. A known predicate trap is a hard
+    # rejection independent of target outcomes, controls or repair ownership.
+    status = ('reject_predicate_trap' if trap_cases else
+              'reject_same_crash' if counts['reject_same_crash'] else
               'unavailable' if not results else 'not_rejected')
     result = {'dataset_id': dataset.dataset_id, 'candidate_id': _digest({'base': base_identity, 'descriptor': descriptor}),
               'predicate': candidate.expression if candidate is not None else None,
               'descriptor': descriptor, 'status': status, 'verified': False,
               'cases': results, 'summary': {'total': len(results), **counts},
+              'admission': admission,
               'evaluation_mode': 'host' if execute else 'offline',
               'quality': summarize_quality(item['report'] for item in results),
               'report_summary': summarize_reports(item['report'] for item in results)}

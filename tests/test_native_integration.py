@@ -384,7 +384,14 @@ def test_manual_cli_publishes_evaluated_runtime_and_replays_held_out_inputs(tmp_
     binary = dataset.artifact('fixture.brcached')
     original_bytes = binary.read_bytes()
     capfd.readouterr()
-    assert main(['--dataset', str(dataset.root), '--predicate', 'rax <= 0',
+    assert main(['--dataset', str(dataset.root), '--predicate', '1 / rax',
+                 '--output', str(tmp_path / 'unsafe'), '--execution-workers', '2']) == 0
+    rejected = json.loads(capfd.readouterr().out)
+    assert rejected['status'] == 'reject_predicate_trap'
+    assert rejected['admission']['predicate_traps'] > 0
+    assert 'candidate' not in rejected and 'publication_status' not in rejected
+    assert not (tmp_path / 'unsafe' / 'candidate.json').exists()
+    assert main(['--dataset', str(dataset.root), '--predicate', 'rax == 0 || (rax < 0 && 1 / rax <= 0)',
                  '--output', str(tmp_path / 'candidate'), '--execution-workers', '2']) == 0
     result = json.loads(capfd.readouterr().out)
     candidate = result['candidate']

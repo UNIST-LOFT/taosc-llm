@@ -97,6 +97,15 @@ def _reports(evaluation: dict) -> list[tuple[str, dict]]:
     return reports
 
 
+def _predicate_trapped(report: dict) -> bool:
+    """Only authenticated activation or an explicit evaluator/replay rejection.
+
+    Predictions on states after branch divergence are not candidate execution.
+    """
+    return (_object(report, 'activation').get('status') == 'trapped'
+            or _object(report, 'candidate').get('reason') == 'predicate-trap')
+
+
 def _branch_evidence(report: dict) -> tuple[bool, bool, bool, bool]:
     """Shared control/capture authentication for collection and selection."""
     neutral = _object(report, 'neutral_baseline')
@@ -121,11 +130,13 @@ def _branch_evidence(report: dict) -> tuple[bool, bool, bool, bool]:
 def selection_case_sets(evaluation: dict | None) -> dict[str, frozenset[str]]:
     """Observed objective evidence, independent of strict producer quality."""
     result = {key: set() for key in ('known', 'target_crashes', 'branch_comparable',
-                                    'branch_regressions')}
+                                    'branch_regressions', 'predicate_traps')}
     reports = [] if evaluation is None else _reports(evaluation)
     for case, (_, report) in zip([] if evaluation is None else evaluation['cases'], reports):
         case_id = case.get('case_id', report.get('case_id'))
         outcome = _object(report, 'candidate').get('outcome', 'unknown')
+        if _predicate_trapped(report):
+            result['predicate_traps'].add(case_id)
         if outcome != 'unknown':
             result['known'].add(case_id)
         if outcome == 'target_crash':
@@ -140,8 +151,12 @@ def selection_case_sets(evaluation: dict | None) -> dict[str, frozenset[str]]:
 def compare_selection(before: dict[str, frozenset[str]] | None,
                       after: dict[str, frozenset[str]]) -> tuple[bool, dict]:
     """Compare observed targets, then branches, without rewarding evidence loss."""
-    if before is None:
-        return True, {'accepted': True, 'reason': 'first-evaluated-candidate'}
+    if after['predicate_traps']:
+        return False, {'accepted': False, 'reason': 'predicate-trap',
+                       'predicate_traps': len(after['predicate_traps']),
+                       'trap_cases': sorted(after['predicate_traps'])[:3]}
+    if before is None or before['predicate_traps']:
+        return True, {'accepted': True, 'reason': 'first-eligible-candidate'}
     known = before['known'] & after['known']
     comparable = before['branch_comparable'] & after['branch_comparable']
     targets = (len(before['target_crashes'] & known), len(after['target_crashes'] & known))
@@ -161,6 +176,15 @@ def compare_selection(before: dict[str, frozenset[str]] | None,
         'previous_branch_regressions': branches[0], 'candidate_branch_regressions': branches[1]}}
 
 
+def candidate_admission(evaluation: dict | None) -> dict:
+    """Reject known complete-predicate traps, without claiming universal safety."""
+    if evaluation is None:
+        return {'status': 'not_evaluated', 'predicate_traps': None, 'trap_cases': []}
+    traps = sorted(selection_case_sets(evaluation)['predicate_traps'])
+    return {'status': 'rejected-predicate-trap' if traps else 'eligible',
+            'predicate_traps': len(traps), 'trap_cases': traps}
+
+
 def normal_branch_comparison(report: dict) -> str:
     """Return the authenticated normal-control comparison, including other crashes."""
     return report['branch_comparison']['status'] if _branch_evidence(report)[3] else 'unavailable'
@@ -175,7 +199,6 @@ def _summarize(reports: list[tuple[str, dict]] | None, candidate_present: bool) 
         original = _object(report, 'original_baseline')
         neutral = _object(report, 'neutral_baseline')
         candidate = _object(report, 'candidate')
-        activation = _object(report, 'activation').get('status', 'unknown')
         comparison = _object(report, 'branch_comparison')
         oracle = _object(report, 'oracle')
         outcome = candidate.get('outcome', 'unknown')
@@ -213,7 +236,7 @@ def _summarize(reports: list[tuple[str, dict]] | None, candidate_present: bool) 
                 result['other_crash_branch_unavailable'] += 1
         if not capture_complete:
             result['candidate_capture_incomplete'] += 1
-        if activation == 'trapped':
+        if _predicate_trapped(report):
             result['predicate_traps'] += 1
         # Gaps are availability diagnostics. Known disagreement is separate and
         # cannot erase either an original target transition or a neutral pair.

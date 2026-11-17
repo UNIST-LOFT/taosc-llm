@@ -39,6 +39,7 @@ REASONS = (
     "invalid-descriptor",
     "cancelled",
     "incomplete-observation",
+    "predicate-trap",
 )
 IGNORED_REASONS = ("unsupported-external-state", "timeout")
 BUSY = "busy"
@@ -406,7 +407,9 @@ def _case_result(dataset, row: dict, candidate) -> dict:
     capture = _capture(dataset, row, candidate)
     mutation = row["mutation"]
     outcome = row["outcome"]
-    if outcome == "target-crash":
+    if outcome == "unavailable" and row["reason"] == "predicate-trap":
+        status, reason = "reject_predicate_trap", "predicate-trap"
+    elif outcome == "target-crash":
         # Only the selected artifact's committed attempt-1 reference produces
         # target-crash; another crash is not that reference.
         status, reason = "reject_same_crash", "same-crash"
@@ -480,6 +483,7 @@ def _evaluate_replay(dataset, candidate, *, socket_path, admission_timeout,
         return {
             "cases": [], "status": "unavailable",
             "summary": {"total": 0, "reject_same_crash": 0,
+                        "reject_predicate_trap": 0,
                         "not_rejected": 0, "unavailable": 0},
             "replay": {"socket": str(path), "coverage": "empty",
                        "mutations": 0, "unavailable": 0, "ignored": 0},
@@ -526,8 +530,10 @@ def _evaluate_replay(dataset, candidate, *, socket_path, admission_timeout,
             operation_check()
         results.append(_case_result(dataset, by_mutation[int(case["id"].split(":", 1)[1])], candidate))
     counts = {status: sum(item["status"] == status for item in results)
-              for status in ("reject_same_crash", "not_rejected", "unavailable")}
-    status = "reject_same_crash" if counts["reject_same_crash"] else "not_rejected"
+              for status in ("reject_same_crash", "reject_predicate_trap",
+                             "not_rejected", "unavailable")}
+    status = ("reject_predicate_trap" if counts["reject_predicate_trap"] else
+              "reject_same_crash" if counts["reject_same_crash"] else "not_rejected")
     return {
         "cases": results,
         "status": status,
