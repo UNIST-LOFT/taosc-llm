@@ -5,6 +5,9 @@ from dataclasses import asdict, dataclass
 import math
 
 
+SEARCH_POLICIES = ("baseline", "boundaries", "refine", "balanced", "composed", "adaptive")
+
+
 @dataclass(frozen=True)
 class SearchLimits:
     timeout: float = 10800.0
@@ -14,8 +17,11 @@ class SearchLimits:
     max_clauses: int = 12
     max_factors: int = 6
     operand_depth: int = 2
+    search_policy: str = "balanced"
 
     def __post_init__(self):
+        if self.search_policy not in SEARCH_POLICIES:
+            raise ValueError("search_policy must be one of " + ", ".join(SEARCH_POLICIES))
         if isinstance(self.timeout, bool) or not isinstance(self.timeout, (int, float)) or not math.isfinite(self.timeout) or self.timeout <= 0:
             raise ValueError("timeout must be positive finite seconds")
         for name in ("max_evaluations", "max_atoms", "beam_width", "max_clauses", "max_factors", "operand_depth"):

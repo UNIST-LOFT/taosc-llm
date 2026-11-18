@@ -7,6 +7,7 @@ revisions, visited work and execution budgets. Predictions only schedule work.
 from __future__ import annotations
 
 import copy
+import re
 
 from ..collection_metrics import candidate_admission, compare_selection, selection_objective
 from ..dataset import canonical
@@ -40,7 +41,11 @@ class SearchEngine:
                       "processed_evaluations": [], "atoms": [], "best_result": None,
                       "pending": [], "visited_branches": {}, "visited_work": {},
                       "branch_prediction_revision": 0, "exhausted_revision": None,
-                      "next_clause_id": 1}
+                      "next_clause_id": 1, "cover_draft": None, "early_draft": None,
+                      "early_index": 0, "cover_opportunities": 0,
+                      "operator_evaluations": [], "operator_stats": {},
+                      "work_counts": {"introduce": 0, "refine": 0,
+                                      "lookahead_predictions": 0}}
         for event in self.journal.events:
             if event["kind"] in ("checkpoint", "commit"):
                 self.state = self.journal.load(event["data"]["state"])
@@ -60,7 +65,8 @@ class SearchEngine:
                 snapshots[case] = loaded[key][case]
         else:
             references.update({case: backend.baseline_ref for case in snapshots})
-        self.space = Space(self.family, snapshots, self.limits, check=backend.check_operation)
+        self.space = Space(self.family, snapshots, self.limits, check=backend.check_operation,
+                           crashes=self.population.crashes, normals=self.population.normals)
         if self.state["atoms"]:
             if set(self.state["atoms"]) != set(self.space.atoms):
                 raise ValueError("checkpoint atom corpus mismatch")
@@ -79,6 +85,86 @@ class SearchEngine:
         self.best_sets = None
         if self.state["best_result"] is not None:
             self._authenticate_best()
+        self._validate_learning()
+
+    @staticmethod
+    def _operator_families(program):
+        families = set()
+        for clause in program:
+            for atom in clause:
+                if "i->" in atom:
+                    family = "containment" if "i->begin &&" in atom else "size"
+                elif re.search(r"[/%]", atom):
+                    family = "division"
+                elif "<<" in atom or ">>" in atom:
+                    family = "shift"
+                elif re.search(r"[&|^~]", atom):
+                    family = "bitwise"
+                elif re.search(r"[+*]|(?<=[\w)])\s*-", atom):
+                    family = "arithmetic"
+                else:
+                    family = "comparison"
+                families.add(family)
+        return sorted(families or {"constant"})
+
+    @staticmethod
+    def _learning_reward(before, after, result):
+        # Learning is deliberately stricter than the independent final archive:
+        # never reward lost observations or newly hidden responsibility evidence.
+        return (candidate_admission(result)["status"] == "eligible"
+                and before.selection["known"] <= after.selection["known"]
+                and before.selection["branch_comparable"] <= after.selection["branch_comparable"]
+                and set(after.ignored) <= set(before.ignored)
+                and compare_selection(before.selection, after.selection)[0])
+
+    @staticmethod
+    def _tally_operator(stats, families, reward):
+        for family in families:
+            row = stats.setdefault(family, {"trials": 0, "improvements": 0})
+            row["trials"] += 1
+            row["improvements"] += int(reward)
+
+    def _learn(self, program, result, score, reference):
+        if self.limits.search_policy != "adaptive":
+            return
+        if any(row["descriptor"] == result["descriptor"] for row in self.state["operator_evaluations"]):
+            return
+        families = self._operator_families(program)
+        reward = self._learning_reward(self.score, score, result)
+        self.state["operator_evaluations"].append({
+            "descriptor": result["descriptor"], "program": [list(row) for row in program],
+            "evaluation": reference, "before": self.state["evaluation"],
+            "families": families, "reward": reward})
+        self._tally_operator(self.state["operator_stats"], families, reward)
+
+    def _validate_learning(self):
+        stats, descriptors = {}, set()
+        for row in self.state["operator_evaluations"]:
+            self.backend.check_operation()
+            result = self.backend.load(row["evaluation"])
+            before = Score.from_evaluation(self.population, self.backend.load(row["before"]))
+            after = Score.from_evaluation(self.population, result)
+            program = tuple(tuple(clause) for clause in row["program"])
+            expected = parse_candidate(self.family, self.space.expression(program))
+            families = self._operator_families(program)
+            reward = self._learning_reward(before, after, result)
+            if (row["descriptor"] in descriptors or row["descriptor"] != result["descriptor"]
+                    or expected.descriptor != result["descriptor"]
+                    or row["families"] != families or row["reward"] is not reward):
+                raise ValueError("checkpoint operator learning evidence mismatch")
+            descriptors.add(row["descriptor"])
+            self._tally_operator(stats, families, reward)
+        if (stats != self.state["operator_stats"]
+                or self.limits.search_policy != "adaptive" and stats
+                or set(self.state["work_counts"]) != {"introduce", "refine", "lookahead_predictions"}
+                or any(type(value) is not int or value < 0 for value in self.state["work_counts"].values())):
+            raise ValueError("invalid checkpoint guided search counters")
+
+    def _operator_priority(self, factors):
+        stats = self.state["operator_stats"]
+        # Integer arithmetic makes priority and ties reproducible on resume.
+        return max((1024 * stats[family]["improvements"] // stats[family]["trials"]
+                    for family in self._operator_families((factors,)) if family in stats), default=0)
 
     def _validate_archive(self, saved, evaluated, score):
         """Bind an evaluated program independently of optional search proofs."""
@@ -179,6 +265,7 @@ class SearchEngine:
         score = Score.from_evaluation(self.population, result)
         reference = self.journal.store(result)
         self._scores[canonical(reference)] = score
+        self._learn(clauses, result, score, reference)
         self._archive(clauses, result, score, reference)
         # At most one entry per admitted descriptor (bounded by the evaluation
         # budget). Reusing an old outcome must not roll prediction state back to
@@ -190,6 +277,7 @@ class SearchEngine:
             if self.space.revision != revision:
                 self.state["prediction_revision"] += 1
                 self.state.update(blocked=[], termination=None, exhausted_revision=None,
+                                  early_index=self._early_cursor(),
                                   branch_prediction_revision=self.state["prediction_revision"])
             self.state["prediction_evidence"].update({case: reference for case in snapshots})
             self.state["processed_evaluations"].append(result["descriptor"])
@@ -292,17 +380,102 @@ class SearchEngine:
                     proposal = self._proposal(factors, draft)
                     if proposal is not None:
                         pool[factors], signatures[factors] = proposal
-        selected = self._diverse(list(pool), pool, signatures, self.limits.beam_width)
+        if self.limits.search_policy in ("composed", "adaptive"):
+            self._lookahead(pool, signatures, seen, draft)
+        selected = self._shortlist(pool, signatures, self.limits.beam_width)
         return [list(row) for row in selected]
+
+    def _shortlist(self, ranks, signatures, width):
+        pool = list(ranks)
+        selected = self._diverse(pool, ranks, signatures, width)
+        if self.limits.search_policy == "adaptive" and pool and width:
+            # One exploitation slot in four; all other slots retain the original
+            # coverage/regression/membership exploration roles. A width-one
+            # beam receives the same floor over consecutive durable proposals.
+            turn = sum(self.state["work_counts"][kind] for kind in ("introduce", "refine"))
+            slots = range(3, len(selected), 4) if width >= 4 else ([len(selected) - 1] if turn % 4 == 3 else [])
+            for slot in slots:
+                choices = [row for row in pool if row not in selected or row == selected[slot]]
+                selected[slot] = min(choices, key=lambda row: (-self._operator_priority(row), ranks[row]))
+        return selected
+
+    def _lookahead(self, pool, signatures, seen, draft):
+        """Predict at most four beam-squared ordered extensions, never atoms^3.
+
+        Whole programs go through Space, including same-hit conjunctions and
+        same-clamp CWE trees. Reverse extensions are separate proposals, not
+        commutation: a guard before a dangerous factor may be the only safe one.
+        Sample-equivalent expressions remain available on later rounds.
+        """
+        width = self.limits.beam_width
+        seeds = self._shortlist(pool, signatures, width)
+        leaves = list(dict.fromkeys(atom for row in seeds for atom in row))[:width]
+        cap = min(3, self.limits.max_factors)
+        predictions = 0
+        for _ in range(2):
+            extensions, memberships = {}, {}
+            for seed in seeds:
+                if len(seed) >= cap:
+                    continue
+                for atom in leaves:
+                    if atom in seed:
+                        continue
+                    for factors in (seed + (atom,), (atom,) + seed):
+                        self.backend.check()
+                        if factors in seen or factors in pool or factors in extensions:
+                            continue
+                        predictions += 1
+                        proposal = self._proposal(factors, draft)
+                        if proposal is not None:
+                            extensions[factors], memberships[factors] = proposal
+            seeds = self._shortlist(extensions, memberships, width)
+            pool.update(extensions)
+            signatures.update(memberships)
+            if not seeds:
+                break
+        self.state["work_counts"]["lookahead_predictions"] += predictions
 
     def _start_draft(self, kind, anchor, *, index=None):
         factors = list(self.state["clauses"][index]["factors"]) if kind == "refine" else []
         initial = [factors] if kind == "introduce" and self.family == "ERM generic" else []
         self.state["draft"] = {"kind": kind, "anchor": anchor, "index": index,
                                "beam": [factors], "queue": initial, "offset": 0, "depth": 0,
-                               "seen": [], "best": None,
+                               "seen": [], "best": None, "attempt": None,
                                "prediction_revision": self.state["prediction_revision"]}
         self._save()
+
+    def _early_cursor(self):
+        draft = self.state["draft"] if self.state["cover_draft"] is not None else self.state["early_draft"]
+        return draft["index"] if draft is not None else 0
+
+    def _step_scheduled_draft(self):
+        # A suspended cover draft is durable even if interruption lands during
+        # local/global validation or immediately after the refinement commit.
+        if self.state["cover_draft"] is not None:
+            if self.state["draft"] is not None:
+                self._step_draft()
+            self.state["early_draft"] = self.state["draft"]
+            self.state["draft"] = self.state["cover_draft"]
+            self.state["cover_draft"] = None
+            self._save()
+            return
+        draft = self.state["draft"]
+        early = (draft["kind"] == "introduce" and self.score.regressions
+                 and self.state["early_index"] < len(self.state["clauses"])
+                 and self.limits.search_policy in ("refine", "balanced", "composed", "adaptive"))
+        if early and draft["attempt"] is None and self.state["cover_opportunities"] % 4 == 3:
+            self.state["cover_opportunities"] += 1
+            self.state["cover_draft"] = draft
+            self.state["draft"] = self.state["early_draft"]
+            self.state["early_draft"] = None
+            if self.state["draft"] is None:
+                index = self.state["early_index"]
+                self._start_draft("refine", self.state["clauses"][index]["owners"][0], index=index)
+            else:
+                self._save()
+            self._step_scheduled_draft()
+            return
+        self._step_draft()
 
     def _introduction_record(self, best):
         identifier = self.state["next_clause_id"]
@@ -315,7 +488,8 @@ class SearchEngine:
                 "witnesses": best["witnesses"]}
 
     _BRANCH_KEYS = ("clauses", "evaluation", "phase", "blocked", "refine_index",
-                    "refine_progress", "draft", "branch_prediction_revision", "exhausted_revision")
+                    "refine_progress", "draft", "branch_prediction_revision", "exhausted_revision",
+                    "cover_draft", "early_draft", "early_index", "cover_opportunities")
 
     def _branch(self):
         return copy.deepcopy({key: self.state[key] for key in self._BRANCH_KEYS})
@@ -332,11 +506,22 @@ class SearchEngine:
         if (branch["phase"] not in ("cover", "refine")
                 or not 0 <= branch["branch_prediction_revision"] <= revision
                 or branch["exhausted_revision"] is not None and not 0 <= branch["exhausted_revision"] <= revision
-                or not 0 <= branch["refine_index"] <= len(branch["clauses"])):
+                or not 0 <= branch["refine_index"] <= len(branch["clauses"])
+                or type(branch["early_index"]) is not int
+                or not 0 <= branch["early_index"] <= len(branch["clauses"])
+                or type(branch["cover_opportunities"]) is not int or branch["cover_opportunities"] < 0):
             raise ValueError("invalid checkpoint branch schedule")
-        draft = branch["draft"]
-        if draft is None:
-            return
+        if (branch["cover_draft"] is not None
+                and (branch["cover_draft"]["kind"] != "introduce"
+                     or branch["draft"] is not None and branch["draft"]["kind"] != "refine"
+                     or branch["early_draft"] is not None)
+                or branch["early_draft"] is not None and branch["early_draft"]["kind"] != "refine"):
+            raise ValueError("invalid checkpoint suspended draft schedule")
+        for draft in (branch["draft"], branch["cover_draft"], branch["early_draft"]):
+            if draft is not None:
+                self._validate_draft(draft, branch, score, revision)
+
+    def _validate_draft(self, draft, branch, score, revision):
         if (draft["kind"] not in ("introduce", "refine")
                 or not 0 <= draft["offset"] <= len(draft["queue"])
                 or not 0 <= draft["depth"] <= self.limits.max_factors
@@ -345,6 +530,13 @@ class SearchEngine:
                 or len(draft["beam"]) > self.limits.beam_width
                 or any(len(row) > self.limits.max_factors for row in draft["queue"] + draft["beam"])):
             raise ValueError("invalid checkpoint draft schedule")
+        if draft["attempt"] is not None:
+            if draft["offset"] >= len(draft["queue"]):
+                raise ValueError("invalid checkpoint counted proposal")
+            work = canonical([self._branch_key(branch), draft["kind"], draft["index"],
+                              draft["queue"][draft["offset"]]]).decode("utf-8")
+            if draft["attempt"] != work:
+                raise ValueError("checkpoint counted proposal mismatch")
         if draft["kind"] == "refine":
             if not isinstance(draft["index"], int) or not 0 <= draft["index"] < len(branch["clauses"]):
                 raise ValueError("invalid checkpoint refinement index")
@@ -473,7 +665,8 @@ class SearchEngine:
         self.state.update(branch)
         self.current, self.score = evaluated, score
         if self.state["branch_prediction_revision"] < revision:
-            self.state.update(blocked=[], branch_prediction_revision=revision)
+            self.state.update(blocked=[], branch_prediction_revision=revision,
+                              early_index=self._early_cursor())
             if self.state["exhausted_revision"] is not None:
                 self.state.update(exhausted_revision=None, phase="cover", refine_index=0, refine_progress=False)
         self._save()
@@ -503,6 +696,7 @@ class SearchEngine:
         self.score = score
         self._remember_proofs(self.state["clauses"], best["evaluation"])
         self.state.update(draft=None, blocked=[], phase="cover", exhausted_revision=None,
+                          early_draft=None, early_index=0,
                           revision=self.state["revision"] + 1)
         self.state["visited_branches"][self._branch_key(self.state)] = self.state["prediction_revision"]
         self._save(commit="introduce")
@@ -523,7 +717,12 @@ class SearchEngine:
         self.current = result
         self.score = Score.from_evaluation(self.population, result)
         self._remember_proofs(self.state["clauses"], reference)
-        self.state.update(draft=None, refine_progress=True, revision=self.state["revision"] + 1)
+        if self.state["cover_draft"] is not None:
+            # Its queue/offset are still useful, but an introduction proof is
+            # relative to the old frozen prefix and cannot survive this commit.
+            self.state["cover_draft"]["best"] = None
+        self.state.update(draft=None, early_draft=None, early_index=draft["index"],
+                          refine_progress=True, revision=self.state["revision"] + 1)
         self.state["visited_branches"][self._branch_key(self.state)] = self.state["prediction_revision"]
         self._save(commit="refine")
 
@@ -545,8 +744,15 @@ class SearchEngine:
         if self.state["visited_work"].get(work, -1) >= self.state["prediction_revision"]:
             draft["seen"].append(list(factors))
             draft["offset"] += 1
+            draft["attempt"] = None
             self._save()
             return
+        if draft["attempt"] != work:
+            draft["attempt"] = work
+            self.state["work_counts"][draft["kind"]] += 1
+            if draft["kind"] == "introduce":
+                self.state["cover_opportunities"] += 1
+            self._save()
         if draft["kind"] == "introduce":
             tested = self._run(program + (tuple(factors),))
             if tested is not None:
@@ -569,6 +775,7 @@ class SearchEngine:
                         # must never accept the same cached candidate again.
                         draft["seen"].append(list(factors))
                         draft["offset"] += 1
+                        draft["attempt"] = None
                         self.state["visited_work"][work] = self.state["prediction_revision"]
                         if score.regressions <= self.score.regressions:
                             self._accept_introduction(candidate)
@@ -577,6 +784,7 @@ class SearchEngine:
                             child.update(clauses=copy.deepcopy(records), evaluation=reference,
                                          draft=None, phase="cover", blocked=[], refine_index=0,
                                          refine_progress=False, exhausted_revision=None,
+                                         early_draft=None, early_index=0, cover_draft=None,
                                          branch_prediction_revision=self.state["prediction_revision"])
                             self._retain(child)
                             self._save()
@@ -598,12 +806,14 @@ class SearchEngine:
                         if improves(self.score, score, old_cost=_cost(program), new_cost=_cost(modified)):
                             draft["seen"].append(list(factors))
                             draft["offset"] += 1
+                            draft["attempt"] = None
                             self.state["visited_work"][work] = self.state["prediction_revision"]
                             self._accept_refinement(draft, factors, result, reference, local[2], witnesses)
                             return
         self.state["visited_work"][work] = self.state["prediction_revision"]
         draft["seen"].append(list(factors))
         draft["offset"] += 1
+        draft["attempt"] = None
         self._save()
 
     def _end_draft(self):
@@ -622,8 +832,11 @@ class SearchEngine:
             # Repeating it for each anchor would only reload cached outcomes and
             # rebuild identical predictions, without adding search alternatives.
             self.state["blocked"] = sorted(self.population.crashes - self.score.covered)
+        elif self.state["cover_draft"] is not None:
+            self.state["early_index"] = draft["index"] + 1
         else:
             self.state["refine_index"] += 1
+            self.state["early_index"] = max(self.state["early_index"], self.state["refine_index"])
         self.state["draft"] = None
         self._save()
 
@@ -672,20 +885,26 @@ class SearchEngine:
                         self.state["termination"] = self._exhaustion_reason()
                         self._save()
                     continue
-                if self.state["draft"] is not None:
-                    self._step_draft()
+                if self.state["draft"] is not None or self.state["cover_draft"] is not None:
+                    self._step_scheduled_draft()
                     self._rotate()
                 elif self.state["phase"] == "cover":
                     outstanding = sorted(self.population.crashes - self.score.covered - set(self.state["blocked"]))
                     if outstanding and len(self.state["clauses"]) < self.limits.max_clauses:
                         self._start_draft("introduce", outstanding[0])
                     else:
-                        self.state.update(phase="refine", refine_index=0, refine_progress=False)
+                        self.state.update(phase="refine", refine_index=self.state["early_index"],
+                                          refine_progress=False)
                         self._save()
                 elif self.state["refine_index"] < len(self.state["clauses"]):
                     index = self.state["refine_index"]
-                    owner = self.state["clauses"][index]["owners"][0]
-                    self._start_draft("refine", owner, index=index)
+                    if self.state["early_draft"] is not None:
+                        self.state["draft"] = self.state["early_draft"]
+                        self.state["early_draft"] = None
+                        self._save()
+                    else:
+                        owner = self.state["clauses"][index]["owners"][0]
+                        self._start_draft("refine", owner, index=index)
                 elif (self.state["refine_progress"]
                       or (len(self.state["clauses"]) < self.limits.max_clauses
                           and self.population.crashes - self.score.covered - set(self.state["blocked"]))):
@@ -740,4 +959,7 @@ class SearchEngine:
                 "evaluation": selected["evaluation"], "score": score.summary(self.population),
                 "objective": selection_objective(evaluated if predicate is not None else None),
                 "budgets": {"elapsed": self.backend.elapsed, "evaluations": self.backend.evaluations},
+                "search_diagnostics": {**self.state["work_counts"],
+                                       "evaluated_programs": len(self.state["processed_evaluations"]),
+                                       "operator_stats": copy.deepcopy(self.state["operator_stats"])},
                 "limits": self.limits.to_dict()}

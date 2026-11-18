@@ -256,6 +256,26 @@ def test_resume_refuses_uninitialized_search_without_rewriting_run(tmp_path, cap
     assert not (output / "logs").exists()
 
 
+def test_resume_refuses_changed_search_policy_before_execution(tmp_path, capsys):
+    from taosc_llm.runner import _options
+    from taosc_llm.runner_options import parse_args
+
+    output = tmp_path / "run"
+    (output / "result").mkdir(parents=True)
+    (output / "result" / "identity.json").write_text("{}")
+    saved_args = parse_args(["--dataset", str(tmp_path / "dataset"),
+                             "--search-policy", "boundaries"])
+    record = {"schema_version": 1, "engine": "taosc-llm-run", "mode": "no-llm",
+              "dataset": str(saved_args.dataset), "options": _options(saved_args)}
+    summary = output / "run.json"
+    summary.write_text(json.dumps(record))
+    before = summary.read_bytes()
+    assert main(["--output", str(output), "--resume", "--search-policy", "adaptive"]) == 1
+    assert "resume must preserve --search-policy" in capsys.readouterr().err
+    assert summary.read_bytes() == before
+    assert not (output / "logs").exists()
+
+
 @pytest.mark.parametrize("field,value", [
     ("patch-location", "0"), ("patch-destination", "-1"),
     ("patch-destination", "10000000000000000"), ("patch-destination", "not-an-address"),

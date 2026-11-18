@@ -246,6 +246,129 @@ def test_cancelled_prediction_never_caches_a_partial_vector():
     assert len(expected) == 600 and set(expected) == {0, 1, 2}
 
 
+def test_case_envelopes_admit_late_boundary_missing_the_observed_prefix():
+    rows = {
+        "a-normal": [snapshot(rax=value) for value in range(3000, 3032)],
+        "z-target": [snapshot(rax=2000), snapshot(rax=4000)],
+    }
+    limits = SearchLimits(max_atoms=128, search_policy="boundaries")
+    labels = {"crashes": frozenset({"z-target"}), "normals": frozenset({"a-normal"})}
+    ordinary = Space(GENERIC, rows, replace(limits, search_policy="baseline"), **labels)
+    guided = Space(GENERIC, rows, limits, **labels)
+    assert "rax <= 2000" not in ordinary.atoms
+    assert "rax <= 2000" in guided.atoms
+    assert guided.predict((("rax <= 2000",),)) == {
+        "a-normal": (0,) * 32, "z-target": (1, 0),
+    }
+    assert len(set(ordinary.atoms) & set(guided.atoms)) >= limits.max_atoms - 32
+
+
+def test_case_envelopes_use_signed_per_case_extrema_and_keep_ordered_hits():
+    rows = {
+        "a": [snapshot(rax=-40), snapshot(rax=-5), snapshot(rax=100)],
+        "b": [snapshot(rax=(1 << 64) - 10), snapshot(rax=9)],
+        "normal": [snapshot(rax=0)],
+        "unlabelled": [snapshot(rax=-999), snapshot(rax=999)],
+        "empty": [],
+    }
+    space = Space(GENERIC, rows, SearchLimits(max_atoms=64),
+                  crashes=frozenset({"a", "b", "empty", "missing"}),
+                  normals=frozenset({"normal", "missing-normal"}))
+    assert {"rax <= -10", "rax >= 9"} <= set(space.atoms)
+    upper = space.predict((("rax <= -10",),))
+    lower = space.predict((("rax >= 9",),))
+    assert upper["a"] == (1, 0, 0) and upper["b"] == (1, 0)
+    assert lower["a"] == (0, 0, 1) and lower["b"] == (0, 1)
+    assert upper["normal"] == lower["normal"] == (0,)
+    assert upper["empty"] == lower["empty"] == ()
+    assert "missing" not in upper and "missing-normal" not in lower
+
+
+def _case_weighted_rows():
+    return {
+        "target": [snapshot(rax=101, rbx=201)],
+        "heavy": [snapshot(rax=100, rbx=300)] * 100,
+        "light-a": [snapshot(rax=300, rbx=100)],
+        "light-b": [snapshot(rax=300, rbx=100)],
+    }
+
+
+def test_boundary_budget_ranks_normal_cases_not_number_of_hits():
+    rows = _case_weighted_rows()
+    space = Space(GENERIC, rows, SearchLimits(max_atoms=2),
+                  crashes=frozenset({"target"}),
+                  normals=frozenset({"heavy", "light-a", "light-b"}))
+    # This boundary activates one normal case with 100 hits. Its competitor
+    # activates two normal cases with one hit each: fewer hits is NOT better.
+    normals = ("heavy", "light-a", "light-b")
+    predictions = [space.predict(((atom,),)) for atom in space.atoms]
+    preferred = [vector for vector in predictions if vector["target"] == (1,)
+                 and sum(any(vector[case]) for case in normals) == 1]
+    assert len(preferred) == 1
+    competitor = space.predict((("rbx <= 201",),))
+    assert sum(any(competitor[case]) for case in normals) == 2
+    assert sum(sum(preferred[0][case]) for case in normals) == 100
+    assert sum(sum(competitor[case]) for case in normals) == 2
+
+
+def test_boundary_slots_prefer_distinct_discriminating_outcomes():
+    space = Space(GENERIC, _case_weighted_rows(), SearchLimits(max_atoms=4),
+                  crashes=frozenset({"target"}),
+                  normals=frozenset({"heavy", "light-a", "light-b"}))
+    # Equivalent register spellings must not consume both proposal slots, nor
+    # may the many constant-register always-firing envelopes crowd them out.
+    normals = ("heavy", "light-a", "light-b")
+    predictions = [space.predict(((atom,),)) for atom in space.atoms]
+    activated = {frozenset(case for case in normals if any(vector[case]))
+                 for vector in predictions if vector["target"] == (1,)}
+    assert frozenset({"heavy"}) in activated
+    assert frozenset({"light-a", "light-b"}) in activated
+
+
+@pytest.mark.parametrize("cap", (1, 2, 3, 7, 64))
+def test_guided_atoms_share_the_existing_cap_and_leave_ordinary_slots(cap):
+    rows = _case_weighted_rows()
+    limits = SearchLimits(max_atoms=cap)
+    ordinary = Space(GENERIC, rows, replace(limits, search_policy="baseline"))
+    guided = Space(GENERIC, rows, limits, crashes=frozenset({"target"}),
+                   normals=frozenset({"heavy", "light-a", "light-b"}))
+    assert len(guided.atoms) == cap
+    assert len(set(guided.atoms) & set(ordinary.atoms)) >= cap - min(32, cap // 2)
+    descriptors = [parse_candidate(GENERIC, atom).descriptor for atom in guided.atoms]
+    assert len(set(descriptors)) == cap
+
+
+def test_boundary_revision_removes_stale_proposals_and_reconstructs_for_resume():
+    limits = SearchLimits(max_atoms=64)
+    labels = {"crashes": frozenset({"z-target"}), "normals": frozenset({"a-normal"})}
+    rows = {"a-normal": [snapshot(rax=value) for value in range(3000, 3032)],
+            "z-target": [snapshot(rax=2000)]}
+    space = Space(GENERIC, rows, limits, **labels)
+    assert "rax <= 2000" in space.atoms
+    replacement = [snapshot(rax=1900)]
+    space.update({"z-target": replacement})
+    assert "rax <= 1900" in space.atoms and "rax <= 2000" not in space.atoms
+    rebuilt = Space(GENERIC, {"z-target": replacement, "a-normal": rows["a-normal"]},
+                    limits, **labels)
+    assert space.atoms == rebuilt.atoms
+    assert space.predict((("rax <= 1900",),)) == rebuilt.predict((("rax <= 1900",),))
+
+
+@pytest.mark.parametrize("policy", ("baseline", "refine", "boundaries", "balanced", "composed", "adaptive"))
+def test_search_policy_only_enables_boundaries_for_guided_atom_modes(policy):
+    rows = {"a-normal": [snapshot(rax=value) for value in range(3000, 3032)],
+            "z-target": [snapshot(rax=2000)]}
+    limits = SearchLimits(max_atoms=64, search_policy=policy)
+    space = Space(GENERIC, rows, limits, crashes=frozenset({"z-target"}),
+                  normals=frozenset({"a-normal"}))
+    assert ("rax <= 2000" in space.atoms) == (policy not in ("baseline", "refine"))
+    unlabelled = Space(GENERIC, rows, limits)
+    assert "rax <= 2000" not in unlabelled.atoms
+    no_captures = Space(GENERIC, {"empty": []}, limits,
+                        crashes=frozenset({"empty", "missing"}))
+    assert no_captures.atoms == atoms(GENERIC, [], limits)
+
+
 def test_limits_and_family_mismatches_are_rejected():
     space = Space(GENERIC, {}, SearchLimits(max_clauses=1, max_factors=1))
     with pytest.raises(ValueError, match="max_clauses"):

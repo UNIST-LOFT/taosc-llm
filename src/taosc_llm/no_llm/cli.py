@@ -10,7 +10,7 @@ import signal
 import sys
 from threading import Event, Thread
 
-from .model import SearchLimits
+from .model import SEARCH_POLICIES, SearchLimits
 
 
 @contextmanager
@@ -36,6 +36,8 @@ def main(argv=None) -> int:
     parser.add_argument("--cache-dir", type=Path)
     parser.add_argument("--replay-socket", type=Path, help="explicit endpoint of the dataset's existing mutation server")
     defaults = SearchLimits()
+    parser.add_argument("--search-policy", choices=SEARCH_POLICIES, default=defaults.search_policy,
+                        help="deterministic proposal policy, recorded in resume identity")
     parser.add_argument("--timeout", type=float, default=defaults.timeout, help="persistent search-time budget in seconds")
     for name in ("max_evaluations", "max_atoms", "beam_width", "max_clauses", "max_factors", "operand_depth"):
         parser.add_argument("--" + name.replace("_", "-"), type=int, default=getattr(defaults, name))

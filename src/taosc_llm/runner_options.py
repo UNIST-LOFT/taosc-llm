@@ -7,7 +7,7 @@ import os
 import re
 from pathlib import Path
 
-from .no_llm.model import SearchLimits
+from .no_llm.model import SEARCH_POLICIES, SearchLimits
 
 
 def _positive_int(value: str) -> int:
@@ -106,6 +106,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     search_names = ("max_evaluations", "max_atoms", "beam_width", "max_clauses", "max_factors", "operand_depth")
     for name in search_names:
         parser.add_argument("--" + name.replace("_", "-"), type=_positive_int)
+    parser.add_argument("--search-policy", choices=SEARCH_POLICIES,
+                        help="no-LLM proposal policy; defaults to " + limits.search_policy)
+    search_names += ("search_policy",)
     args = parser.parse_args(argv)
 
     if args.output is not None and (args.run_prefix is not None or args.run_id is not None):

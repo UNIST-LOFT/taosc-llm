@@ -303,6 +303,17 @@ Cancellation never promotes a draft.
 | `--max-clauses` | 12 | 1–128 |
 | `--max-factors` | 6 | 1–128 |
 | `--operand-depth` | 2 | 1–4; generic leaves have depth 1 |
+| `--search-policy` | `balanced` | `baseline`, `boundaries`, `refine`, `balanced`, `composed`, `adaptive` |
+
+Both the direct CLI and experiment runner accept `--search-policy`; the library
+uses `SearchLimits(search_policy=...)`. The policy is part of the saved limits
+and resume identity. Use separate runner `--run-prefix` values for comparisons,
+not a changed policy on an existing journal. `baseline` retains ordinary bounded
+enumeration; `boundaries` adds case-derived generic thresholds; `refine` reserves
+early refinement opportunities; `balanced` combines those two. `composed` also
+shortlists bounded multi-factor continuations; `adaptive` additionally guides
+proposals using actually evaluated improvements. All policies use the same
+parser, family semantics, owner proofs, trap admission and final comparator.
 
 Canonical source/descriptor/depth and stack bounds override search bounds.
 There is no target-execution count limit or corpus-size reservation. Target work

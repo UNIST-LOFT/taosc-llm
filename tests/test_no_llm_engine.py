@@ -98,9 +98,11 @@ class FiniteExecution:
 @pytest.fixture
 def finite_grammar(monkeypatch):
     def install(*atoms):
-        # Bound proposals only; Space and execution still use the real parser
-        # and predicate evaluator for every snapshot and ordered composition.
+        # Supply a closed vocabulary, including the new boundary proposal
+        # source. Parsing, scheduling and whole-expression evaluation stay real;
+        # boundary generation has separate case-based tests in test_no_llm_space.
         monkeypatch.setattr("taosc_llm.no_llm.space.atoms", lambda *args, **kwargs: atoms)
+        monkeypatch.setattr("taosc_llm.no_llm.space._case_boundaries", lambda *args, **kwargs: ())
     return install
 
 
@@ -830,7 +832,9 @@ def test_new_incumbent_trap_evidence_revokes_final_selection(tmp_path):
         assert engine.result()["publication_status"] == "no_candidate"
 
 
-def test_guard_first_search_retains_dangerous_atom_and_selects_eligible_composition(tmp_path, finite_grammar):
+@pytest.mark.parametrize("search_policy", ["balanced", "composed", "adaptive"])
+def test_guard_first_search_retains_dangerous_atom_and_selects_eligible_composition(
+        tmp_path, finite_grammar, search_policy):
     guard, dangerous = "rax != 0", "1 / rax != 0"
     finite_grammar(guard, dangerous)
 
@@ -838,7 +842,7 @@ def test_guard_first_search_retains_dangerous_atom_and_selects_eligible_composit
         cases = (((1,), "target_crash", True), ((0,), "normal", True), ((2,), "normal", True))
 
     limits = SearchLimits(max_evaluations=24, max_clauses=1, max_factors=2,
-                          operand_depth=1, beam_width=4)
+                          operand_depth=1, beam_width=4, search_policy=search_policy)
     with Journal(tmp_path / "search", {"case": "guarded-division"}) as journal:
         backend = DivisionExecution(journal, limits)
         engine = SearchEngine(backend)
@@ -898,3 +902,256 @@ def test_budget_promotion_cannot_replace_an_existing_owner(tmp_path):
             with engine.backend.restoration():
                 engine._accept_introduction(best)
         assert engine._required() == frozenset({"system:0"})
+
+
+class EarlyNarrowingExecution(PartitionExecution):
+    cases = (
+        ((1, 1, 1), "target_crash", True),
+        ((2, 2, 2), "target_crash", False),
+        ((1, 0, 1), "normal", True),
+        ((1, 1, 0), "normal", True),
+    )
+    residual_outcome = "target_crash"
+
+    def _result(self, source):
+        result = super()._result(source)
+        if source != "0" and self.residual_outcome == "unknown":
+            report = result["cases"][1]["report"]
+            report["candidate"].update(outcome="unknown", reason="offline-divergence")
+            report["activation"]["status"] = "unknown"
+        return result
+
+
+def seed_broad_owner(engine):
+    # A proved branch with an immutable partial owner, rather than an offline
+    # claim that union coverage or an unknown remaining target was repaired.
+    engine._start_draft("introduce", "system:0")
+    engine._step_draft()
+    engine._accept_introduction(engine.state["draft"]["best"])
+    assert engine._required() == {"system:0"}
+    assert engine.score.regressions == {"system:2", "system:3"}
+
+
+@pytest.mark.parametrize("search_policy", ["refine", "balanced", "composed", "adaptive"])
+@pytest.mark.parametrize("residual_outcome", ["target_crash", "unknown"])
+def test_early_narrowing_gets_budget_before_unresolvable_cover(
+        tmp_path, finite_grammar, search_policy, residual_outcome):
+    finite_grammar("rax == 1", "rbx == 1", "rcx == 1")
+    limits = SearchLimits(search_policy=search_policy, max_evaluations=4,
+                          max_factors=3, max_clauses=2, beam_width=1)
+    with Journal(tmp_path / "early", {"case": "early-narrowing"}) as journal:
+        backend = EarlyNarrowingExecution(journal, limits)
+        backend.residual_outcome = residual_outcome
+        engine = SearchEngine(backend)
+        seed_broad_owner(engine)
+        result = engine.run()
+        refinements = [journal.load(event["data"]["state"]) for event in journal.events
+                       if event["kind"] == "commit" and event["data"]["operation"] == "refine"]
+        assert refinements
+        assert result["score"]["covered"] == ["system:0"]
+        assert result["score"]["unresolved_targets"] == ["system:1"]
+        assert len(result["score"]["branch_regressions"]) < 2
+        assert result["search_diagnostics"]["refine"] == 1
+        assert backend.evaluations == 4
+        # Refinement did not throw away or restart the pending cover queue.
+        assert engine.state["draft"]["kind"] == "introduce"
+        assert engine.state["draft"]["offset"] == 1
+        assert engine.state["draft"]["seen"] == [[], ["rax == 1"]]
+        assert engine._required() == {"system:0"}
+        assert engine.state["cover_draft"] is None
+        assert engine.state["early_draft"] is None
+        assert engine.state["clauses"][0]["introduced_factors"] == []
+        assert engine.state["clauses"][0]["prefix"] == []
+
+
+@pytest.mark.parametrize("search_policy", ["refine", "balanced", "composed", "adaptive"])
+def test_guided_interruption_restores_suspended_cover_and_exact_work_counts(
+        tmp_path, finite_grammar, search_policy):
+    finite_grammar("rax == 1", "rbx == 1", "rcx == 1")
+    limits = SearchLimits(search_policy=search_policy, max_evaluations=8,
+                          max_factors=3, max_clauses=2, beam_width=1)
+    with Journal(tmp_path / "continuous", {"case": "continuous-guided"}) as journal:
+        continuous_engine = SearchEngine(EarlyNarrowingExecution(journal, limits))
+        seed_broad_owner(continuous_engine)
+        continuous = continuous_engine.run()
+    directory = tmp_path / "resumed"
+    identity = {"case": "interrupted-guided"}
+    with Journal(directory, identity) as journal:
+        engine = SearchEngine(EarlyNarrowingExecution(journal, limits, interrupt_at=4))
+        seed_broad_owner(engine)
+        interrupted = engine.run()
+        assert interrupted["termination"] == "interrupted"
+        assert engine.state["cover_draft"] is not None
+        assert engine.state["draft"]["kind"] == "refine"
+        assert engine.state["work_counts"]["refine"] == 1
+    prior = {path: path.read_bytes() for path in (directory / "segments").iterdir()}
+    with Journal(directory, identity, resume=True) as journal:
+        restored = SearchEngine(EarlyNarrowingExecution(journal, limits))
+        result = restored.run()
+        for key in ("predicate", "clauses", "score", "budgets", "search_diagnostics", "termination"):
+            assert result[key] == continuous[key]
+        assert restored.state["draft"] == continuous_engine.state["draft"]
+        assert restored.state["early_draft"] == continuous_engine.state["early_draft"]
+    assert all(path.read_bytes() == data for path, data in prior.items())
+
+
+@pytest.mark.parametrize("search_policy", ["composed", "adaptive"])
+def test_three_factor_preview_improves_before_broad_intermediates_use_budget(
+        tmp_path, finite_grammar, search_policy):
+    finite_grammar("rax == 1", "rbx == 1", "rcx == 1")
+
+    class ThreeFactorExecution(PartitionExecution):
+        cases = (
+            ((1, 1, 1), "target_crash", True),
+            ((0, 1, 1), "normal", True),
+            ((1, 0, 1), "normal", True),
+            ((1, 1, 0), "normal", True),
+        )
+
+    limits = SearchLimits(search_policy=search_policy, max_evaluations=2,
+                          max_factors=3, max_clauses=1, beam_width=3)
+    with Journal(tmp_path / "combination", {"case": "three-factor-preview"}) as journal:
+        backend = ThreeFactorExecution(journal, limits)
+        result = SearchEngine(backend).run()
+        assert result["score"]["covered"] == ["system:0"]
+        assert result["score"]["branch_regressions"] == []
+        assert len(result["program"]) == 1
+        assert len(result["program"][0]) == 3
+        assert set(result["program"][0]) == {"rax == 1", "rbx == 1", "rcx == 1"}
+        assert backend.evaluations == 2
+        assert all(source.count("&&") == 2 for source in backend.requests[1:])
+        assert 0 < result["search_diagnostics"]["lookahead_predictions"] <= 4 * limits.beam_width ** 2
+
+
+def test_exhausted_early_refinement_is_not_reopened_by_cached_evidence(tmp_path, finite_grammar):
+    finite_grammar("rax == 1")
+    limits = SearchLimits(search_policy="balanced", max_factors=1,
+                          max_clauses=2, beam_width=1)
+    with Journal(tmp_path / "exhausted-early", {"case": "exhausted-early"}) as journal:
+        backend = EarlyNarrowingExecution(journal, limits)
+        engine = SearchEngine(backend)
+        seed_broad_owner(engine)
+        result = engine.run()
+        assert result["termination"] == "bounded-search-exhausted"
+        assert result["search_diagnostics"]["refine"] == 1
+        assert engine.state["early_index"] == 1
+        assert engine.state["draft"] is None
+        assert engine.state["early_draft"] is None
+        assert engine.state["cover_draft"] is None
+        counts = deepcopy(engine.state["work_counts"])
+        spent = backend.evaluations
+        engine._run((("rax == 1",),))
+        assert engine.state["prediction_revision"] == 0
+        assert engine.state["early_index"] == 1
+        assert engine.run()["search_diagnostics"] == result["search_diagnostics"]
+        assert engine.state["work_counts"] == counts
+        assert backend.evaluations == spent
+
+
+@pytest.mark.parametrize("corruption", ["kind", "index", "attempt", "offset"])
+def test_resume_rejects_forged_suspended_cover_work(tmp_path, finite_grammar, corruption):
+    finite_grammar("rax == 1", "rbx == 1", "rcx == 1")
+    limits = SearchLimits(search_policy="balanced", max_factors=3,
+                          max_clauses=2, beam_width=1)
+    directory = tmp_path / "forged-suspended"
+    identity = {"case": "forged-suspended", "corruption": corruption}
+    with Journal(directory, identity) as journal:
+        engine = SearchEngine(EarlyNarrowingExecution(journal, limits, interrupt_at=4))
+        seed_broad_owner(engine)
+        assert engine.run()["termination"] == "interrupted"
+        if corruption == "kind":
+            engine.state["cover_draft"]["kind"] = "refine"
+        elif corruption == "index":
+            engine.state["draft"]["index"] = 1
+        elif corruption == "attempt":
+            engine.state["draft"]["attempt"] = "forged"
+        else:
+            engine.state["cover_draft"]["offset"] = 100
+        engine._save()
+    with Journal(directory, identity, resume=True) as journal:
+        with pytest.raises(ValueError, match="checkpoint"):
+            SearchEngine(EarlyNarrowingExecution(journal, limits))
+
+
+class AdaptiveExecution(PartitionExecution):
+    cases = tuple(((value,), "target_crash" if abs(value) == 2 else "normal", True)
+                  for value in (-2, -1, 0, 1, 2))
+
+
+@pytest.mark.parametrize("hide_normal", [False, True])
+def test_adaptive_learns_only_unique_eligible_evidence_preserving_improvements(
+        tmp_path, finite_grammar, hide_normal):
+    atom = "rax * rax >= 4"
+    finite_grammar(atom, "rax == 2", "rax == -2", "rax != 0", "rax >= 0")
+
+    class LearningExecution(AdaptiveExecution):
+        def _result(self, source):
+            result = super()._result(source)
+            if hide_normal and atom in source:
+                report = result["cases"][1]["report"]
+                report["candidate"].update(outcome="unknown", reason="timeout")
+                report["activation"]["status"] = "unknown"
+                report["branch_comparison"]["status"] = "unavailable"
+            return result
+
+    limits = SearchLimits(search_policy="adaptive", beam_width=4)
+    directory = tmp_path / "learning"
+    identity = {"case": "operator-learning", "hide-normal": hide_normal}
+    ranks = {(factor,): (index, 0, 0, 0, (factor,)) for index, factor in enumerate(
+        ("rax == 2", "rax == -2", "rax != 0", "rax >= 0", atom))}
+    signatures = {factor: frozenset({index}) for index, factor in enumerate(ranks)}
+    with Journal(directory, identity) as journal:
+        backend = LearningExecution(journal, limits)
+        engine = SearchEngine(backend)
+        engine._run(((atom,),))
+        engine._run(((atom,),))  # Real backend cache, not another learning trial.
+        engine._run((("rax / rax != 0",),))  # Complete-predicate trap: never rewarded.
+        stats = deepcopy(engine.state["operator_stats"])
+        assert stats["arithmetic"] == {"trials": 1, "improvements": int(not hide_normal)}
+        assert stats["division"] == {"trials": 1, "improvements": 0}
+        assert len(engine.state["operator_evaluations"]) == 2
+        chosen = engine._shortlist(ranks, signatures, 4)
+        assert chosen[:3] == list(ranks)[:3]  # Exploration floor survives learning.
+        assert ((atom,) in chosen) is (not hide_normal)
+        engine._save()
+        spent = backend.evaluations
+    prior = {path: path.read_bytes() for path in (directory / "segments").iterdir()}
+    with Journal(directory, identity, resume=True) as journal:
+        backend = LearningExecution(journal, limits)
+        restored = SearchEngine(backend)
+        assert restored.state["operator_stats"] == stats
+        assert restored._shortlist(ranks, signatures, 4) == chosen
+        restored._run(((atom,),))
+        assert backend.evaluations == spent
+        assert restored.state["operator_stats"] == stats
+        assert len(restored.state["operator_evaluations"]) == 2
+    assert all(path.read_bytes() == data for path, data in prior.items())
+
+
+@pytest.mark.parametrize("corruption", ["reward", "stats", "program", "before", "duplicate", "counter"])
+def test_resume_authenticates_adaptive_rewards_and_counters(tmp_path, finite_grammar, corruption):
+    atom = "rax * rax >= 4"
+    finite_grammar(atom)
+    limits = SearchLimits(search_policy="adaptive")
+    directory = tmp_path / "forged-learning"
+    identity = {"case": "forged-operator-learning", "corruption": corruption}
+    with Journal(directory, identity) as journal:
+        engine = SearchEngine(AdaptiveExecution(journal, limits))
+        engine._run(((atom,),))
+        row = engine.state["operator_evaluations"][0]
+        if corruption == "reward":
+            row["reward"] = False
+        elif corruption == "stats":
+            engine.state["operator_stats"]["arithmetic"]["improvements"] += 1
+        elif corruption == "program":
+            row["program"] = [["rax == 2"]]
+        elif corruption == "before":
+            row["before"] = row["evaluation"]
+        elif corruption == "duplicate":
+            engine.state["operator_evaluations"].append(deepcopy(row))
+        else:
+            engine.state["work_counts"]["refine"] = -1
+        engine._save()
+    with Journal(directory, identity, resume=True) as journal:
+        with pytest.raises(ValueError, match="checkpoint.*(learning|counters)"):
+            SearchEngine(AdaptiveExecution(journal, limits))

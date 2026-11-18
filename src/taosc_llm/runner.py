@@ -16,7 +16,7 @@ from .runner_options import allocate_run, parse_args
 from .runner_process import RunnerInterrupted, RunnerTimeout, Supervisor
 
 _SEARCH_OPTIONS = ("search_timeout", "max_evaluations", "max_atoms",
-                   "beam_width", "max_clauses", "max_factors", "operand_depth")
+                   "beam_width", "max_clauses", "max_factors", "operand_depth", "search_policy")
 
 
 class StageFailure(RuntimeError):

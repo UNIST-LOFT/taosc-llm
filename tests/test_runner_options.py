@@ -108,6 +108,7 @@ def test_normalization_preserves_lexical_symlink_parents(tmp_path, monkeypatch):
     ["--forkserver-child-timeout", "10", "--dataset", "data"],
     ["--forkserver-child-timeout", "10", "--concrete-only", "--concrete-run", "concrete"],
     ["--concrete-timeout", "-1"],
+    ["--search-policy", "unknown-policy"],
 ])
 def test_invalid_combinations_do_not_create_output(tmp_path, monkeypatch, argv):
     monkeypatch.chdir(tmp_path)
@@ -119,7 +120,7 @@ def test_invalid_combinations_do_not_create_output(tmp_path, monkeypatch, argv):
 
 @pytest.mark.parametrize("option", [
     "search-timeout", "max-evaluations", "max-atoms", "beam-width",
-    "max-clauses", "max-factors", "operand-depth",
+    "max-clauses", "max-factors", "operand-depth", "search-policy",
 ])
 @pytest.mark.parametrize("mode", ["manual", "provider"])
 def test_explicit_search_defaults_are_rejected_in_other_modes(option, mode):

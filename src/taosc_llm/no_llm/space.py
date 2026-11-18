@@ -214,6 +214,85 @@ def atoms(patch_format: str, snapshots: list[predicates.CachedSnapshot],
     return tuple(result)
 
 
+def _case_boundaries(snapshots_by_case, crashes, normals, limit, flattened,
+                     indices, environments, check=None) -> tuple[str, ...]:
+    """Rank at most two signed envelopes per register using whole cases.
+
+    Each envelope fires at least once in every captured target trace. Missing
+    and empty traces supply neither an extremum nor a successful observation.
+    Equivalent full outcome vectors share one revision-local proposal slot;
+    ordinary enumeration still retains other spellings and operators.
+    """
+    if not limit:
+        return ()
+    lower, upper = None, None
+    for case in sorted(crashes):
+        if check is not None:
+            check()
+        rows = snapshots_by_case.get(case, ())
+        if not rows:
+            continue
+        minima, maxima = [_MAX64] * len(_REGISTERS), [_MIN64] * len(_REGISTERS)
+        for turn, row in enumerate(rows):
+            if check is not None and turn % 256 == 0:
+                check()
+            for index, value in enumerate(row.registers):
+                value = predicates.wrap64(value)
+                minima[index] = min(minima[index], value)
+                maxima[index] = max(maxima[index], value)
+        if lower is None:
+            lower, upper = maxima, minima
+        else:
+            lower = [min(left, right) for left, right in zip(lower, maxima)]
+            upper = [max(left, right) for left, right in zip(upper, minima)]
+    if lower is None:
+        return ()
+
+    # Preserve ordered hit outcomes for diversity, not only an any-hit bit. Two
+    # atoms can activate identical case sets but refine differently at each hit.
+    relevant = set()
+    for case in sorted(crashes | normals):
+        if check is not None:
+            check()
+        for turn, index in enumerate(indices.get(case, ())):
+            if check is not None and turn % 256 == 0:
+                check()
+            relevant.add(index)
+    relevant = sorted(relevant)
+    ranked = []
+    for index, register in enumerate(_REGISTERS):
+        for operator, cutoff in (("<=", upper[index]), (">=", lower[index])):
+            candidate = parse_candidate("ERM generic", f"{register} {operator} {cutoff}")
+            outcomes = {}
+            for turn, position in enumerate(relevant):
+                if check is not None and turn % 256 == 0:
+                    check()
+                outcomes[position] = predicates.evaluate_cached_branch(
+                    candidate.parsed, flattened[position], environments[position])
+            activated_normals = 0
+            for case in sorted(normals):
+                if check is not None:
+                    check()
+                for turn, position in enumerate(indices.get(case, ())):
+                    if check is not None and turn % 256 == 0:
+                        check()
+                    if outcomes[position] == 1:
+                        activated_normals += 1
+                        break
+            rank = (activated_normals, len(candidate.expression.encode("utf-8")), candidate.expression)
+            # The fixed case-to-state index vectors reconstruct every ordered
+            # hit from these bytes, without duplicating shared capture traces.
+            ranked.append((rank, bytes(outcomes.values()), candidate.expression))
+    seen, result = set(), []
+    for _, signature, expression in sorted(ranked):
+        if signature not in seen:
+            seen.add(signature)
+            result.append(expression)
+            if len(result) == limit:
+                break
+    return tuple(result)
+
+
 class Space:
     """Canonical capture evaluator with bounded revision-local bitset caches.
 
@@ -224,10 +303,15 @@ class Space:
 
     def __init__(self, patch_format: str,
                  snapshots_by_case: dict[str, list[predicates.CachedSnapshot]],
-                 limits: SearchLimits, *, check=None):
+                 limits: SearchLimits, *, crashes: frozenset[str] = frozenset(),
+                 normals: frozenset[str] = frozenset(), check=None):
         _family(patch_format)
         self.patch_format = patch_format
         self.limits = limits
+        self._crashes = crashes
+        self._normals = normals
+        self._guided = (patch_format == "ERM generic" and bool(crashes)
+                        and limits.search_policy in ("boundaries", "balanced", "composed", "adaptive"))
         self._check = check
         self._snapshots: dict[str, tuple[predicates.CachedSnapshot, ...]] = {}
         self._cache: OrderedDict[str, tuple[bytes, bytes]] = OrderedDict()
@@ -280,18 +364,38 @@ class Space:
                     selected.append(positions[id(state)])
                 captures[id(rows)] = tuple(selected)
             indices[case] = captures[id(rows)]
-        generated = atoms(self.patch_format, flattened, self.limits, check=self._check)
-        available = set(generated)
-        # Keep the order of still-proposed atoms stable without keeping stale
-        # capture boundaries forever or crowding out new evidence-derived atoms.
-        retained = tuple(atom for atom in self.atoms if atom in available)
-        retained_set = set(retained)
         environments = [] if self.patch_format == "ERM generic" else None
         if environments is not None:
             for start in range(0, len(flattened), 256):
                 if self._check is not None:
                     self._check()
                 environments.extend(predicates.prepare_generic_environments(flattened[start:start + 256]))
+        generated = atoms(self.patch_format, flattened, self.limits, check=self._check)
+        if self._guided:
+            # A small cap must still admit ordinary grammar. Larger caps devote
+            # at most 32 existing slots to case envelopes, never an extra pool.
+            proposals = _case_boundaries(updated, self._crashes, self._normals,
+                                         min(32, self.limits.max_atoms // 2),
+                                         flattened, indices, environments, self._check)
+            selected, seen = [], set()
+            for atom in (*proposals, *generated):
+                if self._check is not None:
+                    self._check()
+                descriptor = parse_candidate(self.patch_format, atom).descriptor
+                if descriptor not in seen:
+                    seen.add(descriptor)
+                    selected.append(atom)
+                    if len(selected) == self.limits.max_atoms:
+                        break
+            generated = tuple(selected)
+            # Reconstruct from current evidence alone, including proposal rank,
+            # so updates and a fresh resume agree and stale boundaries disappear.
+            retained = ()
+        else:
+            available = set(generated)
+            # Preserve the original unlabelled/baseline enumerator behavior.
+            retained = tuple(atom for atom in self.atoms if atom in available)
+        retained_set = set(retained)
         if self._check is not None:
             self._check()
         self.atoms = retained + tuple(atom for atom in generated if atom not in retained_set)
