@@ -6,7 +6,8 @@ repair DNF is represented by its ordered safe CNF and evaluated at one clamp.
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
+from typing import NamedTuple
 
 from binradar import binradar_taosc_predicates as predicates
 
@@ -293,11 +294,24 @@ def _case_boundaries(snapshots_by_case, crashes, normals, limit, flattened,
     return tuple(result)
 
 
+class _CaseBranches(NamedTuple):
+    fired: int
+    trapped: int
+    # One distinct bit per (case, branch 0/1/2) pair, including mixed traces.
+    signature: int
+
+
+class _Prediction(NamedTuple):
+    ones: bytes
+    traps: bytes
+    cases: _CaseBranches
+
+
 class Space:
     """Canonical capture evaluator with bounded revision-local bitset caches.
 
-    Predictions are branch vectors only: no result here establishes repair or
-    ownership.  For CWE the whole safe expression is evaluated jointly, never
+    Predictions, whether ordered vectors or case membership, establish no repair
+    or ownership. For CWE the whole safe expression is evaluated jointly, never
     an OR of independently reduced per-allocation jump decisions.
     """
 
@@ -314,7 +328,7 @@ class Space:
                         and limits.search_policy in ("boundaries", "balanced", "composed", "adaptive"))
         self._check = check
         self._snapshots: dict[str, tuple[predicates.CachedSnapshot, ...]] = {}
-        self._cache: OrderedDict[str, tuple[bytes, bytes]] = OrderedDict()
+        self._cache: OrderedDict[tuple[Clause, ...], _Prediction] = OrderedDict()
         self._cache_limit = max(32, min(4096, limits.max_atoms + limits.beam_width * limits.max_clauses))
         self.atoms: tuple[str, ...] = ()
         self.revision = 0
@@ -364,6 +378,28 @@ class Space:
                     selected.append(positions[id(state)])
                 captures[id(rows)] = tuple(selected)
             indices[case] = captures[id(rows)]
+        # Keep an ordinal even for a known case without captures. Missing or
+        # empty traces contribute no branch bits and cannot satisfy an owner.
+        cases = sorted(updated.keys() | self._crashes | self._normals)
+        case_bits, trace_cases = {}, {}
+        nonempty_cases = 0
+        for ordinal, case in enumerate(cases):
+            if self._check is not None and ordinal % 256 == 0:
+                self._check()
+            bit = 1 << ordinal
+            case_bits[case] = bit
+            if trace := indices.get(case):
+                group = id(trace)
+                previous = trace_cases.get(group)
+                trace_cases[group] = (bit if previous is None else previous[0] | bit), trace
+                nonempty_cases |= bit
+        state_cases = [0] * len(flattened)
+        for mask, trace in trace_cases.values():
+            for turn, position in enumerate(trace):
+                if self._check is not None and turn % 256 == 0:
+                    self._check()
+                previous = state_cases[position]
+                state_cases[position] = (previous | mask) if previous else mask
         environments = [] if self.patch_format == "ERM generic" else None
         if environments is not None:
             for start in range(0, len(flattened), 256):
@@ -399,8 +435,13 @@ class Space:
         if self._check is not None:
             self._check()
         self.atoms = retained + tuple(atom for atom in generated if atom not in retained_set)
-        self._snapshots = dict(sorted(updated.items()))
+        self._snapshots = updated
         self._indices = indices
+        self._case_bits = case_bits
+        self._case_count = len(cases)
+        self._state_cases = state_cases
+        self._neutral_cases = self._pack_cases(nonempty_cases, 0, 0)
+        self._true_cases = self._pack_cases(0, nonempty_cases, 0)
         self._flat = flattened
         self._environments = tuple(environments) if environments is not None else None
         self._cache.clear()
@@ -413,44 +454,71 @@ class Space:
             raise ValueError("candidate exceeds max_factors")
         return compose(self.patch_format, clauses)
 
-    def predict(self, clauses: tuple[Clause, ...]) -> dict[str, tuple[int, ...]]:
+    def case_mask(self, cases: Iterable[str]) -> int:
+        """Map case IDs to the same revision-local bits used by predictions."""
+        mask = 0
+        for index, case in enumerate(cases):
+            if self._check is not None and index % 256 == 0:
+                self._check()
+            mask |= self._case_bits.get(case, 0)
+        return mask
+
+    def _pack_cases(self, zero: int, one: int, trap: int) -> _CaseBranches:
+        signature = zero | (one << self._case_count) | (trap << (2 * self._case_count))
+        return _CaseBranches(one & ~trap, trap, signature)
+
+    def _prediction(self, clauses: tuple[Clause, ...]) -> _Prediction | None:
         if self._check is not None:
             self._check()
+        cached = self._cache.get(clauses)
+        if cached is not None:
+            self._cache.move_to_end(clauses)
+            return cached
         expression = self.expression(clauses)
         if not clauses or expression is None:
+            return None
+        candidate = parse_candidate(self.patch_format, expression)
+        ones = bytearray((len(self._flat) + 7) // 8)
+        traps = bytearray(len(ones))
+        cases = [0, 0, 0]
+        for index, snapshot in enumerate(self._flat):
+            if self._check is not None and index % 256 == 0:
+                self._check()
+            environment = self._environments[index] if self._environments is not None else None
+            branch = predicates.evaluate_cached_branch(candidate.parsed, snapshot, environment)
+            cases[branch] |= self._state_cases[index]
+            if branch == 1:
+                ones[index // 8] |= 1 << (index % 8)
+            elif branch == 2:
+                traps[index // 8] |= 1 << (index % 8)
+        prediction = _Prediction(bytes(ones), bytes(traps), self._pack_cases(*cases))
+        self._cache[clauses] = prediction
+        if len(self._cache) > self._cache_limit:
+            self._cache.popitem(last=False)
+        return prediction
+
+    def branch_membership(self, clauses: tuple[Clause, ...]) -> _CaseBranches:
+        """Return compact firing, trapping and branch membership for ranking."""
+        prediction = self._prediction(clauses)
+        if prediction is not None:
+            return prediction.cases
+        return self._true_cases if clauses else self._neutral_cases
+
+    def predict(self, clauses: tuple[Clause, ...]) -> dict[str, tuple[int, ...]]:
+        prediction = self._prediction(clauses)
+        if prediction is None:
             # Empty program is neutral; CWE's unencodable true draft is only a
             # heuristic, not an executable candidate or outcome assertion.
-            branch = 0 if not clauses else 1
+            branch = int(bool(clauses))
             result, vectors = {}, {}
-            for case, rows in self._snapshots.items():
+            for case, indices in self._indices.items():
                 if self._check is not None:
                     self._check()
-                if len(rows) not in vectors:
-                    vectors[len(rows)] = (branch,) * len(rows)
-                result[case] = vectors[len(rows)]
+                if len(indices) not in vectors:
+                    vectors[len(indices)] = (branch,) * len(indices)
+                result[case] = vectors[len(indices)]
             return result
-        candidate = parse_candidate(self.patch_format, expression)
-        key = candidate.descriptor
-        bits = self._cache.get(key)
-        if bits is None:
-            ones = bytearray((len(self._flat) + 7) // 8)
-            traps = bytearray(len(ones))
-            for index, snapshot in enumerate(self._flat):
-                if self._check is not None and index % 256 == 0:
-                    self._check()
-                environment = self._environments[index] if self._environments is not None else None
-                branch = predicates.evaluate_cached_branch(candidate.parsed, snapshot, environment)
-                if branch == 1:
-                    ones[index // 8] |= 1 << (index % 8)
-                elif branch == 2:
-                    traps[index // 8] |= 1 << (index % 8)
-            bits = (bytes(ones), bytes(traps))
-            self._cache[key] = bits
-            if len(self._cache) > self._cache_limit:
-                self._cache.popitem(last=False)
-        else:
-            self._cache.move_to_end(key)
-        ones, traps = bits
+        ones, traps, _ = prediction
         result, vectors = {}, {}
         for case, indices in self._indices.items():
             if self._check is not None:

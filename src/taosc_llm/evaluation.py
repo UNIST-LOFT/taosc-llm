@@ -360,29 +360,36 @@ def _case_result(dataset, case, candidate, descriptor, execute, root, base_ident
     with _lock(root / (pool_key + '.lock'), operation_check=operation_check):
         if operation_check is not None:
             operation_check()
-        representatives = _pool_descriptors(pool_path, pool_identity)
-        captures = []
-        own = _cache_record(record_path, identity)
-        if own:
-            captures.append((own, 'cache'))
-        if case.get('capture'):
-            captures.append((case['capture'], 'offline' if case['domain'] == 'function' else 'cache'))
-        captures.extend((c, 'cache') for c in _external_captures(dataset, case, producer, metadata))
-        # Reuse neutral own captures across candidates without trusting a prior
-        # result summary; validate their complete state and mirror every time.
-        neutral_identity = {**identity, 'descriptor': 'p0'}
-        neutral = _cache_record(root / (_digest(neutral_identity) + '.json'), neutral_identity)
-        if neutral and descriptor != 'p0':
-            captures.append((neutral, 'cache'))
-        for representative in representatives:
-            if representative in (descriptor, 'p0'):
-                continue
-            representative_identity = {**pool_identity, 'descriptor': representative}
-            capture = _cache_record(root / (_digest(representative_identity) + '.json'),
-                                    representative_identity)
-            if capture is not None:
-                captures.append((capture, 'cache'))
-        for capture, source in captures:
+        representatives: list[str]
+
+        def captures():
+            # Only exhaust the durable index on a miss. Its locked snapshot
+            # then also serves the fresh-execution append below.
+            nonlocal representatives
+            own = _cache_record(record_path, identity)
+            if own:
+                yield own, 'cache'
+            if case.get('capture'):
+                yield case['capture'], 'offline' if case['domain'] == 'function' else 'cache'
+            for capture in _external_captures(dataset, case, producer, metadata):
+                yield capture, 'cache'
+            if descriptor != 'p0':
+                neutral_identity = {**pool_identity, 'descriptor': 'p0'}
+                neutral = _cache_record(root / (_digest(neutral_identity) + '.json'), neutral_identity)
+                if neutral:
+                    yield neutral, 'cache'
+            representatives = _pool_descriptors(pool_path, pool_identity)
+            for representative in representatives:
+                if operation_check is not None:
+                    operation_check()
+                if representative in (descriptor, 'p0'):
+                    continue
+                key = {**pool_identity, 'descriptor': representative}
+                capture = _cache_record(root / (_digest(key) + '.json'), key)
+                if capture is not None:
+                    yield capture, 'cache'
+
+        for capture, source in captures():
             if operation_check is not None:
                 operation_check()
             try:

@@ -171,8 +171,8 @@ class Backend:
         self.check_operation()
         return preserved
 
-    def _validate_result(self, dataset, result):
-        """Authenticate predicate/report binding and every full-vector mirror."""
+    def _validate_result(self, dataset, result, *, snapshots=None):
+        """Authenticate every report/vector, optionally collecting prediction states."""
         from ..evidence import _project_case
         from ..poc import poc_case
         descriptor = result["descriptor"]
@@ -182,6 +182,7 @@ class Backend:
             raise ValueError("journal evaluation identity mismatch")
         metadata = evaluation._capture_metadata(dataset)
         poc = poc_case(dataset)
+        active = self.population.active if snapshots is not None and self.population is not None else None
         seen = set()
         for item in result["cases"]:
             self.check_operation()
@@ -194,31 +195,40 @@ class Backend:
                 case = {**case, "observation": item["original_observation"]["outcome"]}
             if item["report"] != _project_case(dataset, case, item, metadata=metadata, descriptor=descriptor):
                 raise ValueError("journal case report mismatch")
+            selected = None
             for record in (item, item.get("neutral_baseline", {})):
                 capture = record.get("capture")
                 if capture and capture.get("complete") is True:
-                    states = evaluation._snapshots(dataset, capture)
-                    actual = capture["branches"]
-                    if evaluation._vector(capture["descriptor"], states, dataset=dataset) != actual:
+                    states = evaluation._validated_snapshots(dataset, capture, metadata)
+                    actual, representative = capture["branches"], capture["descriptor"]
+                    if evaluation._vector(representative, states, dataset=dataset) != actual:
                         raise ValueError("journal representative evaluator mismatch")
                     if ((record.get("status") != "unavailable" or record.get("branches") is not None)
                             and record.get("branches") != actual):
                         raise ValueError("journal observed vector mismatch")
-                    if (record.get("status") != "unavailable"
+                    if (record.get("status") != "unavailable" and record["descriptor"] != representative
                             and evaluation._vector(record["descriptor"], states, dataset=dataset) != actual):
                         raise ValueError("journal candidate vector mismatch")
+                    # A complete candidate capture wins even when it has zero hits.
+                    if selected is None:
+                        selected = states
                 reference = record.get("offline_reference")
                 if reference and reference.get("complete") is True:
-                    states = evaluation._snapshots(dataset, reference)
-                    actual = reference["branches"]
-                    if evaluation._vector(reference["descriptor"], states, dataset=dataset) != actual:
+                    states = evaluation._validated_snapshots(dataset, reference, metadata)
+                    actual, representative = reference["branches"], reference["descriptor"]
+                    if evaluation._vector(representative, states, dataset=dataset) != actual:
                         raise ValueError("journal offline representative evaluator mismatch")
-                    predicted = evaluation._vector(record["descriptor"], states, dataset=dataset)
-                    divergence = next((index for index, (a, b) in enumerate(zip(predicted, actual))
-                                       if a != b), None)
+                    if record["descriptor"] == representative:
+                        predicted, divergence = actual, None
+                    else:
+                        predicted = evaluation._vector(record["descriptor"], states, dataset=dataset)
+                        divergence = next((index for index, (a, b) in enumerate(zip(predicted, actual))
+                                           if a != b), None)
                     if (record.get("offline_branches") != predicted
                             or record.get("first_divergence") != divergence):
                         raise ValueError("journal offline vector mismatch")
+            if snapshots is not None and selected and (active is None or identifier in active):
+                snapshots[identifier] = selected
         self.check_operation()
 
     def load(self, reference):
@@ -274,10 +284,14 @@ class Backend:
         self.checkpoint_budget()
         return result
 
-    def evaluate(self, source: str):
+    def evaluate(self, source: str) -> tuple[dict, dict]:
         candidate = parse_candidate(self.dataset.patch_format, source)
         if candidate.descriptor in self.result_refs:
-            return self.load(self.result_refs[candidate.descriptor])
+            reference = self.result_refs[candidate.descriptor]
+            result = self.load(reference)
+            if result["descriptor"] != candidate.descriptor:
+                raise ValueError("journal evaluation identity mismatch")
+            return result, reference.copy()
         self.check()
         with self.dataset.validation(check=self.check_operation) as dataset:
             if self.socket is not None:
@@ -293,22 +307,15 @@ class Backend:
             self.journal.append("evaluation", {"descriptor": candidate.descriptor, "result": reference})
             self.result_refs[candidate.descriptor] = reference
         self.checkpoint_budget()
-        return result
+        return result, reference.copy()
+
+    def load_snapshots(self, reference):
+        """Load and authenticate a saved result, returning only prediction states."""
+        self.check_operation()
+        return self.snapshots(self.journal.load(reference))
 
     def snapshots(self, result):
         output = {}
-        active = self.population.active if self.population is not None else None
         with self.dataset.validation(check=self.check_operation) as dataset:
-            self._validate_result(dataset, result)
-            for item in result["cases"]:
-                self.check_operation()
-                if active is not None and item["case_id"] not in active:
-                    continue
-                capture = item.get("capture")
-                if not capture or capture.get("complete") is not True:
-                    capture = item.get("neutral_baseline", {}).get("capture")
-                if capture and capture.get("complete") is True:
-                    states = evaluation._snapshots(dataset, capture)
-                    if states:
-                        output[item["case_id"]] = states
+            self._validate_result(dataset, result, snapshots=output)
         return output

@@ -81,6 +81,9 @@ def test_cwe_distinct_allocations_must_share_one_clamp_for_composition():
     # Each safe leaf matches a different allocation.  AND of the safe blocks
     # matches neither; OR-ing the independent jump results would be WRONG.
     assert space.predict(((POINTER_A,), (POINTER_B,))) == {"case": (1,)}
+    assert not space.branch_membership(((POINTER_A,),)).fired
+    assert not space.branch_membership(((POINTER_B,),)).fired
+    assert space.branch_membership(((POINTER_A,), (POINTER_B,))).fired == space.case_mask({"case"})
     # Two factors refine a single unsafe conjunction; dual safe OR stays safe.
     assert space.predict(((POINTER_A, POINTER_B),)) == {"case": (0,)}
 
@@ -165,6 +168,7 @@ def test_equal_predictive_states_retain_atoms_and_prediction_cache(monkeypatch):
     space = Space(GENERIC, {"case": rows}, SearchLimits())
     program = (("1 / rax",),)
     expected = space.predict(program)
+    membership = space.branch_membership(program)
     atoms_before, revision = space.atoms, space.revision
 
     def unexpected(*args, **kwargs):
@@ -179,6 +183,45 @@ def test_equal_predictive_states_retain_atoms_and_prediction_cache(monkeypatch):
     assert space.revision == revision
     assert space.atoms is atoms_before
     assert space.predict(program) == expected
+    assert space.branch_membership(program) is membership
+
+
+def test_branch_membership_matches_vector_sets_through_revision():
+    zero, one, two = (snapshot(rax=value) for value in range(3))
+    mixed = (zero, one, two, zero)
+    rows = {"mixed": mixed, "alias": mixed, "fired": (one,), "empty": ()}
+    labels = {"crashes": frozenset({"missing"})}
+    limits = SearchLimits(max_atoms=16)
+    space = Space(GENERIC, rows, limits, **labels)
+    programs = ((), ((),), (("1 / rax",),), (("rax != 0", "1 / rax"),), (("rax == 1",),))
+
+    def compare():
+        membership, signatures = [], []
+        for program in programs:
+            prediction = space.branch_membership(program)
+            vectors = space.predict(program)
+            fired = space.case_mask(case for case, vector in vectors.items() if 1 in vector and 2 not in vector)
+            trapped = space.case_mask(case for case, vector in vectors.items() if 2 in vector)
+            assert prediction.fired == fired
+            assert prediction.trapped == trapped
+            membership.append(prediction.signature)
+            signatures.append({(case, branch) for case, vector in vectors.items() for branch in vector})
+        for i, signature in enumerate(signatures):
+            assert all(case not in {"empty", "missing"} for case, _ in signature)
+            for j, other in enumerate(signatures):
+                assert (membership[i] ^ membership[j]).bit_count() == len(signature ^ other)
+
+    compare()
+    danger = programs[2]
+    assert space.branch_membership(danger).fired == space.case_mask({"fired"})
+    assert space.branch_membership(danger).trapped == space.case_mask({"mixed", "alias"})
+    prior_revision = space.revision
+    updated = {"a-first": (one,), "mixed": (two,)}
+    space.update(updated)
+    assert space.revision == prior_revision + 1
+    compare()
+    rebuilt = Space(GENERIC, rows | updated, limits, **labels)
+    assert space.branch_membership(danger) == rebuilt.branch_membership(danger)
 
 
 def test_capture_update_rebuilds_atom_boundaries_and_removes_invalid_stack_cells():
@@ -225,7 +268,8 @@ def test_cancelled_preprocessing_keeps_prior_capture_revision():
     assert space.predict((("rax == 1",),)) == {"case": (1,)}
 
 
-def test_cancelled_prediction_never_caches_a_partial_vector():
+@pytest.mark.parametrize("prediction_api", ["predict", "branch_membership"])
+def test_cancelled_prediction_never_caches_a_partial_vector(prediction_api):
     polls = {"remaining": None}
 
     def check():
@@ -238,8 +282,9 @@ def test_cancelled_prediction_never_caches_a_partial_vector():
     space = Space(GENERIC, {"case": rows}, SearchLimits(), check=check)
     clauses = (("1 / rax",),)
     polls["remaining"] = 3
+    predict = getattr(space, prediction_api)
     with pytest.raises(SearchStopped, match="wall-time"):
-        space.predict(clauses)
+        predict(clauses)
     polls["remaining"] = None
     expected = tuple(predicates.evaluate_cached_predicate(parse_candidate(GENERIC, "1 / rax").parsed, rows))
     assert space.predict(clauses) == {"case": expected}

@@ -22,6 +22,10 @@ class JournalError(ValueError):
     """Invalid identity, evidence, journal structure, or storage boundary."""
 
 
+_PAYLOAD_PATH = re.compile(r"payloads/([0-9a-f]{64})\.[A-Za-z0-9][A-Za-z0-9._-]{0,31}")
+_RecoveryFiles = dict[str, tuple[os.stat_result, str]]
+
+
 # Linux renameat2 is the atomic no-overwrite operation required here. A
 # link/unlink publication can leave a second hard link after SIGKILL; ordinary
 # rename can replace evidence created between the existence check and publish.
@@ -102,6 +106,12 @@ def _private(info: os.stat_result, *, directory: bool = False) -> None:
         raise JournalError("journal storage must be private, owned, and not linked")
 
 
+def _immutable(info: os.stat_result) -> None:
+    _private(info)
+    if info.st_mode & 0o222:
+        raise JournalError("journal evidence files must be immutable")
+
+
 def _directory(path: Path, *, create: bool) -> int:
     """Traverse with directory descriptors; no ancestor may be a symlink."""
     path = Path(os.path.abspath(path))
@@ -147,7 +157,6 @@ class Journal:
         self._active = False
         self._entered = False
         self._poisoned = False
-        self._recovering = False
         self._seq = 0
         self._chain = ""
 
@@ -167,23 +176,50 @@ class Journal:
         self._created.append((parent, name, os.fstat(fd).st_ino, False))
         return fd
 
-    def _read(self, parent: int, name: str) -> bytes:
+    def _read(self, parent: int, name: str, *, recovered: _RecoveryFiles | None = None) -> bytes:
         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
         try:
             info = os.fstat(fd)
-            _private(info)
-            if info.st_mode & 0o222:
-                raise JournalError("journal evidence files must be immutable")
+            _immutable(info)
             chunks = []
             while chunk := os.read(fd, 1024 * 1024):
                 chunks.append(chunk)
-            if self._recovering:
+            data = b"".join(chunks)
+            if recovered is not None:
                 # A prior writer may have died between write/rename and fsync.
                 # Seal only bytes made durable again by this recovery.
                 os.fsync(fd)
-            return b"".join(chunks)
+                recovered[name] = info, _digest(data)
+            return data
         finally:
             os.close(fd)
+
+    @staticmethod
+    def _check_recovered_file(info: os.stat_result, expected: os.stat_result) -> None:
+        _immutable(info)
+        if (info.st_dev != expected.st_dev or info.st_ino != expected.st_ino
+                or info.st_size != expected.st_size or info.st_ctime_ns != expected.st_ctime_ns
+                or info.st_mtime_ns != expected.st_mtime_ns):
+            raise JournalError("recovered journal file was replaced or modified")
+
+    def _check_recovered_files(self, parent: int, recovered: _RecoveryFiles) -> None:
+        # Metadata alone can miss a rewrite with the same ctime. Reopen each
+        # distinct file after directory fsyncs and hash it without retaining bytes.
+        for name, (expected, checksum) in recovered.items():
+            try:
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+                try:
+                    self._check_recovered_file(os.fstat(fd), expected)
+                    digest = hashlib.sha256()
+                    while chunk := os.read(fd, 1024 * 1024):
+                        digest.update(chunk)
+                    if digest.hexdigest() != checksum:
+                        raise JournalError("recovered journal file was replaced or modified: checksum mismatch")
+                    self._check_recovered_file(os.stat(name, dir_fd=parent, follow_symlinks=False), expected)
+                finally:
+                    os.close(fd)
+            except OSError as exc:
+                raise JournalError("missing or unsafe recovered journal file") from exc
 
     def _subdirectory(self, name: str) -> int:
         fd = self._keep(os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
@@ -222,16 +258,19 @@ class Journal:
             os.fsync(self._lock)
             if self.resume:
                 # Recheck under the lock before examining the append-only stream.
-                self._recovering = True
-                header = _decode(self._read(self._root, "identity.json"))
+                identity, segments, payloads = {}, {}, {}
+                header = _decode(self._read(self._root, "identity.json", recovered=identity))
                 self._validate_identity(header)
                 self._segments = self._subdirectory("segments")
                 self._payloads = self._subdirectory("payloads")
-                previous, number, torn = self._replay(header["sha256"])
+                previous, number, torn = self._replay(header["sha256"], segments, payloads)
                 os.fsync(self._payloads)
                 os.fsync(self._segments)
                 os.fsync(self._root)
-                self._recovering = False
+                self._check_recovered_files(self._root, identity)
+                self._check_recovered_files(self._segments, segments)
+                self._check_recovered_files(self._payloads, payloads)
+                self._identity_info, _ = identity["identity.json"]
             else:
                 self._check_new_output(locked=True)
                 os.fchmod(self._root, 0o700)
@@ -244,8 +283,7 @@ class Journal:
                 os.fsync(self._root)
                 self._chain = header["sha256"]
                 previous, number, torn = None, 1, None
-            self._identity_info = os.stat("identity.json", dir_fd=self._root,
-                                          follow_symlinks=False)
+                self._identity_info = os.fstat(fd)
             self._check_storage()
             segment_header = _signed({"schema": 1, "segment": number,
                                       "next_seq": self._seq + 1, "prev": self._chain,
@@ -300,14 +338,16 @@ class Journal:
         if _canonical(header["identity"]) != self._identity_bytes:
             raise JournalError("journal identity mismatch")
 
-    def _replay(self, initial: str) -> tuple[str | None, int, str | None]:
+    def _replay(self, initial: str, segments: _RecoveryFiles,
+                payloads: _RecoveryFiles) -> tuple[str | None, int, str | None]:
         names = sorted(os.listdir(self._segments))
         self._chain = initial
         previous = torn = None
         for number, name in enumerate(names, 1):
             if name != f"{number:08d}.jsonl":
                 raise JournalError("invalid or missing journal segment")
-            raw = self._read(self._segments, name)
+            raw = self._read(self._segments, name, recovered=segments)
+            checksum = segments[name][1]
             lines = raw.split(b"\n")
             expected = {"schema": 1, "segment": number, "next_seq": self._seq + 1,
                         "prev": self._chain, "previous_segment_sha256": previous,
@@ -319,14 +359,14 @@ class Journal:
                 if header is not None:
                     self._segment_header(header, expected)
                 self.torn_tails.append(name)
-                previous, torn = _digest(raw), _digest(raw)
+                previous = torn = checksum
                 continue
             header = _decode(lines[0])
             self._segment_header(header, expected)
             self._chain = header["sha256"]
             for line in lines[1:-1]:
                 record = _decode(line)
-                self._event(record)
+                self._event(record, payloads)
                 self.events.append(record)
                 self._seq += 1
                 self._chain = record["sha256"]
@@ -334,9 +374,9 @@ class Journal:
             if tail:
                 pending = self._check_torn(tail)
                 if pending is not None:
-                    self._event(pending)
+                    self._event(pending, payloads)
                 self.torn_tails.append(name)
-            previous = _digest(raw)
+            previous = checksum
             torn = _digest(tail) if tail else None
         if not names:
             raise JournalError("journal has no initial segment")
@@ -349,14 +389,14 @@ class Journal:
                 or {key: value for key, value in header.items() if key != "sha256"} != expected):
             raise JournalError("journal segment chain mismatch")
 
-    def _event(self, record: dict) -> None:
+    def _event(self, record: dict, payloads: _RecoveryFiles) -> None:
         _checked(record)
         if (set(record) != {"seq", "kind", "data", "prev", "sha256"}
                 or type(record["seq"]) is not int or record["seq"] != self._seq + 1
                 or record["prev"] != self._chain or not isinstance(record["kind"], str)
                 or not record["kind"] or not isinstance(record["data"], dict)):
             raise JournalError("journal event sequence or structure mismatch")
-        self._references(record["data"])
+        self._references(record["data"], recovered=payloads)
 
     @staticmethod
     def _check_torn(tail: bytes) -> dict | None:
@@ -417,16 +457,12 @@ class Journal:
                 _private(info, directory=directory)
             identity = os.stat("identity.json", dir_fd=self._root, follow_symlinks=False)
             same(identity, self._identity_info)
-            _private(identity)
-            if identity.st_mode & 0o222:
-                raise JournalError("journal evidence files must be immutable")
+            _immutable(identity)
             if self._active:
                 name = f"{self._segment_number:08d}.jsonl"
                 info = os.stat(name, dir_fd=self._segments, follow_symlinks=False)
                 same(info, os.fstat(self._segment))
-                _private(info)
-                if info.st_mode & 0o222:
-                    raise JournalError("journal evidence files must be immutable")
+                _immutable(info)
         except OSError as exc:
             raise JournalError("missing or unsafe journal storage") from exc
 
@@ -460,52 +496,55 @@ class Journal:
         return _decode(_canonical(record))
 
     @staticmethod
-    def _reference(reference: dict) -> tuple[str, str]:
-        if not isinstance(reference, dict):
-            raise JournalError("invalid payload reference")
-        path, digest = reference.get("path"), reference.get("sha256")
-        if (not isinstance(path, str) or not isinstance(digest, str)
-                or not re.fullmatch(r"[0-9a-f]{64}", digest)
-                or not re.fullmatch(r"payloads/[0-9a-f]{64}\.[A-Za-z0-9][A-Za-z0-9._-]{0,31}", path)
-                or path.split("/", 1)[1].split(".", 1)[0] != digest):
+    def _reference(path, digest) -> str:
+        match = _PAYLOAD_PATH.fullmatch(path) if isinstance(path, str) else None
+        if match is None or not isinstance(digest, str) or match[1] != digest:
             raise JournalError("invalid or escaping payload reference")
-        return path.split("/", 1)[1], digest
+        return path[len("payloads/"):]
 
-    def _load_bytes(self, reference: dict) -> bytes:
-        name, digest = self._reference(reference)
+    def _load_bytes(self, name: str, digest: str, *, recovered: _RecoveryFiles | None = None) -> bytes:
         try:
-            data = self._read(self._payloads, name)
+            data = self._read(self._payloads, name, recovered=recovered)
         except OSError as exc:
             raise JournalError("missing or unsafe journal payload") from exc
-        if _digest(data) != digest:
+        checksum = _digest(data) if recovered is None else recovered[name][1]
+        if checksum != digest:
             raise JournalError("payload checksum mismatch")
         return data
 
-    def _references(self, value: object, seen: set[str] | None = None) -> None:
-        if seen is None:
-            seen = set()
-        if isinstance(value, dict):
-            path = value.get("path")
-            owned_prefix = str(self.directory / "payloads") + "/"
-            if isinstance(path, str) and path.startswith(owned_prefix):
-                # Canonical capture consumers need absolute paths; these still
-                # belong to this journal and require descriptor-relative reads.
-                path = "payloads/" + path[len(owned_prefix):]
-            if isinstance(path, str) and path.startswith("payloads/"):
-                reference = {**value, "path": path}
-                # Validate even repeated references: a duplicate path with a
-                # different digest must not be hidden by the traversal cache.
-                self._reference(reference)
-                if path not in seen:
-                    seen.add(path)
-                    raw = self._load_bytes(reference)
-                    if path.endswith(".json"):
-                        self._references(_decode(raw), seen)
-            for child in value.values():
-                self._references(child, seen)
-        elif isinstance(value, list):
-            for child in value:
-                self._references(child, seen)
+    def _references(self, value: dict, *, recovered: _RecoveryFiles | None = None) -> None:
+        # Reuse only inside this traversal or the enclosing replay. A full
+        # basename (including suffix) identifies one physical dependency.
+        seen = set() if recovered is None else recovered
+        owned_prefix = str(self.directory / "payloads") + "/"
+        self._visit_references(value, seen, owned_prefix)
+
+    def _visit_references(self, node: dict | list, seen: set[str] | _RecoveryFiles,
+                          owned_prefix: str) -> None:
+        if isinstance(node, dict):
+            path = node.get("path")
+            if isinstance(path, str):
+                if path.startswith(owned_prefix):
+                    # Owned captures use absolute paths in case records.
+                    path = "payloads/" + path[len(owned_prefix):]
+                if path.startswith("payloads/"):
+                    digest = node.get("sha256")
+                    name = self._reference(path, digest)
+                    if name not in seen:
+                        if isinstance(seen, set):
+                            seen.add(name)
+                            recovered = None
+                        else:
+                            recovered = seen
+                        raw = self._load_bytes(name, digest, recovered=recovered)
+                        if name.endswith(".json"):
+                            self._visit_references(_decode(raw), seen, owned_prefix)
+            children = node.values()
+        else:
+            children = node
+        for child in children:
+            if isinstance(child, (dict, list)):
+                self._visit_references(child, seen, owned_prefix)
 
     def store(self, value: dict) -> dict:
         if not isinstance(value, dict):
@@ -527,7 +566,7 @@ class Journal:
         except FileNotFoundError:
             pass
         else:
-            self._load_bytes(reference)
+            self._load_bytes(name, digest)
             return reference
         temporary = ".pending-" + uuid.uuid4().hex
         try:
@@ -540,7 +579,7 @@ class Journal:
                     _publish(self._payloads, temporary, name)
                 except FileExistsError:
                     # A substituted file must be authenticated, never overwritten.
-                    self._load_bytes(reference)
+                    self._load_bytes(name, digest)
             finally:
                 os.close(fd)
                 try:
@@ -549,7 +588,7 @@ class Journal:
                     pass
             os.fsync(self._payloads)
             self._check_storage()
-            self._load_bytes(reference)
+            self._load_bytes(name, digest)
         except BaseException:
             # In particular, a failed directory fsync can leave a visible but
             # not durable payload. Do not let deduplication commit it on retry.
@@ -559,7 +598,11 @@ class Journal:
 
     def load(self, reference: dict) -> dict:
         self._require_active()
-        value = _decode(self._load_bytes(reference))
+        if not isinstance(reference, dict):
+            raise JournalError("invalid payload reference")
+        digest = reference.get("sha256")
+        name = self._reference(reference.get("path"), digest)
+        value = _decode(self._load_bytes(name, digest))
         self._references(value)
         return value
 

@@ -41,6 +41,7 @@ class FiniteExecution:
         self.interrupt_at = interrupt_at
         self.requests = []
         self.results = {}
+        self.result_refs = {}
         self.restoring = False
 
     @contextmanager
@@ -78,7 +79,12 @@ class FiniteExecution:
             if self.evaluations == self.interrupt_at:
                 raise KeyboardInterrupt
             self.results[descriptor] = self._result(source)
-        return self.results[descriptor]
+            self.result_refs[descriptor] = self.journal.store(self.results[descriptor])
+        return self.results[descriptor], self.result_refs[descriptor]
+
+    def load_snapshots(self, reference):
+        self.check_operation()
+        return self.snapshots(self.load(reference))
 
     def snapshots(self, result):
         return {row["case_id"]: [CachedSnapshot(0, row["branch"],
@@ -126,8 +132,10 @@ class PartitionExecution(FiniteExecution):
             if event["kind"] == "finite_budget":
                 self.evaluations = event["data"]["evaluations"]
             elif event["kind"] == "finite_evaluation":
-                result = journal.load(event["data"]["result"])
+                reference = event["data"]["result"]
+                result = journal.load(reference)
                 self.results[result["descriptor"]] = result
+                self.result_refs[result["descriptor"]] = reference
         self.elapsed = self.evaluations
 
     def _result(self, source):
@@ -163,8 +171,9 @@ class PartitionExecution(FiniteExecution):
             self.elapsed = self.evaluations
             self.journal.append("finite_budget", {"evaluations": self.evaluations})
             self.results[descriptor] = self._result(source)
-            self.journal.append("finite_evaluation", {"result": self.journal.store(self.results[descriptor])})
-        return self.results[descriptor]
+            reference = self.result_refs[descriptor] = self.journal.store(self.results[descriptor])
+            self.journal.append("finite_evaluation", {"result": reference})
+        return self.results[descriptor], self.result_refs[descriptor]
 
 
 class PermanentlyUnrepairedExecution(PartitionExecution):
@@ -309,12 +318,17 @@ def test_scheduled_partitions_resume_without_rewriting_or_resetting_budget(tmp_p
         assert interrupted["termination"] == "interrupted"
         assert engine.state["pending"]
         spent = backend.evaluations
+        visited = {key: dict(engine.state[key]) for key in ("visited_branches", "visited_work")}
+        for saved in visited.values():
+            assert saved
+            assert all(len(bytes.fromhex(key)) == 32 for key in saved)
     prior = {path: path.read_bytes() for path in (output / "segments").iterdir()}
     with Journal(output, identity, resume=True) as journal:
         backend = PartitionExecution(journal, limits)
         assert backend.evaluations == spent
         restored = SearchEngine(backend)
         assert restored.state["pending"]
+        assert all(restored.state[key] == saved for key, saved in visited.items())
         result = restored.run()
         assert result["score"] == uninterrupted["score"]
         assert result["predicate"] == uninterrupted["predicate"]
@@ -323,6 +337,22 @@ def test_scheduled_partitions_resume_without_rewriting_or_resetting_budget(tmp_p
         assert result["budgets"]["evaluations"] == uninterrupted["budgets"]["evaluations"]
         assert backend.evaluations >= spent
     assert all(path.read_bytes() == contents for path, contents in prior.items())
+
+
+def test_branch_retention_keeps_lexical_owner_tie_order(tmp_path):
+    with Journal(tmp_path / "search", {"case": "lexical-branch-tie"}) as journal:
+        engine = SearchEngine(FiniteExecution(journal, SearchLimits(beam_width=2)))
+        # Equal scores and costs, but distinct proof partitions. This fixture's
+        # digest order deliberately reverses the canonical owner order.
+        def branch(owner):
+            return {**engine._branch(), "clauses": [{"factors": ["rax != 0"], "owners": [owner],
+                                                     "prefix": [], "introduced_factors": ["rax != 0"]}]}
+
+        first, second = branch("system:0"), branch("system:4")
+        assert engine._branch_key(second) < engine._branch_key(first)
+        engine._retain(second)
+        engine._retain(first)
+        assert engine.state["pending"] == [first]
 
 
 def test_archived_result_checkpoint_requires_introduction_proof(tmp_path):
@@ -460,6 +490,7 @@ def test_refinement_retains_real_owners_without_all_normal_evidence(tmp_path):
         engine._start_draft("refine", "system:0", index=0)
         engine.state["draft"]["queue"] = [[atom]]
         engine._step_draft()
+        assert sum(atom in source for source in engine.backend.requests) == 1
         assert engine.state["clauses"][0]["factors"] == [atom]
         assert engine._required() == {"system:0", "system:4"}
         assert engine.state["best_result"]["clauses"][0]["refinement"]
@@ -505,24 +536,47 @@ def test_interrupted_search_resumes_without_rewriting_prior_evidence(tmp_path):
     assert all(path.read_bytes() == contents for path, contents in prior.items())
 
 
-def test_resume_retains_uncommitted_capture_revision_and_atom_order(tmp_path):
+def test_resume_retains_uncommitted_capture_revision_and_atom_order(tmp_path, monkeypatch):
     limits = SearchLimits(operand_depth=1, max_factors=1, max_atoms=512)
     output = tmp_path / "search"
     identity = {"case": "new-visit-state"}
+    probe = (("rax == 23",),)
     with Journal(output, identity) as journal:
         backend = FiniteExecution(journal, limits)
         engine = SearchEngine(backend)
+        engine._save()
+        older = next(e["data"]["state"] for e in reversed(journal.events) if e["kind"] == "checkpoint")
         # A divergent real representative may expose a different later state.
         # It must survive restart even when that proposal never became incumbent.
         backend.values = (-19, -1, 0, 1, 23)
-        engine._run((("rax < 0",),))
+        reference = engine._run((("rax < 0",),)).reference
         engine._save()
-        expected = engine.space.predict((("rax == 23",),))
+        latest = next(e["data"]["state"] for e in reversed(journal.events) if e["kind"] == "checkpoint")
+        expected = engine.space.predict(probe)
+        membership = engine.space.branch_membership(probe)
         ordered_atoms = engine.space.atoms
         assert engine.state["clauses"] == []
     with Journal(output, identity, resume=True) as journal:
-        restored = SearchEngine(FiniteExecution(journal, limits))
-        assert restored.space.predict((("rax == 23",),)) == expected
+        backend = FiniteExecution(journal, limits)
+        load, load_captures = journal.load, backend.load_snapshots
+        loaded, captures = [], []
+
+        def track_load(ref):
+            loaded.append(ref)
+            return load(ref)
+
+        def track_captures(ref):
+            captures.append(ref)
+            return load_captures(ref)
+
+        monkeypatch.setattr(journal, "load", track_load)
+        monkeypatch.setattr(backend, "load_snapshots", track_captures)
+        restored = SearchEngine(backend)
+        assert older not in loaded
+        assert loaded.count(latest) == 1
+        assert captures == [reference]
+        assert restored.space.predict(probe) == expected
+        assert restored.space.branch_membership(probe) == membership
         assert restored.space.atoms == ordered_atoms
         assert restored.state["clauses"] == []
 
@@ -722,6 +776,53 @@ def test_budget_promotion_keeps_baseline_gaps_visible(tmp_path):
     assert result["score"]["coverage"] == "partial"
 
 
+@pytest.mark.parametrize("width", [3, 8, 12])
+def test_shortlist_matches_ordered_full_vector_ranking(tmp_path, finite_grammar, monkeypatch, width):
+    atoms = ("rax >= 2", "rax <= -2", "rax > 0", "rax == 2", "rax == -2", "rax < 0",
+             "rax <= 0", "rax >= 0", "rax / rax", "rax != 0", "1 / (rax + 2)")
+    finite_grammar(*atoms)
+    limits = SearchLimits(beam_width=width, search_policy="baseline")
+    with Journal(tmp_path / "search", {"case": "ranking-equivalence"}) as journal:
+        backend = FiniteExecution(journal, limits)
+        engine = SearchEngine(backend)
+        observed = backend.snapshots(engine.baseline)
+        engine.space.update({"system:3": observed["system:3"] + observed["system:2"], "empty": []})
+        draft = {"kind": "introduce", "beam": [[]], "seen": [["rax > 0"]]}
+        ranks, signatures = {}, {}
+        for atom in atoms:
+            vectors = engine.space.predict(((atom,),))
+            fired = {case for case, trace in vectors.items() if 1 in trace and 2 not in trace}
+            trapped = {case for case, trace in vectors.items() if 2 in trace}
+            covered = fired & engine.population.crashes
+            rank = (len(fired & engine.population.normals), -len(covered), len(trapped),
+                    len(atom.encode("utf-8")) + 5, (atom,))
+            assert engine._rank((atom,), draft) == (rank if covered else None)
+            if covered and [atom] not in draft["seen"]:
+                ranks[atom] = rank
+                signatures[atom] = {(case, branch) for case, trace in vectors.items() for branch in trace}
+
+        expected, represented = [], []
+        for turn in range(min(width, len(ranks))):
+            remaining = [atom for atom in ranks if atom not in expected]
+            choices = [atom for atom in remaining if signatures[atom] not in represented] or remaining
+            if turn % 3 == 0:
+                chosen = min(choices, key=lambda atom: (ranks[atom][1], ranks[atom][0], ranks[atom][2:]))
+            elif turn % 3 == 1:
+                chosen = min(choices, key=ranks.__getitem__)
+            else:
+                chosen = min(choices, key=lambda atom: (
+                    -min(len(signatures[atom] ^ other) for other in represented), ranks[atom]))
+            expected.append(chosen)
+            represented.append(signatures[chosen])
+
+        def unexpected(*args, **kwargs):
+            raise AssertionError("ranking must not reconstruct full vectors")
+
+        monkeypatch.setattr(engine.space, "predict", unexpected)
+        assert engine._queue(draft) == [[atom] for atom in expected]
+        assert engine._queue(draft) == [[atom] for atom in expected]
+
+
 def test_exhausted_population_does_not_cycle_cached_evaluations(tmp_path):
     limits = SearchLimits(operand_depth=1, max_atoms=32, max_factors=2, beam_width=3)
     with Journal(tmp_path / "search", {"case": "exhaustion"}) as journal:
@@ -821,7 +922,7 @@ def test_new_incumbent_trap_evidence_revokes_final_selection(tmp_path):
 
     with Journal(tmp_path / "search", {"case": "new-incumbent-trap"}) as journal:
         engine = SearchEngine(FiniteExecution(journal, SearchLimits(operand_depth=1)))
-        _, evaluated, _ = engine._run((("rax < -1",),))
+        evaluated = engine._run((("rax < -1",),)).result
         unsafe = deepcopy(evaluated)
         unsafe["cases"][1]["report"]["activation"]["status"] = "trapped"
         engine._archive((("rax < -1",),), unsafe,
@@ -869,7 +970,7 @@ def test_resume_rechecks_saved_archive_evaluation_despite_eligible_scalars(tmp_p
     limits = SearchLimits(operand_depth=1)
     with Journal(output, identity) as journal:
         engine = SearchEngine(FiniteExecution(journal, limits))
-        _, evaluated, _ = engine._run((("rax < -1",),))
+        evaluated = engine._run((("rax < -1",),)).result
         unsafe = deepcopy(evaluated)
         unsafe["cases"][1]["report"]["activation"]["status"] = "trapped"
         saved = engine.state["best_result"]
@@ -893,9 +994,11 @@ def test_budget_promotion_cannot_replace_an_existing_owner(tmp_path):
         draft["queue"] = [["rax < -1"]]
         engine._step_draft()
         assert engine._required() == frozenset({"system:0"})
+        engine.space.update({"system:0": []})
+        assert engine._rank(("rax > 1",), {"kind": "introduce"}) is None
         # This is a real repair of system:4, but not an owner-preserving global
         # introduction. Reusing its evidence cannot discharge system:0.
-        score, result, reference = engine._run((("rax > 1",),))
+        reference = engine._run((("rax > 1",),)).reference
         best = {"factors": ["rax > 1"], "evaluation": reference,
                 "owners": ["system:4"], "witnesses": {"system:4": {"hit": 0, "prefix_branch": 0, "branch": 1}}}
         with pytest.raises(ValueError, match="does not establish owners"):
@@ -1099,7 +1202,7 @@ def test_adaptive_learns_only_unique_eligible_evidence_preserving_improvements(
     identity = {"case": "operator-learning", "hide-normal": hide_normal}
     ranks = {(factor,): (index, 0, 0, 0, (factor,)) for index, factor in enumerate(
         ("rax == 2", "rax == -2", "rax != 0", "rax >= 0", atom))}
-    signatures = {factor: frozenset({index}) for index, factor in enumerate(ranks)}
+    signatures = {factor: 1 << index for index, factor in enumerate(ranks)}
     with Journal(directory, identity) as journal:
         backend = LearningExecution(journal, limits)
         engine = SearchEngine(backend)

@@ -614,6 +614,79 @@ def test_resume_authenticates_transitive_state_and_evaluation_references(tmp_pat
     assert snapshot(directory) == old
 
 
+@pytest.mark.parametrize("digest", ["0" * 64, 0])
+def test_resume_rechecks_digest_of_an_already_seen_path(tmp_path, digest):
+    directory = tmp_path / "search"
+    with Journal(directory, IDENTITY) as journal:
+        reference = journal.store({"vector": [0]})
+        journal.append("evaluation", {"result": reference})
+        journal.append("commit", {"result": reference})
+    segment = segments(directory)[0]
+    lines = segment.read_bytes().splitlines(keepends=True)
+    last = json.loads(lines[-1])
+    last["data"]["result"] = {"path": str(directory / reference["path"]), "sha256": digest}
+    lines[-1] = resign(last)
+    replace_bytes(segment, b"".join(lines))
+    with pytest.raises(JournalError, match="invalid or escaping payload reference"):
+        with Journal(directory, IDENTITY, resume=True):
+            pass
+    assert segments(directory) == [segment]
+
+
+@pytest.mark.parametrize("damage", ["replace", "rewrite"])
+def test_resume_rejects_changes_after_dependency_sync(tmp_path, monkeypatch, damage):
+    directory = tmp_path / "search"
+    with Journal(directory, IDENTITY) as journal:
+        capture = journal.store_bytes(b"vector", suffix=".brch")
+        result = journal.store({"capture": capture})
+        journal.append("evaluation", {"result": result})
+        journal.append("commit", {"result": result})
+    path = directory / capture["path"]
+    before = path.stat()
+    payload_directory = path.parent.stat().st_ino
+    real_sync, real_stat, real_fstat = module.os.fsync, module.os.stat, module.os.fstat
+
+    def sync(fd):
+        real_sync(fd)
+        if real_fstat(fd).st_ino == payload_directory:
+            if damage == "replace":
+                raw = path.read_bytes()
+                path.rename(tmp_path / "displaced-capture")
+                path.write_bytes(raw)
+                path.chmod(0o400)
+            else:
+                replace_bytes(path, b"tamper")
+                os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+    def unchanged_generation(info):
+        if (info.st_dev, info.st_ino) == (before.st_dev, before.st_ino):
+            return before
+        return info
+
+    monkeypatch.setattr(module.os, "fsync", sync)
+    if damage == "rewrite":
+        # Overlayfs can report identical ctime_ns after the rewrite; force
+        # that condition so a metadata-only guard fails on other filesystems too.
+        monkeypatch.setattr(module.os, "stat", lambda *a, **kw: unchanged_generation(real_stat(*a, **kw)))
+        monkeypatch.setattr(module.os, "fstat", lambda fd: unchanged_generation(real_fstat(fd)))
+    with pytest.raises(JournalError, match="replaced or modified"):
+        with Journal(directory, IDENTITY, resume=True):
+            pass
+    assert len(segments(directory)) == 1
+
+
+def test_load_after_resume_reauthenticates_transitive_evidence(tmp_path):
+    directory = tmp_path / "search"
+    with Journal(directory, IDENTITY) as journal:
+        capture = journal.store_bytes(b"vector", suffix=".brch")
+        result = journal.store({"capture": capture})
+        journal.append("evaluation", {"result": result})
+    with Journal(directory, IDENTITY, resume=True) as journal:
+        replace_bytes(directory / capture["path"], b"tamper")
+        with pytest.raises(JournalError, match="checksum"):
+            journal.load(result)
+
+
 def test_load_and_append_reject_dangling_nested_evidence(tmp_path):
     directory = tmp_path / "search"
     with Journal(directory, IDENTITY) as journal:
@@ -692,31 +765,51 @@ def test_payload_and_commit_fsync_order_is_observable(tmp_path, monkeypatch):
                               "payload-directory-sync", "event-write", "event-sync"]
 
 
-def test_resume_syncs_recovered_dependencies_before_writing_new_segment(tmp_path, monkeypatch):
+def test_resume_syncs_each_recovered_dependency_once_before_writing_new_segment(tmp_path, monkeypatch):
     directory = tmp_path / "search"
     with Journal(directory, IDENTITY) as journal:
-        reference = journal.store({"vector": [1]})
-        journal.append("commit", {"evaluation": reference})
+        capture = journal.store_bytes(b"vector", suffix=".brch")
+        payload = {"capture": capture}
+        reference = journal.store(payload)
+        alternate = journal.store_bytes(canonical(payload), suffix=".bin")
+        assert reference["sha256"] == alternate["sha256"]
+        journal.append("commit", {"evaluation": reference, "binary": alternate})
+    with Journal(directory, IDENTITY, resume=True) as journal:
+        journal.append("reuse", {"evaluation": reference, "capture": capture})
+
+    dependency_paths = [directory / ref["path"] for ref in (capture, reference, alternate)]
     paths = [directory, directory / "segments", directory / "payloads",
-             directory / "identity.json", segments(directory)[0], directory / reference["path"]]
-    required = {(path.stat().st_dev, path.stat().st_ino) for path in paths}
-    synced = set()
-    real_sync, real_write = module.os.fsync, module._write_all
+             directory / "identity.json", *segments(directory), *dependency_paths]
+
+    def inode(info):
+        return info.st_dev, info.st_ino
+
+    required = {inode(path.stat()) for path in paths}
+    dependency_names = {path.name for path in dependency_paths}
+    synced, opened = [], []
+    real_sync, real_open, real_write = module.os.fsync, module.os.open, module._write_all
 
     def sync(fd):
-        info = os.fstat(fd)
-        synced.add((info.st_dev, info.st_ino))
+        synced.append(inode(os.fstat(fd)))
         real_sync(fd)
 
+    def open_file(name, flags, *args, **kwargs):
+        if name in dependency_names:
+            opened.append(name)
+        return real_open(name, flags, *args, **kwargs)
+
     def write(fd, data):
-        assert required <= synced
+        assert required <= set(synced)
+        assert all(synced.count(inode(path.stat())) == 1 for path in dependency_paths)
+        assert all(opened.count(name) == 2 for name in dependency_names)
         real_write(fd, data)
 
     with monkeypatch.context() as patch:
         patch.setattr(module.os, "fsync", sync)
+        patch.setattr(module.os, "open", open_file)
         patch.setattr(module, "_write_all", write)
         with Journal(directory, IDENTITY, resume=True) as journal:
-            assert len(journal.events) == 1
+            assert len(journal.events) == 2
 
 
 def test_replacing_named_lock_cannot_admit_a_concurrent_writer(tmp_path):

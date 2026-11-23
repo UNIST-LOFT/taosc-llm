@@ -13,6 +13,23 @@ from ..collection_metrics import selection_case_sets
 @dataclass(frozen=True)
 class Population:
     cases: dict[str, dict]
+    crashes: frozenset[str] = field(init=False, repr=False, compare=False)
+    normals: frozenset[str] = field(init=False, repr=False, compare=False)
+    active: frozenset[str] = field(init=False, repr=False, compare=False)
+    gaps: frozenset[str] = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        groups = {"target_crash": set(), "normal": set(), "unknown": set()}
+        for case, record in self.cases.items():
+            group = groups.get(record["label"])
+            if group is not None:
+                group.add(case)
+        crashes = frozenset(groups["target_crash"])
+        normals = frozenset(groups["normal"])
+        object.__setattr__(self, "crashes", crashes)
+        object.__setattr__(self, "normals", normals)
+        object.__setattr__(self, "active", crashes | normals)
+        object.__setattr__(self, "gaps", frozenset(groups["unknown"]))
 
     @classmethod
     def from_evaluation(cls, evaluation: dict) -> "Population":
@@ -46,22 +63,6 @@ class Population:
             cases[identifier] = {"domain": item["domain"], "label": label, "reason": reason}
         return cls(cases)
 
-    @property
-    def crashes(self) -> frozenset[str]:
-        return frozenset(k for k, v in self.cases.items() if v["label"] == "target_crash")
-
-    @property
-    def normals(self) -> frozenset[str]:
-        return frozenset(k for k, v in self.cases.items() if v["label"] == "normal")
-
-    @property
-    def active(self) -> frozenset[str]:
-        return self.crashes | self.normals
-
-    @property
-    def gaps(self) -> frozenset[str]:
-        return frozenset(k for k, v in self.cases.items() if v["label"] == "unknown")
-
     def to_dict(self) -> dict:
         return {key: self.cases[key] for key in sorted(self.cases)}
 
@@ -80,7 +81,7 @@ class Score:
         objective = selection_case_sets(evaluation)
         covered, known = set(), set()
         normals = population.normals
-        active = population.crashes | normals
+        active = population.active
         ignored = {key: "candidate-not-evaluated" for key in active}
         seen = set()
         for item in evaluation["cases"]:

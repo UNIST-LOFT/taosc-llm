@@ -8,13 +8,30 @@ from __future__ import annotations
 
 import copy
 import re
+from hashlib import sha256
+from typing import NamedTuple
 
 from ..collection_metrics import candidate_admission, compare_selection, selection_objective
 from ..dataset import canonical
 from ..family import parse_candidate
 from .model import SearchStopped
 from .score import Population, Score, improves, new_owners, preserves
-from .space import Space, compose
+from .space import Clause, Space, compose
+
+
+class _Ranking(NamedTuple):
+    before: tuple[Clause, ...]
+    after: tuple[Clause, ...]
+    targets: int
+    required: int
+    normals: int
+
+
+class _Evaluation(NamedTuple):
+    score: Score
+    result: dict
+    reference: dict
+    snapshots: dict | None
 
 
 def _clauses(records):
@@ -46,33 +63,23 @@ class SearchEngine:
                       "operator_evaluations": [], "operator_stats": {},
                       "work_counts": {"introduce": 0, "refine": 0,
                                       "lookahead_predictions": 0}}
-        for event in self.journal.events:
+        # The journal authenticates history; only the last complete state is
+        # needed to restore the frontier.
+        for event in reversed(self.journal.events):
             if event["kind"] in ("checkpoint", "commit"):
                 self.state = self.journal.load(event["data"]["state"])
-        self.current = backend.load(self.state["evaluation"])
+                break
+        self.current = (self.baseline if self.state["evaluation"] == backend.baseline_ref
+                        else backend.load(self.state["evaluation"]))
         self.score = Score.from_evaluation(self.population, self.current)
-        snapshots = backend.snapshots(self.baseline)
-        references = self.state["prediction_evidence"]
-        if references:
-            loaded = {}
-            for case, reference in references.items():
-                backend.check_operation()
-                key = canonical(reference)
-                if key not in loaded:
-                    loaded[key] = backend.snapshots(backend.load(reference))
-                if case not in loaded[key]:
-                    raise ValueError("checkpoint prediction capture missing")
-                snapshots[case] = loaded[key][case]
-        else:
-            references.update({case: backend.baseline_ref for case in snapshots})
-        self.space = Space(self.family, snapshots, self.limits, check=backend.check_operation,
+        self.space = Space(self.family, self._restore_predictions(), self.limits, check=backend.check_operation,
                            crashes=self.population.crashes, normals=self.population.normals)
         if self.state["atoms"]:
             if set(self.state["atoms"]) != set(self.space.atoms):
                 raise ValueError("checkpoint atom corpus mismatch")
             self.space.atoms = tuple(self.state["atoms"])
         self._scores = {canonical(self.state["evaluation"]): self.score}
-        self._validate_branch(self._branch(), self.current, self.score)
+        self._validate_branch(self.state, self.current, self.score)
         if len(self.state["pending"]) >= self.limits.beam_width:
             raise ValueError("checkpoint exceeds branch beam")
         for branch in self.state["pending"]:
@@ -86,6 +93,25 @@ class SearchEngine:
         if self.state["best_result"] is not None:
             self._authenticate_best()
         self._validate_learning()
+
+    def _restore_predictions(self):
+        snapshots = self.backend.snapshots(self.baseline)
+        references = self.state["prediction_evidence"]
+        if not references:
+            references.update({case: self.backend.baseline_ref for case in snapshots})
+            return snapshots
+        # Keep the baseline fallback and read each distinct durable evaluation
+        # only once for this capture reconstruction, never across operations.
+        loaded = {canonical(self.backend.baseline_ref): dict(snapshots)}
+        for case, reference in references.items():
+            self.backend.check_operation()
+            key = canonical(reference)
+            if key not in loaded:
+                loaded[key] = self.backend.load_snapshots(reference)
+            if case not in loaded[key]:
+                raise ValueError("checkpoint prediction capture missing")
+            snapshots[case] = loaded[key][case]
+        return snapshots
 
     @staticmethod
     def _operator_families(program):
@@ -178,14 +204,18 @@ class SearchEngine:
         if saved["clauses"]:
             if _clauses(saved["clauses"]) != program:
                 raise ValueError("checkpoint archive proof program mismatch")
-            self._validate_incumbent(saved["clauses"], evaluated, score)
+            self._validate_incumbent(saved["clauses"], evaluated, score, saved["evaluation"])
 
-    def _validate_incumbent(self, clauses, current, score):
+    def _validate_incumbent(self, clauses, current, score, reference):
         """A durable checkpoint is not itself proof of ownership or execution."""
+        def load(evidence):
+            return current if evidence == reference else self.backend.load(evidence)
+
         self.space.expression(_clauses(clauses))
         required = set()
         ids = set()
         for clause in clauses:
+            self.backend.check_operation()
             owners = frozenset(clause["owners"])
             if (not owners or not owners <= self.population.crashes or owners & required
                     or clause["id"] in ids):
@@ -195,8 +225,8 @@ class SearchEngine:
             prefix = tuple(tuple(row) for row in clause["prefix"])
             if len(prefix) != len(ids) - 1:
                 raise ValueError("checkpoint introduction prefix length mismatch")
-            before = self.backend.load(clause["prefix_evaluation"])
-            introduced = self.backend.load(clause["introduction"])
+            before = load(clause["prefix_evaluation"])
+            introduced = load(clause["introduction"])
             def matches(result, program):
                 self.space.expression(program)
                 expected = (parse_candidate(self.family, compose(self.family, program)).descriptor
@@ -216,8 +246,9 @@ class SearchEngine:
                 raise ValueError("checkpoint introduction witness mismatch")
             refinement = clause.get("refinement")
             if refinement is not None:
-                local = self.backend.load(refinement["local_evaluation"])
-                global_result = self.backend.load(refinement["evaluation"])
+                local = load(refinement["local_evaluation"])
+                global_result = (local if refinement["evaluation"] == refinement["local_evaluation"]
+                                 else load(refinement["evaluation"]))
                 refined_program = tuple(tuple(row) for row in refinement["program"])
                 matches(global_result, refined_program)
                 global_score = Score.from_evaluation(self.population, global_result)
@@ -261,15 +292,15 @@ class SearchEngine:
             parse_candidate(self.family, expression)
         except ValueError:
             return None
-        result = self.backend.evaluate(expression)
+        result, reference = self.backend.evaluate(expression)
         score = Score.from_evaluation(self.population, result)
-        reference = self.journal.store(result)
         self._scores[canonical(reference)] = score
         self._learn(clauses, result, score, reference)
         self._archive(clauses, result, score, reference)
         # At most one entry per admitted descriptor (bounded by the evaluation
         # budget). Reusing an old outcome must not roll prediction state back to
         # that descriptor's earlier capture or restart an exhausted frontier.
+        snapshots = None
         if result["descriptor"] not in self.state["processed_evaluations"]:
             snapshots = self.backend.snapshots(result)
             revision = self.space.revision
@@ -281,9 +312,9 @@ class SearchEngine:
                                   branch_prediction_revision=self.state["prediction_revision"])
             self.state["prediction_evidence"].update({case: reference for case in snapshots})
             self.state["processed_evaluations"].append(result["descriptor"])
-        return score, result, reference
+        return _Evaluation(score, result, reference, snapshots)
 
-    def _witnesses(self, prefix, factors, result, owners):
+    def _witnesses(self, prefix, factors, result, owners, *, captures=None):
         """A repair hit must exclude the frozen prefix's remaining safe path.
 
         For CWE this compares whole same-clamp trees, never per-clause reduced
@@ -294,7 +325,8 @@ class SearchEngine:
         prefix_source = compose(self.family, prefix)
         prefix_parsed = parse_candidate(self.family, prefix_source).parsed if prefix_source is not None else None
         full = parse_candidate(self.family, compose(self.family, prefix + (tuple(factors),))).parsed
-        captures = self.backend.snapshots(result)
+        if captures is None:
+            captures = self.backend.snapshots(result)
         witnesses, evaluated = {}, {}
         for key in owners:
             self.backend.check_operation()
@@ -316,78 +348,68 @@ class SearchEngine:
             witnesses[key] = {"hit": index, "prefix_branch": 0, "branch": 1}
         return witnesses
 
-    def _predict(self, clauses, *, membership=False):
-        try:
-            vectors = self.space.predict(clauses)
-        except ValueError:
-            return None
-        fired = {key for key, vector in vectors.items() if 1 in vector and 2 not in vector}
-        trapped = {key for key, vector in vectors.items() if 2 in vector}
-        if membership:
-            # Preserve mixed-hit fire/trap distinctions as well as case IDs.
-            signature = frozenset((key, branch) for key, vector in vectors.items() for branch in set(vector))
-            return fired, trapped, signature
-        return fired, trapped
+    def _ranking(self, draft):
+        clauses = _clauses(self.state["clauses"])
+        required = self.space.case_mask(self._required())
+        normals = self.space.case_mask(self.population.normals)
+        if draft["kind"] == "introduce":
+            targets = self.space.case_mask(self.population.crashes - self.score.covered)
+            return _Ranking(clauses, (), targets, required, normals)
+        index = draft["index"]
+        return _Ranking(clauses[:index], clauses[index + 1:], required, required, normals)
 
     def _rank(self, factors, draft):
-        proposal = self._proposal(factors, draft)
+        proposal = self._proposal(tuple(factors), self._ranking(draft))
         return proposal[0] if proposal is not None else None
 
-    def _proposal(self, factors, draft):
-        clauses = list(_clauses(self.state["clauses"]))
-        if draft["kind"] == "introduce":
-            clauses.append(tuple(factors))
-            targets = self.population.crashes - self.score.covered
-        else:
-            clauses[draft["index"]] = tuple(factors)
-            targets = self._required()
-        prediction = self._predict(tuple(clauses), membership=True)
-        if prediction is None:
+    def _proposal(self, factors, ranking):
+        try:
+            fired, trapped, signature = self.space.branch_membership(ranking.before + (factors,) + ranking.after)
+        except ValueError:
             return None
-        fired, trapped, signature = prediction
         # Introduction searches the unresolved population together. An anchor
         # with unavailable outcomes must not veto another case's actual repair.
-        # Refinement still retains its immutable owners below.
-        if not fired & targets:
+        # Firing excludes any case with a trap, including mixed fire/trap traces.
+        covered = fired & ranking.targets
+        if not covered or ranking.required & ~fired:
             return None
-        if not self._required() <= fired or trapped & self._required():
-            return None
-        false_positives = len(fired & self.population.normals)
-        covered = len(fired & targets)
-        rank = (false_positives, -covered, len(trapped), _cost((tuple(factors),)), tuple(factors))
+        rank = ((fired & ranking.normals).bit_count(), -covered.bit_count(), trapped.bit_count(),
+                _cost((factors,)), factors)
         return rank, signature
 
     def _queue(self, draft):
         """Keep coverage, regression and case-membership roles, not outcomes."""
         pool, signatures = {}, {}
         seen = {tuple(row) for row in draft["seen"]}
-        for parent in draft["beam"]:
+        ranking = self._ranking(draft)
+        for row in draft["beam"]:
+            parent = tuple(row)
             for atom in self.space.atoms:
                 self.backend.check()
                 if atom in parent:
                     continue
-                factors = tuple(parent) + (atom,)
+                factors = parent + (atom,)
                 if len(factors) > self.limits.max_factors or factors in seen:
                     continue
-                proposal = self._proposal(factors, draft)
+                proposal = self._proposal(factors, ranking)
                 if proposal is not None:
                     pool[factors], signatures[factors] = proposal
             if draft["kind"] == "refine":
                 for index in range(len(parent)):
-                    factors = tuple(parent[:index] + parent[index + 1:])
+                    factors = parent[:index] + parent[index + 1:]
                     if factors in seen or not factors and self.family == "ERM CWE-805":
                         continue
-                    proposal = self._proposal(factors, draft)
+                    proposal = self._proposal(factors, ranking)
                     if proposal is not None:
                         pool[factors], signatures[factors] = proposal
         if self.limits.search_policy in ("composed", "adaptive"):
-            self._lookahead(pool, signatures, seen, draft)
+            self._lookahead(pool, signatures, seen, ranking)
         selected = self._shortlist(pool, signatures, self.limits.beam_width)
         return [list(row) for row in selected]
 
     def _shortlist(self, ranks, signatures, width):
         pool = list(ranks)
-        selected = self._diverse(pool, ranks, signatures, width)
+        selected = self._diverse(pool, ranks, signatures, width, xor_size=int.bit_count)
         if self.limits.search_policy == "adaptive" and pool and width:
             # One exploitation slot in four; all other slots retain the original
             # coverage/regression/membership exploration roles. A width-one
@@ -399,7 +421,7 @@ class SearchEngine:
                 selected[slot] = min(choices, key=lambda row: (-self._operator_priority(row), ranks[row]))
         return selected
 
-    def _lookahead(self, pool, signatures, seen, draft):
+    def _lookahead(self, pool, signatures, seen, ranking):
         """Predict at most four beam-squared ordered extensions, never atoms^3.
 
         Whole programs go through Space, including same-hit conjunctions and
@@ -425,7 +447,7 @@ class SearchEngine:
                         if factors in seen or factors in pool or factors in extensions:
                             continue
                         predictions += 1
-                        proposal = self._proposal(factors, draft)
+                        proposal = self._proposal(factors, ranking)
                         if proposal is not None:
                             extensions[factors], memberships[factors] = proposal
             seeds = self._shortlist(extensions, memberships, width)
@@ -492,16 +514,35 @@ class SearchEngine:
                     "cover_draft", "early_draft", "early_index", "cover_opportunities")
 
     def _branch(self):
-        return copy.deepcopy({key: self.state[key] for key in self._BRANCH_KEYS})
+        # Rotation transfers the schedule. Clause proof records are read-only;
+        # introducing or refining a clause replaces the outer list.
+        return {key: self.state[key] for key in self._BRANCH_KEYS}
 
-    def _branch_key(self, branch):
+    def _fork_branch(self):
+        branch = self._branch()
+        for key in ("draft", "cover_draft", "early_draft"):
+            draft = branch[key]
+            if draft is not None:
+                # Queue/beam/best values are replaced, but seen grows in place.
+                branch[key] = {**draft, "seen": list(draft["seen"])}
+        return branch
+
+    @staticmethod
+    def _branch_identity(branch):
         # Different owner partitions are different decompositions, even when
         # they happen to repair equally many cases. IDs are allocation details.
         return canonical([(row["factors"], row["owners"], row["prefix"], row["introduced_factors"])
-                          for row in branch["clauses"]]).decode("utf-8")
+                          for row in branch["clauses"]])
+
+    def _branch_key(self, branch):
+        return sha256(self._branch_identity(branch)).hexdigest()
+
+    def _work_key(self, branch, draft):
+        return sha256(canonical([self._branch_key(branch), draft["kind"], draft["index"],
+                                 draft["queue"][draft["offset"]]])).hexdigest()
 
     def _validate_branch(self, branch, evaluated, score):
-        self._validate_incumbent(branch["clauses"], evaluated, score)
+        self._validate_incumbent(branch["clauses"], evaluated, score, branch["evaluation"])
         revision = self.state["prediction_revision"]
         if (branch["phase"] not in ("cover", "refine")
                 or not 0 <= branch["branch_prediction_revision"] <= revision
@@ -533,9 +574,7 @@ class SearchEngine:
         if draft["attempt"] is not None:
             if draft["offset"] >= len(draft["queue"]):
                 raise ValueError("invalid checkpoint counted proposal")
-            work = canonical([self._branch_key(branch), draft["kind"], draft["index"],
-                              draft["queue"][draft["offset"]]]).decode("utf-8")
-            if draft["attempt"] != work:
+            if draft["attempt"] != self._work_key(branch, draft):
                 raise ValueError("checkpoint counted proposal mismatch")
         if draft["kind"] == "refine":
             if not isinstance(draft["index"], int) or not 0 <= draft["index"] < len(branch["clauses"]):
@@ -592,23 +631,25 @@ class SearchEngine:
         return self._scores[key]
 
     @staticmethod
-    def _diverse(pool, ranks, signatures, width, *, initial=()):
+    def _diverse(pool, ranks, signatures, width, *, initial=(), xor_size=len):
         """Coverage, regression and farthest-membership turns; stable ties."""
         coverage = sorted(pool, key=lambda key: (ranks[key][1], ranks[key][0], *ranks[key][2:]))
         regression = sorted(pool, key=ranks.__getitem__)
-        selected, represented = [], list(initial)
+        selected, taken, represented = [], set(), set(initial)
         for turn in range(min(width, len(pool))):
-            remaining = [key for key in pool if key not in selected]
+            remaining = [key for key in pool if key not in taken]
             novel = [key for key in remaining if signatures[key] not in represented]
             choices = novel or remaining
             if turn % 3 == 2:
                 chosen = min(choices, key=lambda key: (
-                    -min((len(signatures[key] ^ other) for other in represented), default=0), ranks[key]))
+                    -min((xor_size(signatures[key] ^ other) for other in represented), default=0), ranks[key]))
             else:
                 order = coverage if turn % 3 == 0 else regression
-                chosen = next(key for key in order if key in choices)
+                allowed = set(choices)
+                chosen = next(key for key in order if key in allowed)
             selected.append(chosen)
-            represented.append(signatures[chosen])
+            taken.add(chosen)
+            represented.add(signatures[chosen])
         return selected
 
     def _retain(self, branch, *, continuation=False):
@@ -636,7 +677,7 @@ class SearchEngine:
             for index, row in enumerate(pool):
                 score = self._branch_score(row)
                 ranks[index] = (len(score.regressions), -len(score.covered),
-                                _cost(_clauses(row["clauses"])), self._branch_key(row))
+                                _cost(_clauses(row["clauses"])), self._branch_identity(row))
                 signatures[index] = (frozenset(("repair", case) for case in score.covered)
                                      | frozenset(("regression", case) for case in score.regressions)
                                      | frozenset(("failure", case) for case in score.target_failures)
@@ -685,12 +726,15 @@ class SearchEngine:
         witnesses = self._witnesses(prefix, best["factors"], current, owners)
         if witnesses is None or witnesses != best["witnesses"]:
             raise ValueError("draft introduction does not establish owners")
+        self._commit_introduction(best, current, score)
+
+    def _commit_introduction(self, best, current, score):
         self.backend.check_operation()
         if self.state["draft"] is not None:
-            continuation = self._branch()
+            continuation = self._fork_branch()
             continuation["draft"]["best"] = None
             self._retain(continuation, continuation=True)
-        self.state["clauses"].append(self._introduction_record(best))
+        self.state["clauses"] = self.state["clauses"] + [self._introduction_record(best)]
         self.state["evaluation"] = best["evaluation"]
         self.current = current
         self.score = score
@@ -702,21 +746,22 @@ class SearchEngine:
         self._save(commit="introduce")
 
     def _refined_records(self, draft, factors, reference, local_reference, witnesses):
-        records = copy.deepcopy(self.state["clauses"])
-        records[draft["index"]]["factors"] = list(factors)
-        records[draft["index"]]["refinement"] = {
+        records = list(self.state["clauses"])
+        index = draft["index"]
+        record = records[index] = {**records[index], "factors": list(factors)}
+        record["refinement"] = {
             "evaluation": reference, "local_evaluation": local_reference, "witnesses": witnesses,
             "program": [list(row) for row in _clauses(records)], "required": sorted(self._required())}
         return records
 
-    def _accept_refinement(self, draft, factors, result, reference, local_reference, witnesses):
+    def _accept_refinement(self, draft, records, tested):
         self.backend.check_operation()
-        self._retain(self._branch(), continuation=True)
-        self.state["clauses"] = self._refined_records(draft, factors, reference, local_reference, witnesses)
-        self.state["evaluation"] = reference
-        self.current = result
-        self.score = Score.from_evaluation(self.population, result)
-        self._remember_proofs(self.state["clauses"], reference)
+        self._retain(self._fork_branch(), continuation=True)
+        self.state["clauses"] = records
+        self.state["evaluation"] = tested.reference
+        self.current = tested.result
+        self.score = tested.score
+        self._remember_proofs(records, tested.reference)
         if self.state["cover_draft"] is not None:
             # Its queue/offset are still useful, but an introduction proof is
             # relative to the old frozen prefix and cannot survive this commit.
@@ -725,6 +770,39 @@ class SearchEngine:
                           refine_progress=True, revision=self.state["revision"] + 1)
         self.state["visited_branches"][self._branch_key(self.state)] = self.state["prediction_revision"]
         self._save(commit="refine")
+
+    def _try_refinement(self, draft, program, factors, work):
+        index = draft["index"]
+        clause = self.state["clauses"][index]
+        prefix = tuple(tuple(row) for row in clause["prefix"])
+        replacement = (tuple(factors),)
+        local_program = prefix + replacement
+        local = self._run(local_program)
+        owners = frozenset(clause["owners"])
+        if local is None or not owners <= local.score.covered:
+            return False
+        witnesses = self._witnesses(prefix, factors, local.result, clause["owners"], captures=local.snapshots)
+        if witnesses is None:
+            return False
+        self.backend.check_operation()
+        modified = program[:index] + replacement + program[index + 1:]
+        tested = local if modified == local_program else self._run(modified)
+        if tested is None or not preserves(owners, local.score, self._required(), tested.score):
+            return False
+        records = self._refined_records(draft, factors, tested.reference, local.reference, witnesses)
+        self._remember_proofs(records, tested.reference)
+        if not improves(self.score, tested.score, old_cost=_cost(program), new_cost=_cost(modified)):
+            return False
+        self._consume_proposal(draft, work)
+        self._accept_refinement(draft, records, tested)
+        return True
+
+    def _consume_proposal(self, draft, work=None):
+        if work is not None:
+            self.state["visited_work"][work] = self.state["prediction_revision"]
+        draft["seen"].append(list(draft["queue"][draft["offset"]]))
+        draft["offset"] += 1
+        draft["attempt"] = None
 
     def _step_draft(self):
         draft = self.state["draft"]
@@ -736,15 +814,13 @@ class SearchEngine:
             draft["depth"] += 1
             if not draft["queue"]:
                 return self._end_draft()
-            draft["beam"] = copy.deepcopy(draft["queue"])
+            draft["beam"] = draft["queue"]
             self._save()
         factors = draft["queue"][draft["offset"]]
         program = _clauses(self.state["clauses"])
-        work = canonical([self._branch_key(self.state), draft["kind"], draft["index"], factors]).decode("utf-8")
+        work = self._work_key(self.state, draft)
         if self.state["visited_work"].get(work, -1) >= self.state["prediction_revision"]:
-            draft["seen"].append(list(factors))
-            draft["offset"] += 1
-            draft["attempt"] = None
+            self._consume_proposal(draft)
             self._save()
             return
         if draft["attempt"] != work:
@@ -756,10 +832,10 @@ class SearchEngine:
         if draft["kind"] == "introduce":
             tested = self._run(program + (tuple(factors),))
             if tested is not None:
-                score, result, reference = tested
+                score, result, reference, snapshots = tested
                 owners = new_owners(self.score, score)
                 if owners and self._required() <= score.covered:
-                    witnesses = self._witnesses(program, factors, result, owners)
+                    witnesses = self._witnesses(program, factors, result, owners, captures=snapshots)
                     if witnesses is not None:
                         rank = (len(score.regressions), -len(owners), _cost((tuple(factors),)), tuple(factors))
                         old = draft["best"]
@@ -773,15 +849,12 @@ class SearchEngine:
                             draft["best"] = candidate
                         # Consume this operation before forking. Its continuation
                         # must never accept the same cached candidate again.
-                        draft["seen"].append(list(factors))
-                        draft["offset"] += 1
-                        draft["attempt"] = None
-                        self.state["visited_work"][work] = self.state["prediction_revision"]
+                        self._consume_proposal(draft, work)
                         if score.regressions <= self.score.regressions:
-                            self._accept_introduction(candidate)
+                            self._commit_introduction(candidate, result, score)
                         else:
                             child = self._branch()
-                            child.update(clauses=copy.deepcopy(records), evaluation=reference,
+                            child.update(clauses=records, evaluation=reference,
                                          draft=None, phase="cover", blocked=[], refine_index=0,
                                          refine_progress=False, exhausted_revision=None,
                                          early_draft=None, early_index=0, cover_draft=None,
@@ -789,31 +862,9 @@ class SearchEngine:
                             self._retain(child)
                             self._save()
                         return
-        else:
-            clause = self.state["clauses"][draft["index"]]
-            prefix = tuple(tuple(row) for row in clause["prefix"])
-            local = self._run(prefix + (tuple(factors),))
-            if local is not None and frozenset(clause["owners"]) <= local[0].covered:
-                witnesses = self._witnesses(prefix, factors, local[1], clause["owners"])
-                modified = list(program)
-                modified[draft["index"]] = tuple(factors)
-                tested = self._run(tuple(modified)) if witnesses is not None else None
-                if tested is not None:
-                    score, result, reference = tested
-                    if preserves(frozenset(clause["owners"]), local[0], self._required(), score):
-                        records = self._refined_records(draft, factors, reference, local[2], witnesses)
-                        self._remember_proofs(records, reference)
-                        if improves(self.score, score, old_cost=_cost(program), new_cost=_cost(modified)):
-                            draft["seen"].append(list(factors))
-                            draft["offset"] += 1
-                            draft["attempt"] = None
-                            self.state["visited_work"][work] = self.state["prediction_revision"]
-                            self._accept_refinement(draft, factors, result, reference, local[2], witnesses)
-                            return
-        self.state["visited_work"][work] = self.state["prediction_revision"]
-        draft["seen"].append(list(factors))
-        draft["offset"] += 1
-        draft["attempt"] = None
+        elif self._try_refinement(draft, program, factors, work):
+            return
+        self._consume_proposal(draft, work)
         self._save()
 
     def _end_draft(self):

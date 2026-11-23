@@ -77,6 +77,21 @@ def test_ignored_normal_cannot_manufacture_regression_improvement():
     assert improves(before, Score(known_normals=normal), old_cost=10, new_cost=10)
 
 
+@pytest.mark.parametrize("baseline", ["normal", "target_crash"])
+def test_other_crash_to_normal_alone_does_not_change_equal_cost_refinement(baseline):
+    stable = row("system:1", "normal", "normal", "not_fired")
+    repaired = row("system:0", baseline)
+    population = Population.from_evaluation({"cases": [repaired, stable]})
+    before = Score.from_evaluation(population, {"cases": [row("system:0", baseline, "other_crash"), stable]})
+    after = Score.from_evaluation(population, {"cases": [repaired, stable]})
+
+    assert before.ignored == {"system:0": "other-crash"}
+    assert not after.ignored
+    assert (before.known_normals & after.known_normals) == {"system:1"}
+    assert not improves(before, after, old_cost=10, new_cost=10)
+    assert not improves(after, before, old_cost=10, new_cost=10)
+
+
 def test_unknown_original_and_changed_reachability_cannot_improve_population():
     unknown = row("system:0")
     unknown["report"]["original_baseline"]["outcome"] = "unknown"

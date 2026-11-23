@@ -221,7 +221,7 @@ def test_equal_bytes_preserve_distinct_valid_representative_descriptors(prepared
             assert evaluation._vector(second["descriptor"], states, dataset=view) == [0]
 
 
-@pytest.mark.parametrize("operation", ["load", "snapshots"])
+@pytest.mark.parametrize("operation", ["load", "load_snapshots", "snapshots"])
 def test_next_operation_reauthenticates_owned_capture(prepared, tmp_path, operation):
     result = offline_result(prepared, tmp_path / "cache")
     with Journal(tmp_path / "search", {"case": "corruption"}) as journal:
@@ -229,19 +229,27 @@ def test_next_operation_reauthenticates_owned_capture(prepared, tmp_path, operat
         with prepared.validation() as view:
             preserved = backend._preserve(result, view)
         reference = journal.store(preserved)
-        assert backend.load(reference)["cases"][0]["capture"]["branches"] == [0]
-        assert backend.snapshots(preserved)["function:2"][0].branch == 0
+        load = getattr(backend, operation)
+        argument = preserved if operation == "snapshots" else reference
+        restored = load(argument)
+        if operation == "load":
+            assert restored["cases"][0]["capture"]["branches"] == [0]
+        else:
+            assert restored["function:2"][0].branch == 0
         path = Path(preserved["cases"][0]["capture"]["path"])
         raw = path.read_bytes()
         path.chmod(0o600)
         path.write_bytes(raw[:-1] + bytes([raw[-1] ^ 1]))
+        path.chmod(0o400)
         with pytest.raises(ValueError):
-            backend.load(reference) if operation == "load" else backend.snapshots(preserved)
+            load(argument)
 
 
 @pytest.mark.parametrize("mirror", ["representative", "candidate", "observed", "missing", "offline", "length", "divergence"])
-@pytest.mark.parametrize("operation", ["load", "snapshots"])
+@pytest.mark.parametrize("operation", ["load", "load_snapshots", "snapshots"])
 def test_all_journal_vector_mirrors_are_checked(prepared, tmp_path, mirror, operation):
+    from taosc_llm.no_llm.score import Population
+
     result = offline_result(prepared, tmp_path / "cache")
     item = result["cases"][0]
     changed_descriptor = parse_candidate(prepared.patch_format, "1").descriptor
@@ -261,9 +269,10 @@ def test_all_journal_vector_mirrors_are_checked(prepared, tmp_path, mirror, oper
         item["offline_branches"] = [1]
     with Journal(tmp_path / "search", {"case": "mirrors"}) as journal:
         backend = Backend(prepared, journal, SearchLimits())
+        backend.population = Population({})
         reference = journal.store(result)
         with pytest.raises(ValueError):
-            backend.load(reference) if operation == "load" else backend.snapshots(result)
+            getattr(backend, operation)(result if operation == "snapshots" else reference)
 
 
 @pytest.mark.parametrize("operation", ["baseline", "evaluate"])
@@ -273,7 +282,12 @@ def test_last_reserved_evaluation_can_finish_preservation(prepared, tmp_path, mo
     limits = SearchLimits(max_evaluations=1)
     with Journal(tmp_path / "search", {"case": "last-reservation"}) as journal:
         backend = Backend(prepared, journal, limits)
-        saved = backend.baseline() if operation == "baseline" else backend.evaluate("0")
+        if operation == "baseline":
+            saved = backend.baseline()
+        else:
+            saved, reference = backend.evaluate("0")
+            assert next(event["data"]["result"] for event in journal.events
+                        if event["kind"] == "evaluation") == reference
         assert saved["cases"][0]["capture"]["complete"] is True
         assert backend.evaluations == 1
         with pytest.raises(SearchStopped, match="evaluation-budget"):
@@ -304,7 +318,7 @@ def test_closed_session_restores_evidence_after_finalization_exceeds_search_time
             resumed.load(reference)
         with resumed.restoration():
             assert resumed.baseline() == preserved
-            assert resumed.snapshots(preserved)["function:2"][0].branch == 0
+            assert resumed.load_snapshots(reference)["function:2"][0].branch == 0
             assert resumed.elapsed == 11.0
             with pytest.raises(SearchStopped, match="wall-time"):
                 resumed.admit_evaluation()
@@ -314,7 +328,7 @@ def test_closed_session_restores_evidence_after_finalization_exceeds_search_time
         cancelled.set()
         with resumed.restoration():
             with pytest.raises(SearchStopped, match="interrupted"):
-                resumed.load(reference)
+                resumed.load_snapshots(reference)
         cancelled.clear()
         path = Path(preserved["cases"][0]["capture"]["path"])
         path.chmod(0o600)
@@ -485,11 +499,28 @@ def test_candidate_scoring_keeps_all_dataset_cases_outside_search_population(pre
     with Journal(tmp_path / "search", {"case": "global-support"}) as journal:
         backend = Backend(prepared, journal, SearchLimits())
         backend.population = Population({})
-        result = backend.evaluate("0")
-        assert calls == [None]
+        result, reference = backend.evaluate("0")
         assert {row["case_id"] for row in result["cases"]} == {case["id"] for case in prepared.cases()}
-        reference = backend.result_refs[result["descriptor"]]
-        assert backend.load(reference) == result
+        assert next(event["data"]["result"] for event in journal.events
+                    if event["kind"] == "evaluation") == reference
+        assert backend.evaluate("0") == (result, reference)
+        assert backend.evaluations == 1
+        assert calls == [None]
+
+
+def test_cached_descriptor_cannot_reuse_a_different_saved_evaluation(prepared, tmp_path):
+    result = offline_result(prepared, tmp_path / "cache")
+    directory = tmp_path / "search"
+    identity = {"case": "descriptor-binding"}
+    descriptor = parse_candidate(prepared.patch_format, "1").descriptor
+    with Journal(directory, identity) as journal:
+        reference = journal.store(result)
+        journal.append("evaluation", {"descriptor": descriptor, "result": reference})
+    with Journal(directory, identity, resume=True) as journal:
+        backend = Backend(prepared, journal, SearchLimits())
+        with pytest.raises(ValueError, match="journal evaluation identity mismatch"):
+            backend.evaluate("1")
+        assert backend.evaluations == 0
 
 
 @pytest.mark.parametrize("corruption", ["dataset", "predicate", "case-descriptor", "report-outcome", "report-comparison"])

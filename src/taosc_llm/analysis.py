@@ -348,6 +348,10 @@ def _public_procedure(procedure_id, procedure):
 
 
 def _instruction_rows(procedure):
+    # _frozen builds private procedures per authenticated lookup. Share the
+    # validated rows between its site windows, never across dataset operations.
+    if "instruction_rows" in procedure:
+        return procedure["instruction_rows"]
     observation = procedure["views"].get("instructions", {})
     value = observation.get("value")
     source = value.get("instructions", []) if isinstance(value, dict) else []
@@ -425,6 +429,7 @@ def _instruction_rows(procedure):
     rows.sort(key=lambda item: int(item["address"], 16))
     if len({row["address"] for row in rows}) != len(rows):
         raise ValueError("duplicate frozen instruction address")
+    procedure["instruction_rows"] = rows
     return rows
 
 
