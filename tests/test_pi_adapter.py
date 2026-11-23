@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 import pytest
-from taosc_llm.bridge import adapter_command, run_adapter
+from taosc_llm.bridge import AdapterError, FinalReview, adapter_command, run_adapter
 from taosc_llm.context import prepare_context
 from taosc_llm.provider import ProviderConfig
 
@@ -18,6 +18,34 @@ let count = 0;
 let synthesisMaxTokens;
 const encode = x => new TextEncoder().encode(x);
 let expireDeadlines;
+if (mode.startsWith('release-cleanup')) {
+  const {default:fs} = await import('node:fs');
+  const {syncBuiltinESMExports} = await import('node:module');
+  const originalClose = fs.closeSync;
+  fs.closeSync = function(fd) {
+    let session = false;
+    try { session = fs.readlinkSync('/proc/self/fd/' + fd).endsWith('.pi.jsonl'); } catch {}
+    originalClose.call(this, fd);
+    if (session) throw Object.assign(new Error('offline session close failure'), {code:'EIO'});
+  };
+  syncBuiltinESMExports();
+}
+if (mode.startsWith('release-transport')) {
+  process.stdin.on('data', data => {
+    if (data.toString().includes('"type":"host_outcome"')) process.exit(1);
+  });
+}
+if (mode.startsWith('release-invalid')) {
+  const write = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (data, ...args) => {
+    if (typeof data === 'string' && data.includes('"type":"feedback_complete"')) {
+      const frame = JSON.parse(data);
+      frame.request_count = 1; // A null review cannot make an HTTP request.
+      data = JSON.stringify(frame) + '\n';
+    }
+    return write(data, ...args);
+  };
+}
 if (mode === 'feedback-deadline') {
   // Drive only the configured 30-second deadlines at protocol boundaries.
   // SDK import speed and host load must not decide this lifecycle regression.
@@ -136,12 +164,16 @@ globalThis.fetch = async (input, init) => {
   const chunk = (delta, finish=null) => 'data: ' + JSON.stringify({id:'offline',object:'chat.completion.chunk',created:1,
     model:body.model,choices:[{index:0,delta,finish_reason:finish}],
     ...(finish ? {usage:{prompt_tokens:11,completion_tokens:7,total_tokens:18}} : {})}) + '\n\n';
+  const spacedPredicate = ' \t rax  <=\n 0  ';
   let data;
-  if (mode === 'missing-finish') data = chunk({role:'assistant',content:'incomplete'}) + 'data: [DONE]\n\n';
+  if (mode.startsWith('release-') && !mode.endsWith('-final')) {
+    data = chunk({role:'assistant',content:'{malformed'},'stop') + 'data: [DONE]\n\n';
+  } else if (mode === 'missing-finish') data = chunk({role:'assistant',content:'incomplete'}) + 'data: [DONE]\n\n';
   else if (mode === 'truncated') data = chunk({role:'assistant',content:'incomplete'},'stop');
-  else if (count <= 2 && mode !== 'abstain') {
+  else if (count <= 2 && mode !== 'abstain' && !mode.startsWith('release-')) {
     const name = count === 1 ? 'get_patch_context' : 'evaluate_predicate';
-    const args = count === 1 ? {context_id:context} : {context_id:context,predicate:'rax <= 0'};
+    const args = count === 1 ? {context_id:context}
+      : {context_id:context,predicate:mode.startsWith('spacing-') ? spacedPredicate : 'rax <= 0'};
     data = chunk({role:'assistant',content:'Intermediate explanation '+count,reasoning_content:'Intermediate reasoning '+count,
       tool_calls:[{index:0,id:'call-'+count,type:'function',function:{name,arguments:JSON.stringify(args)}}]});
     data += chunk({},'tool_calls') + 'data: [DONE]\n\n';
@@ -153,7 +185,10 @@ globalThis.fetch = async (input, init) => {
     data = chunk({role:'assistant',tool_calls:[{index:0,id:'result-call',type:'function',function:{name:'get_candidate_result',arguments:JSON.stringify(args)}}]});
     data += chunk({},'tool_calls') + 'data: [DONE]\n\n';
   } else {
-    const proposal = {schema_version:1,context_id:context,decision:mode === 'abstain' ? 'abstain' : 'candidate',predicate:mode === 'abstain' ? null : 'rax <= 0',evidence_ids:[],assumptions:[],reason:'Offline transport fixture only.'};
+    const abstain = mode === 'abstain' || mode.endsWith('-final');
+    const proposal = {schema_version:1,context_id:context,decision:abstain ? 'abstain' : 'candidate',
+      predicate:abstain ? null : mode === 'spacing-exact' ? spacedPredicate : 'rax <= 0',
+      evidence_ids:[],assumptions:[],reason:'Offline transport fixture only.'};
     data = chunk({role:'assistant',content:JSON.stringify(proposal)}) + chunk({},'stop') + 'data: [DONE]\n\n';
   }
   return new Response(new ReadableStream({
@@ -171,7 +206,6 @@ globalThis.fetch = async (input, init) => {
 @pytest.mark.parametrize("error_code", ["timeout", "cancelled", None])
 def test_closed_tool_result_pipe_preserves_only_valid_terminal(tmp_path, monkeypatch, error_code):
     import sys
-    from taosc_llm.bridge import AdapterError
     from test_context_tools import make_dataset
 
     context = prepare_context(make_dataset(tmp_path / "dataset"), run_dir=tmp_path / "run")
@@ -225,21 +259,26 @@ def adapter_context(tmp_path):
     return prepare_context(make_dataset(tmp_path / "dataset"), run_dir=tmp_path / "run"), Path(root)
 
 
-def operation(adapter_context, tmp_path, mode, *, journal=None,
-              api_key="offline-secret-for-transport", stream_end="eof", reasoning_effort=None,
-              on_complete=None, timeout_seconds=30, max_tokens=65536):
-    context, root = adapter_context
-    journal = journal if journal is not None else tmp_path / "turn.jsonl"
+def offline_adapter(root, tmp_path, mode, *, session_path=None,
+                    api_key="offline-secret-for-transport", stream_end="eof", reasoning_effort=None,
+                    timeout_seconds=30, max_tokens=65536):
     preload = tmp_path / "provider.mjs"
     preload.write_text(PRELOAD.replace("__MODE__", json.dumps(mode))
                        .replace("__STREAM_END__", json.dumps(stream_end))
                        .replace("__REASONING_EFFORT__", json.dumps(reasoning_effort))
-                       .replace("__SESSION_PATH__", json.dumps(str(journal.with_suffix(".pi.jsonl")))))
+                       .replace("__SESSION_PATH__", json.dumps(str(session_path) if session_path else None)))
     command = adapter_command(root)
     command[1:1] = ["--import", str(preload)]
     provider = ProviderConfig(api_key=api_key, base_url="https://example.invalid/v1",
                               model="offline-exact-model", timeout_seconds=timeout_seconds,
                               max_tokens=max_tokens, reasoning_effort=reasoning_effort)
+    return command, provider
+
+
+def operation(adapter_context, tmp_path, mode, *, journal=None, on_complete=None, **options):
+    context, root = adapter_context
+    journal = journal if journal is not None else tmp_path / "turn.jsonl"
+    command, provider = offline_adapter(root, tmp_path, mode, session_path=journal.with_suffix(".pi.jsonl"), **options)
     result = asyncio.run(run_adapter(context, provider, command, "offline", journal,
                                     on_complete=on_complete))
     assert provider.api_key not in journal.read_text()
@@ -314,6 +353,47 @@ def test_host_checks_only_successful_exact_predicate_response(adapter_context, t
     result, _ = operation(adapter_context, tmp_path, "tools")
     assert result["type"] == "turn_complete"
     assert result["host_checked_predicates"] == []
+
+
+@pytest.mark.parametrize("session_feedback", [False, True])
+@pytest.mark.parametrize("exact", [False, True])
+def test_synthesis_exact_whitespace_and_callback_accounting(adapter_context, tmp_path, monkeypatch,
+                                                           session_feedback, exact):
+    from taosc_llm import evaluation, synthesis
+
+    context, root = adapter_context
+    command, provider = offline_adapter(root, tmp_path, "spacing-exact" if exact else "spacing-canonical")
+    monkeypatch.setattr(synthesis, "adapter_command", lambda _: command)
+    original_evaluate = evaluation.evaluate_dataset
+    requested = " \t rax  <=\n 0  "
+
+    def evaluate(dataset, predicate, *, execute, **kwargs):
+        if execute:
+            assert exact and predicate == requested
+            raise RuntimeError("offline post-proposal evaluation failure")
+        return original_evaluate(dataset, predicate, execute=execute, **kwargs)
+
+    monkeypatch.setattr(evaluation, "evaluate_dataset", evaluate)
+    error, message = ((RuntimeError, "post-proposal evaluation failure") if exact
+                      else (ValueError, "exact predicate evaluation"))
+    with pytest.raises(error, match=message):
+        asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=1,
+                                                session_feedback=session_feedback))
+    record = json.loads((context.run_dir / "run.json").read_text())
+    journal = context.run_dir / "trials" / "1" / "turn-1.jsonl"
+    frames = [entry["frame"] for entry in native_records(journal)]
+    complete = next(frame for frame in frames if frame["type"] == "turn_complete")
+    response = next(frame["result"] for frame in frames if frame["type"] == "tool_result"
+                    and "predicate" in frame["result"])
+    assert response["ok"] is True and response["predicate"] == "rax <= 0"
+    assert record["status"] == "infrastructure_error"
+    assert record["attempts"] == [{**{key: value for key, value in complete.items() if key != "final_text"},
+                                  "host_inspected_context": True, "host_checked_predicates": [requested]}]
+    assert complete["request_count"] == 3 and complete["usage"]["totalTokens"] == 54
+    assert "session_feedback" not in record
+    assert not any(frame["type"] == "host_outcome" for frame in frames)
+    if session_feedback:
+        assert frames[-1]["type"] == "turn_failed" and frames[-1]["error_code"] == "cancelled"
 
 
 @pytest.mark.parametrize("stream_end", ["eof", "pending"])
@@ -736,7 +816,7 @@ def test_feedback_uses_original_session_and_separate_accounting(adapter_context,
         callbacks.append(proposal["final_text"])
         records = native_records(tmp_path / "turn.pi.jsonl")
         assert any("Offline transport fixture only." in json.dumps(record) for record in records)
-        return 'Host review phase: final host result {"status":"unavailable"}. Return Markdown, no tools.'
+        return FinalReview('Host review phase: final host result {"status":"unavailable"}. Return Markdown, no tools.')
 
     result, _ = operation(adapter_context, tmp_path, "tools", on_complete=host_outcome, max_tokens=max_tokens)
     frames = [record["frame"] for record in native_records(tmp_path / "turn.jsonl")]
@@ -773,10 +853,66 @@ def test_nonfinal_round_releases_original_session_without_review(adapter_context
     assert "Host review phase:" not in (tmp_path / "turn.pi.jsonl").read_text()
 
 
+@pytest.mark.parametrize("mode,code", [("release-cleanup", "session_persistence_error"),
+                                       ("release-invalid", "feedback_transport_error"),
+                                       ("release-transport", "feedback_transport_error")])
+@pytest.mark.parametrize("final", [False, True])
+def test_synthesis_null_review_release_failure(adapter_context, tmp_path, monkeypatch, mode, code, final):
+    from taosc_llm import synthesis
+
+    context, root = adapter_context
+    command, provider = offline_adapter(root, tmp_path, mode + ("-final" if final else ""))
+    monkeypatch.setattr(synthesis, "adapter_command", lambda _: command)
+    record_path = context.run_dir / "run.json"
+
+    def fail_preparation(*args):
+        # Preparation starts only after the host decision and synthesis accounting
+        # are durable, and still releases that session with a null prompt.
+        frozen = json.loads(record_path.read_text())
+        assert final and frozen["status"] == "abstained"
+        assert len(frozen["attempts"]) == 1 and frozen["attempts"][0]["request_count"] == 1
+        raise ValueError("offline review preparation failure")
+
+    monkeypatch.setattr(synthesis, "_review_prompt", fail_preparation)
+    operation = synthesis.synthesize_context(context, provider, max_rounds=2, session_feedback=True)
+    if final:
+        result = asyncio.run(operation)
+        assert result["status"] == "abstained"
+        assert result["session_feedback"]["type"] == "feedback_failed"
+        assert result["session_feedback"]["error_code"] == code
+        assert json.loads(record_path.read_text()) == result
+    else:
+        with pytest.raises(AdapterError):
+            asyncio.run(operation)
+        result = json.loads(record_path.read_text())
+        assert result["status"] == "infrastructure_error"
+        assert result["rounds"][0]["status"] == "parse_rejected"
+        assert "session_feedback" not in result
+    attempt, = result["attempts"]
+    assert attempt["type"] == "turn_complete" and attempt["remote_settled"] is True
+    assert attempt["request_count"] == 1 and attempt["usage"]["totalTokens"] == 18
+    assert "final_text" not in attempt and "session_feedback" not in attempt
+    assert not (context.run_dir / "trials" / "2").exists()
+    assert not (context.run_dir / "session-feedback.md").exists()
+    frames = [entry["frame"] for entry in native_records(context.run_dir / "trials" / "1" / "turn-1.jsonl")]
+    outcome = next(frame for frame in frames if frame["type"] == "host_outcome")
+    assert outcome["review_prompt"] is None and outcome["review_max_tokens"] is None
+    # A rejected release can be followed by the host's cancel/drain frame.
+    replies = [frame for frame in frames if frame["type"].startswith("feedback_")]
+    if mode == "release-transport":
+        assert replies == []
+    else:
+        reply, = replies
+        if mode == "release-cleanup":
+            assert reply["type"] == "feedback_failed" and reply["error_code"] == code
+        else:
+            assert reply["type"] == "feedback_complete" and reply["request_count"] == 1
+
+
 @pytest.mark.parametrize("mode", ["feedback-auth", "feedback-cancel", "feedback-tool"])
 def test_feedback_failure_never_overwrites_proposal(adapter_context, tmp_path, mode):
     async def review(proposal):
-        return 'Host review phase: final host result {"status":"not_rejected"}. No tools.'
+        return FinalReview('Host review phase: final host result {"status":"not_rejected"}. No tools.')
 
     result, _ = operation(adapter_context, tmp_path, mode, on_complete=review)
     assert result["type"] == "turn_complete" and result["request_count"] == 3
@@ -788,7 +924,7 @@ def test_feedback_failure_never_overwrites_proposal(adapter_context, tmp_path, m
 
 def test_feedback_deadline_is_fresh_after_host_work(adapter_context, tmp_path):
     async def review(proposal):
-        return 'Host review phase: host outcome unavailable. Markdown only.'
+        return FinalReview('Host review phase: host outcome unavailable. Markdown only.')
 
     result, _ = operation(adapter_context, tmp_path, "feedback-deadline", on_complete=review)
     assert result["type"] == "turn_complete" and result["request_count"] == 3
@@ -801,7 +937,7 @@ def test_host_cancellation_during_review_preserves_settled_proposal(adapter_cont
     async def review(proposal):
         task = asyncio.current_task()
         asyncio.get_running_loop().call_later(0.1, task.cancel)
-        return 'Host review phase: host outcome not_rejected. Markdown only.'
+        return FinalReview('Host review phase: host outcome not_rejected. Markdown only.')
 
     result, _ = operation(adapter_context, tmp_path, "feedback-timeout", on_complete=review)
     assert result["type"] == "turn_complete" and result["request_count"] == 3

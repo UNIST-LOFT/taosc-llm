@@ -33,18 +33,19 @@ def child_contract(tmp_path, monkeypatch):
     return contract
 
 
-@pytest.mark.parametrize("mode", ["no-llm", "manual", "provider"])
-@pytest.mark.parametrize("outcome", ["residual", "no-candidate", "bounded-stop"])
+@pytest.mark.parametrize("mode,outcome", [
+    ("no-llm", "bounded-search-exhausted"), ("no-llm", "no-target-cases"), ("no-llm", "wall-time-reached"),
+    ("manual", "rejected"), ("manual", "abstained"), ("manual", "refinement_exhausted"),
+    ("provider", "rejected"), ("provider", "abstained"), ("provider", "refinement_exhausted"),
+    ("manual", "reject_predicate_trap"), ("provider", "no_candidate"),
+])
 def test_runner_records_completed_scoped_outcomes_without_quality_exit(
         tmp_path, capsys, child_contract, mode, outcome):
     result = child_contract["synthesis"]
     if mode != "no-llm":
-        result.update(status={"residual": "rejected", "no-candidate": "abstained",
-                              "bounded-stop": "refinement_exhausted"}[outcome],
-                      quality={"status": "unproven", "counts": {"other_crash": 1}})
+        result.update(status=outcome, quality={"status": "unproven", "counts": {"other_crash": 1}})
     else:
-        result["termination"] = {"residual": "bounded-search-exhausted", "no-candidate": "no-target-cases",
-                                 "bounded-stop": "wall-time-reached"}[outcome]
+        result["termination"] = outcome
     arguments = child_contract["arguments"] + ["--mode", mode]
     if mode == "manual":
         arguments += ["--predicate", "rax != 0"]

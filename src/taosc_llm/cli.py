@@ -9,6 +9,13 @@ from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 
 
+# Scoped manual/provider quality outcomes, also consumed by the experiment runner.
+COMPLETED_SYNTHESIS_STATUSES = (
+    "built", "abstained", "not_rejected", "reject_same_crash", "reject_predicate_trap",
+    "rejected", "unavailable", "no_candidate", "refinement_exhausted",
+)
+
+
 def _positive(value: str) -> int:
     number = int(value)
     if number < 1:
@@ -39,9 +46,7 @@ def _run(label: str, operation) -> int:
         if status == "cancelled":
             return 130
         # Process completion is independent of the observed repair quality.
-        return 0 if status in ("prepared", "built", "abstained", "not_rejected", "warmed",
-                               "reject_same_crash", "reject_predicate_trap", "rejected", "unavailable",
-                               "no_candidate", "refinement_exhausted") else 1
+        return 0 if status in COMPLETED_SYNTHESIS_STATUSES or status in ("prepared", "warmed") else 1
     except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as error:
         print(f"{label}: {error}", file=sys.stderr)
         return 1

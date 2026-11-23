@@ -49,6 +49,34 @@ def test_retry_uses_terminal_settlement_and_existing_bounds(
     assert all(attempt["remote_settled"] is settled for attempt in attempts)
 
 
+@pytest.mark.parametrize("session_feedback", [False, True])
+def test_retry_accounting_precedes_successful_host_callback(tmp_path, monkeypatch, session_feedback):
+    provider = ProviderConfig(api_key="offline-only", base_url="https://example.invalid/v1", model="offline")
+    attempts = []
+    rate = {"type": "turn_failed", "remote_settled": True, "http_status": 429, "retry_after_seconds": 0,
+            "error_code": "provider_rate_limited", "request_count": 1}
+    complete = {"type": "turn_complete", "request_count": 3, "remote_settled": True}
+    response = {**complete, "final_text": "offline synthesis proposal"}
+
+    async def model(context, provider, command, run_id, journal, *, on_complete=None):
+        if journal.name == "turn-1.jsonl":
+            return rate
+        assert journal.name == "turn-2.jsonl"
+        if on_complete is not None:
+            await on_complete(response)
+        return response
+
+    async def finish(terminal):
+        assert terminal == response
+        assert attempts == [rate, complete]
+
+    monkeypatch.setattr(synthesis, "run_adapter", model)
+    result = asyncio.run(synthesis._model_round(None, provider, ["not-executed"], "offline", tmp_path, attempts,
+                                                on_complete=finish if session_feedback else None))
+    assert result == response
+    assert attempts == [rate, complete]
+
+
 def test_exact_candidate_must_have_been_evaluated(tmp_path, monkeypatch):
     context = prepare_context(make_dataset(tmp_path / "dataset"), run_dir=tmp_path / "runs")
     provider = ProviderConfig(api_key="offline-only", base_url="https://example.invalid/v1", model="offline")
@@ -255,6 +283,15 @@ def test_feedback_follows_final_host_outcome_only(tmp_path, monkeypatch, outcome
     monkeypatch.setattr(synthesis, "adapter_command", lambda _: ["not-executed"])
     prompts = []
     settled = []
+    written = []
+    write_record = synthesis.write_record
+
+    def record(path, value):
+        if path.name == "run.json":
+            written.append((value["status"], len(value["attempts"]), "session_feedback" in value))
+        write_record(path, value)
+
+    monkeypatch.setattr(synthesis, "write_record", record)
 
     async def model(current, provider, command, run_id, journal, *, on_complete):
         # First round is invalid; it must settle/release without a review call.
@@ -262,8 +299,9 @@ def test_feedback_follows_final_host_outcome_only(tmp_path, monkeypatch, outcome
         final = (proposal(current, predicate="rax &&") if first
                  else proposal(current, decision="abstain", predicate=None) if outcome == "abstained"
                  else proposal(current))
-        response = terminal(current, final, ["rax < 0"])
-        prompt = await on_complete(response)
+        response = {**terminal(current, final, ["rax < 0"]), "request_count": 2 if first else 1}
+        review = await on_complete(response)
+        prompt = review.prompt if review is not None else None
         settled.append(final)
         prompts.append(prompt)
         if prompt is not None:
@@ -299,11 +337,14 @@ def test_feedback_follows_final_host_outcome_only(tmp_path, monkeypatch, outcome
     result = asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=2, session_feedback=True))
     assert result["status"] == outcome and result["verified"] is False
     assert prompts[0] is None and prompts[1] is not None
+    assert written == [("prepared", 0, False), ("refining", 1, False), (outcome, 2, False), (outcome, 2, True)]
     path = context.run_dir / "session-feedback.md"
     assert path.read_text() == "# Review\nBounded evidence."
     assert path.stat().st_mode & 0o777 == 0o600
     assert "final_text" not in result["session_feedback"]
-    assert all("session_feedback" not in attempt for attempt in result["attempts"])
+    assert [attempt["request_count"] for attempt in result["attempts"]] == [2, 1]
+    assert all(not {"final_text", "session_feedback"}.intersection(attempt) for attempt in result["attempts"])
+    assert json.loads((context.run_dir / "run.json").read_text()) == result
 
 
 def test_feedback_failure_is_separate_from_abstention(tmp_path, monkeypatch):
@@ -335,7 +376,8 @@ def test_review_preparation_failure_preserves_frozen_verdict(tmp_path, monkeypat
 
     async def model(current, provider, command, run_id, journal, *, on_complete):
         response = terminal(current, proposal(current, decision="abstain", predicate=None), [])
-        assert await on_complete(response) is None
+        review = await on_complete(response)
+        assert review is not None and review.prompt is None
         return response
 
     monkeypatch.setattr(synthesis, "_review_prompt", fail_review)
@@ -818,6 +860,38 @@ def test_provider_stop_uses_known_observed_objective_not_strict_quality(
     assert result['selected_round'] == 1 and result['evaluation'] == evaluated
     assert result['objective'] == result['rounds'][0]['objective'] == synthesis.selection_objective(evaluated)
     assert result['verified'] is False and result['binradar_verification'] == 'not_run'
+
+
+def test_round_limit_does_not_construct_next_round_feedback(tmp_path, monkeypatch):
+    from taosc_llm import evaluation
+
+    context = prepare_context(make_dataset(tmp_path / "dataset"), run_dir=tmp_path / "runs")
+    provider = ProviderConfig(api_key="offline-only", base_url="https://example.invalid/v1", model="offline")
+    evaluated = quality_round(misses=("target",))["evaluation"]
+    written = []
+    write_record = synthesis.write_record
+
+    def record(path, value):
+        if path.name == "run.json":
+            written.append(value["status"])
+        write_record(path, value)
+
+    async def model(current, *args):
+        return terminal(current, proposal(current), ["rax < 0"])
+
+    def unused_feedback(*args):
+        pytest.fail("no next round would consume this projection")
+
+    monkeypatch.setattr(synthesis, "write_record", record)
+    monkeypatch.setattr(synthesis, "adapter_command", lambda _: ["not-executed"])
+    monkeypatch.setattr(synthesis, "_model_round", model)
+    monkeypatch.setattr(synthesis, "predicate_feedback", unused_feedback)
+    monkeypatch.setattr(synthesis, "publish_candidate", lambda *args, **kwargs: {"status": "published"})
+    monkeypatch.setattr(evaluation, "evaluate_dataset", lambda *args, **kwargs: evaluated)
+    result = asyncio.run(synthesis.synthesize_context(context, provider, max_rounds=1))
+    assert result["status"] == "reject_same_crash" and result["termination"] == "round_limit"
+    assert result["selected_round"] == 1 and result["evaluation"] == evaluated
+    assert written == ["prepared", "reject_same_crash"]
 
 
 def test_repeated_result_ignores_other_crash_and_baseline_quality_penalties():

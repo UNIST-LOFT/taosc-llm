@@ -978,7 +978,9 @@ actual synthesis JSON and preserves its scoped result, including score/quality,
 residual targets/regressions and publication status. Exit 0 means a completed
 requested stage or explicit skip. Warm and synthesis children must return the
 current zero-exit completed-result contract; old quality-derived 2/3 codes are
-not silently accepted. Zero without a valid terminal result is also an error.
+not silently accepted. In particular, a manual `reject_predicate_trap` or provider
+`no_candidate` is a completed synthesis: the runner retains `synthesis_result`
+without implying publication. Zero without a valid terminal result is still an error.
 Operational warm/producer/build errors still stop the pipeline: a required
 resident that cannot establish its baseline is not a completed search outcome.
 Exit 124 means the runner killed an over-limit stage, not a cooperative search stop;

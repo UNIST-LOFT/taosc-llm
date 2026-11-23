@@ -8,14 +8,17 @@ import shutil
 import sys
 import time
 import uuid
-from threading import Event
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Event
 
 from .context import SynthesisContext, strict_json
-from .provider import ProviderConfig
+from .family import parse_candidate
 from .native import kill_process, native_environment
+from .provider import ProviderConfig
 
 MAX_FRAME = 4 * 1024 * 1024
 SESSION_REVIEW_MAX_TOKENS = 4096
@@ -50,14 +53,22 @@ def adapter_command(sdk_root: Path | None = None) -> list[str]:
             "--sdk-root", str(root)]
 
 
+@dataclass(frozen=True)
+class FinalReview:
+    """The host verdict is frozen, even if review preparation yielded no prompt."""
+
+    prompt: str | None
+
+
 async def run_adapter(context: SynthesisContext, provider: ProviderConfig,
-                      command: list[str], run_id: str, journal: Path, *, on_complete=None) -> dict:
+                      command: list[str], run_id: str, journal: Path, *,
+                      on_complete: Callable[[dict], Awaitable[FinalReview | None]] | None = None) -> dict:
     """Own one SDK worker through synthesis and optional final-outcome review.
 
     on_complete receives the settled synthesis terminal while the original session
-    stays live. Its awaited host work is outside the provider deadline; return a
-    bounded review prompt or None to release a nonfinal round without a model call.
-    Feedback metadata is separate and cannot replace the synthesis terminal.
+    stays live. Its awaited host work is outside the provider deadline. None
+    requires a successful session release before the next round; FinalReview
+    makes subsequent errors diagnostic. Only a prompt admits another model call.
     """
     process = None
     terminal = None
@@ -173,10 +184,16 @@ async def run_adapter(context: SynthesisContext, provider: ProviderConfig,
                     await task
                     raise
                 if result.get("ok"):
-                    if (frame["tool"] in ("evaluate_predicate", "test_candidate")
-                            and result.get("predicate") == frame["arguments"]["predicate"]):
-                        checked.add(frame["arguments"]["predicate"])
-                    elif frame["tool"] not in ("evaluate_predicate", "test_candidate", "get_candidate_result"):
+                    if frame["tool"] in ("evaluate_predicate", "test_candidate"):
+                        requested = frame["arguments"]["predicate"]
+                        try:
+                            normalized = parse_candidate(context.dataset.patch_format, requested).expression
+                        except ValueError:
+                            pass
+                        else:
+                            if result.get("predicate") == normalized:
+                                checked.add(requested)
+                    elif frame["tool"] != "get_candidate_result":
                         inspected = True
                 try:
                     await send({**envelope, "type": "tool_result", "request_id": frame["request_id"], "result": result})
@@ -237,7 +254,8 @@ async def run_adapter(context: SynthesisContext, provider: ProviderConfig,
             terminal = await asyncio.wait_for(conversation(), timeout=provider.timeout_seconds + 20)
             if on_complete is not None and terminal["type"] == "turn_complete":
                 # Native build/evaluation is host work, outside the provider deadline.
-                prompt = await on_complete(terminal)
+                review = await on_complete(terminal)
+                prompt = review.prompt if review is not None else None
                 feedback_id = uuid.uuid4().hex
                 try:
                     await send({**envelope, "type": "host_outcome", "request_id": feedback_id,
@@ -248,27 +266,38 @@ async def run_adapter(context: SynthesisContext, provider: ProviderConfig,
                     record("adapter", frame)
                     common = {*envelope, "type", "request_id", "remote_settled", "request_count",
                               "model_turns", "tool_calls", "usage"}
-                    fields = {"final_text"} if frame["type"] == "feedback_complete" else {"error_code"}
+                    kind = frame.get("type")
+                    fields = {"final_text"} if kind == "feedback_complete" else {"error_code"}
                     if (frame["request_id"] != feedback_id or set(frame) != common | fields
-                            or frame["type"] not in ("feedback_complete", "feedback_failed")
+                            or kind not in ("feedback_complete", "feedback_failed")
                             or type(frame["remote_settled"]) is not bool
                             or type(frame["request_count"]) is not int
                             or frame["request_count"] < 0
                             or type(frame["model_turns"]) is not int or not 0 <= frame["model_turns"] <= 1
                             or type(frame["tool_calls"]) is not int or frame["tool_calls"] != 0
-                            or (frame["type"] == "feedback_failed" and (
+                            or (kind == "feedback_failed" and (
                                 not isinstance(frame["error_code"], str)
                                 or not re.fullmatch(r"[a-z_]+", frame["error_code"])))
-                            or (frame["type"] == "feedback_complete" and (
-                                not frame["remote_settled"] or not isinstance(frame["final_text"], str)
-                                or (prompt is not None and not frame["final_text"].strip())))):
+                            or (kind == "feedback_complete" and (
+                                not frame["remote_settled"] or not isinstance(frame["final_text"], str)))):
                         raise AdapterError("invalid feedback terminal frame")
+                    if kind == "feedback_complete":
+                        if prompt is None:
+                            if (frame["final_text"] != "" or frame["request_count"] != 0
+                                    or frame["model_turns"] != 0 or frame["usage"] is not None):
+                                raise AdapterError("invalid session release terminal frame")
+                        elif not frame["final_text"].strip():
+                            raise AdapterError("invalid feedback terminal frame")
                     await asyncio.wait_for(process.wait(), 15)
-                    if process.returncode != (0 if frame["type"] == "feedback_complete" else 1):
+                    if process.returncode != (0 if kind == "feedback_complete" else 1):
                         raise AdapterError("adapter exit disagrees with feedback frame")
-                    if prompt is not None:
+                    if review is None and kind == "feedback_failed":
+                        raise AdapterError("Pi session release failed: " + frame["error_code"])
+                    if review is not None and (prompt is not None or kind == "feedback_failed"):
                         terminal["session_feedback"] = frame
                 except (OSError, ValueError, TimeoutError, AdapterError, asyncio.CancelledError) as error:
+                    if review is None:
+                        raise
                     if process.returncode is None:
                         try:
                             await asyncio.wait_for(cancel_and_drain(), 15)

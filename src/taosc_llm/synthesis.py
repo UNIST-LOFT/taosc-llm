@@ -6,7 +6,7 @@ import uuid
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-from .bridge import adapter_command, review_max_tokens, run_adapter
+from .bridge import FinalReview, adapter_command, review_max_tokens, run_adapter
 from .collection_metrics import candidate_admission, compare_selection, selection_case_sets, selection_objective
 from .context import SynthesisContext, canonical, prepare_context
 from .poc import poc_observation
@@ -76,11 +76,21 @@ async def _blocking(function, *args, **kwargs):
 
 
 async def _model_round(context, provider, command, run_id, trials, attempts, on_complete=None):
+    def settle(terminal):
+        attempts.append({k: v for k, v in terminal.items() if k not in ("final_text", "session_feedback")})
+
+    async def complete(terminal):
+        # The live SDK session can fail to release, and host finalization can
+        # raise. The received synthesis terminal still belongs in the run record.
+        settle(terminal)
+        return await on_complete(terminal)
+
     for attempt in range(3):
         terminal = await run_adapter(context, provider, command, run_id,
             trials / f"turn-{attempt + 1}.jsonl",
-            **({"on_complete": on_complete} if on_complete is not None else {}))
-        attempts.append({k: v for k, v in terminal.items() if k not in ("final_text", "session_feedback")})
+            **({"on_complete": complete} if on_complete is not None else {}))
+        if on_complete is None or terminal["type"] != "turn_complete":
+            settle(terminal)
         if terminal["type"] == "turn_complete":
             return terminal
         delay = terminal.get("retry_after_seconds")
@@ -270,6 +280,10 @@ async def synthesize_context(context: SynthesisContext, provider: ProviderConfig
                         round_result["repeated_result_of"] = result["rounds"][-2]["round"]
                     if minimized:
                         result.update(status="not_rejected", termination="observed_objective_minimum")
+                    elif repeated or index + 1 == max_rounds:
+                        result.update(status=_objective_outcome(incumbent["objective"]) if incumbent
+                                      else "no_candidate" if "evaluation" in result else "refinement_exhausted",
+                                      termination="repeated_result" if repeated else "round_limit")
                     else:
                         observed = round_result.get("evaluation")
                         observations = None
@@ -293,12 +307,7 @@ async def synthesize_context(context: SynthesisContext, provider: ProviderConfig
                                 "objective": incumbent["objective"],
                                 "result_id": current.reference(incumbent["result_id"], kind="r")}
                         feedback.append(update)
-                        if repeated or index + 1 == max_rounds:
-                            result.update(status=_objective_outcome(incumbent["objective"]) if incumbent
-                                          else "no_candidate" if "evaluation" in result else "refinement_exhausted",
-                                          termination="repeated_result" if repeated else "round_limit")
-                        else:
-                            result["status"] = "refining"
+                        result["status"] = "refining"
                 if result["status"] != "refining" and incumbent is not None:
                     try:
                         candidate = await _blocking(publish_candidate, current.dataset,
@@ -312,12 +321,13 @@ async def synthesize_context(context: SynthesisContext, provider: ProviderConfig
                 write_record(run_dir / "run.json", result)
                 if session_feedback and result["status"] != "refining":
                     try:
-                        return _review_prompt(current, result, round_result, provider)
+                        return FinalReview(_review_prompt(current, result, round_result, provider))
                     except (OSError, ValueError, RuntimeError, TypeError, KeyError):
                         # Optional review cannot replace an already frozen host verdict.
                         result["session_feedback"] = {"type": "feedback_failed",
                             "error_code": "feedback_preparation_error", "remote_settled": True,
                             "request_count": 0, "model_turns": 0, "tool_calls": 0, "usage": None}
+                        return FinalReview(None)
                 return None
 
             terminal = await _model_round(current, provider, command, run_id, trials, result["attempts"],
@@ -333,7 +343,8 @@ async def synthesize_context(context: SynthesisContext, provider: ProviderConfig
                         _write_private(run_dir / "session-feedback.md", review["final_text"].encode("utf-8"))
                     except (OSError, UnicodeError):
                         result["session_feedback"].update(type="feedback_failed", error_code="feedback_persistence_error")
-            write_record(run_dir / "run.json", result)
+            if "session_feedback" in result:
+                write_record(run_dir / "run.json", result)
             if result["status"] != "refining":
                 return result
         return result

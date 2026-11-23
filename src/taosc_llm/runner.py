@@ -12,6 +12,7 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from .cli import COMPLETED_SYNTHESIS_STATUSES
 from .runner_options import allocate_run, parse_args
 from .runner_process import RunnerInterrupted, RunnerTimeout, Supervisor
 
@@ -417,9 +418,7 @@ class Experiment:
                              "bounded-search-exhausted", "clause-budget-reached",
                              "wall-time-reached", "evaluation-budget-reached"))
         else:
-            completed = result.get("status") in (
-                "built", "abstained", "not_rejected", "reject_same_crash", "rejected",
-                "unavailable", "refinement_exhausted")
+            completed = result.get("status") in COMPLETED_SYNTHESIS_STATUSES
         if (not completed or (args.mode == "no-llm" and "predicate" not in result)
                 or result.get("verified") is not False
                 or result.get("binradar_verification") != "not_run"):
