@@ -149,7 +149,7 @@ def _execute(dataset, case: dict, descriptor: str, directory: Path, *, original=
         complete = error is None and len(snapshots) == len(branches) and [s.branch for s in snapshots] == branches
         expected_cwe = dataset.patch_format == 'ERM CWE-805'
         if complete and any(s.patch_id != 0 or s.is_CWE805 != expected_cwe
-                            or (expected_cwe and len(s.stack) != runner.brcache_stack_size)
+                            or len(s.stack) != runner.brcache_stack_size
                             for s in snapshots):
             complete, error = False, 'capture-family-or-stack-mismatch'
         digest = hashlib.sha256(raw or b'').hexdigest()

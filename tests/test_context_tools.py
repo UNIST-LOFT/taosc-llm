@@ -12,16 +12,17 @@ from taosc_llm.dataset import load_dataset
 
 
 def make_dataset(root, *, count=2, patch_format="ERM generic", binradar_run=None,
-                 concrete_run="/private/source-run", destination=4097):
+                 concrete_run="/private/source-run", destination=4097, stack=b""):
     root.mkdir(parents=True, exist_ok=True)
     workdir = root / "workdir"
     workdir.mkdir()
-    payloads = {"config.env": b"BINARY=fixture\nTEST_CMD=./fixture @@\n", "fixture.orig": b"harmless fixture identity",
+    payloads = {"config.env": f"BINARY=fixture\nTEST_CMD=./fixture @@\nBRCACHE_STACK_SIZE={len(stack)}\n".encode(),
+                "fixture.orig": b"harmless fixture identity",
                 "fixture.brcached": b"harmless cached identity", "patch-format": patch_format.encode(),
                 "patch-location": b"1000", "patch-destination": f"{destination:x}".encode()}
     cwe805 = patch_format == "ERM CWE-805"
     if cwe805:
-        payloads["stack-size"] = b"0\n"
+        payloads["stack-size"] = f"{len(stack)}\n".encode()
     artifacts = {}
     for name, data in payloads.items():
         path = workdir / name
@@ -61,9 +62,9 @@ def make_dataset(root, *, count=2, patch_format="ERM generic", binradar_run=None
             analysis_records.append({**record, "sha256": digest(path.read_bytes())})
     capture = root / "state.brch"
     capture.write_bytes(predicates.CACHED_SNAPSHOT_HEADER.pack(
-        predicates.CACHED_SNAPSHOT_MAGIC, 1, 0, 0, 0, 2 if cwe805 else 0)
+        predicates.CACHED_SNAPSHOT_MAGIC, 2, 0, 0, len(stack), 2 if cwe805 else 0)
         + (b"\0" * predicates.CACHED_SNAPSHOT_CLAMPS.size if cwe805 else b"")
-        + predicates.CACHED_SNAPSHOT_REGS.pack((1 << 64) - 3, *([0] * 15)))
+        + predicates.CACHED_SNAPSHOT_REGS.pack((1 << 64) - 3, *([0] * 15)) + stack)
     cases = []
     for index in range(count):
         cases.append({"id": f"function:{index}", "domain": "function", "input_path": None, "input_sha256": None,
@@ -260,6 +261,20 @@ def test_evaluated_state_ids_cannot_cross_result_boundaries(context):
     assert selected["state"]["registers"]["rax"] == "-3"
     assert query(context, "get_case", case_id="function:0", result_id=second["result_id"],
                  state_id=state_id)["error"]["code"] == "out_of_scope"
+
+
+@pytest.mark.parametrize("family", ["ERM generic", "ERM CWE-805"])
+def test_only_cwe_stack_is_projected_to_model(tmp_path, family):
+    stack = b"\x00\xff\x80\x11"
+    dataset = make_dataset(tmp_path / "dataset", patch_format=family, stack=stack)
+    assert dataset.snapshots(dataset.case("function:0")["capture"])[0].stack == stack
+    context = prepare_context(dataset)
+    states = query(context, "get_case", case_id="function:0")
+    state = states["states"]["items"][0]
+    detail = query(context, "get_case", case_id="function:0", state_id=state["state_id"])
+    expected = stack if family == "ERM CWE-805" else b""
+    assert state.get("stack_bytes", 0) == len(expected)
+    assert detail["stack"] == {"hex": expected.hex(), "byte_offset": 0, "total_bytes": len(expected)}
 
 
 def test_unavailable_result_capture_rejects_state_and_cursor(context):

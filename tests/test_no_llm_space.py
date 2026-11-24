@@ -186,6 +186,21 @@ def test_equal_predictive_states_retain_atoms_and_prediction_cache(monkeypatch):
     assert space.branch_membership(program) is membership
 
 
+@pytest.mark.parametrize("family,clamps,expression,after", [
+    (GENERIC, (), "rax < 0", 0),
+    (CWE, ((100, 110),), "1 * ((uint8_t *)s->rsp)[0] < i->end - i->begin", 1),
+])
+def test_only_cwe_stack_changes_affect_predictive_revision(family, clamps, expression, after):
+    row = snapshot(clamps=clamps, stack=b"\x09")
+    space = Space(family, {"case": [row]}, SearchLimits())
+    program = ((expression,),)
+    assert space.predict(program) == {"case": (0,)}
+    revision = space.revision
+    space.update({"case": [replace(row, stack=b"\x0a")]})
+    assert space.revision == revision + (family == CWE)
+    assert space.predict(program) == {"case": (after,)}
+
+
 def test_branch_membership_matches_vector_sets_through_revision():
     zero, one, two = (snapshot(rax=value) for value in range(3))
     mixed = (zero, one, two, zero)

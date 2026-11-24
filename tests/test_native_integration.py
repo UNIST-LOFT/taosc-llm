@@ -349,7 +349,7 @@ def test_real_cached_zero_runs_through_execution_worker(tmp_path):
     metadata = build_cached_fixture(workdir, PredicateFamily.GENERIC_ERM)
     settings = {'BINARY': 'fixture', 'PATCH_LOC': f'0x{location:x}',
                 'TEST_CMD': '@@', 'BINRADAR_PATCH_KIND': 'generic-erm',
-                'BINRADAR_QEMU_EXEC_TIMEOUT': '5'}
+                'BRCACHE_STACK_SIZE': '8', 'BINRADAR_QEMU_EXEC_TIMEOUT': '5'}
     binradar_utils.set_e9_metadata(settings, 'brcached',
                                   metadata.exclude_ranges_str(), metadata.relocated_calls_str())
     manifest = {'patch': {'location': location, 'destination': 0}, 'artifacts': {
@@ -373,6 +373,7 @@ def test_real_cached_zero_runs_through_execution_worker(tmp_path):
         assert result['outcome']['outcome'] == 'normal'
         snapshots, error = parse_cached_snapshots(Path(result['path']).read_bytes())
         assert error is None and [state.branch for state in snapshots] == [branch]
+        assert len(snapshots[0].stack) == 8
 
 
 def test_manual_cli_publishes_evaluated_runtime_and_replays_held_out_inputs(tmp_path, capfd):

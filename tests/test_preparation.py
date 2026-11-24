@@ -16,7 +16,7 @@ from taosc_llm.dataset import canonical, load_dataset, sha256
 from taosc_llm.preparation import prepare_dataset
 
 
-def preparation_inputs(tmp_path, patch_format="ERM generic"):
+def preparation_inputs(tmp_path, patch_format="ERM generic", *, stack_size=None):
     """Build real setup inputs without running a program or manufacturing a manifest."""
     work = tmp_path / "work"
     run = tmp_path / "concrete"
@@ -40,11 +40,14 @@ def preparation_inputs(tmp_path, patch_format="ERM generic"):
     config = tmp_path / "config.env"
     config.write_text("BINARY=fixture\nTEST_CMD=@@\nPOC_INPUT=poc\n")
     (work / "generate-concrete.env").write_text(config.read_text())
-    (work / "generate-binradar.env").write_text(config.read_text())
+    if stack_size is None:
+        stack_size = 8 if patch_format == "ERM CWE-805" else 0
+    (work / "stack-size").write_text(f"{stack_size}\n")
+    (work / "generate-binradar.env").write_text(
+        config.read_text() + f"BRCACHE_STACK_SIZE={stack_size}\n")
     kind = "generic-erm" if patch_format == "ERM generic" else "CWE805-erm"
     (work / "brpatches.json").write_text(json.dumps({"version": 1, "kind": kind, "predicates": []}))
     if patch_format == "ERM CWE-805":
-        (work / "stack-size").write_text("8\n")
         (work / "trace").mkdir()
         (work / "trace/malloc.calls").write_text(f"0 {address:x}\n")
         (work / "trace/malloc.returns").write_text(f"{address + 1:x}\n")
@@ -186,10 +189,12 @@ def mutation_inputs(tmp_path, work, *, torn=False, oracle=True, unknown=False,
     (run / "binradar.br").write_bytes(evidence + (second[:-2] if torn else second))
     stem = "iteration-00000002-patch-00000000"
     cwe = (work / "patch-format").read_text().strip() == "ERM CWE-805"
-    payload = predicates.CACHED_SNAPSHOT_HEADER.pack(predicates.CACHED_SNAPSHOT_MAGIC, 1, 0, 0, 8 if cwe else 0, 2 if cwe else 0)
+    stack_size = int((work / "stack-size").read_text())
+    payload = predicates.CACHED_SNAPSHOT_HEADER.pack(
+        predicates.CACHED_SNAPSHOT_MAGIC, 2, 0, 0, stack_size, 2 if cwe else 0)
     if cwe:
         payload += b"\0" * predicates.CACHED_SNAPSHOT_CLAMPS.size
-    payload += b"\0" * predicates.CACHED_SNAPSHOT_REGS.size + (b"\0" * 8 if cwe else b"")
+    payload += b"\0" * predicates.CACHED_SNAPSHOT_REGS.size + bytes(range(stack_size))
     (directory / f"{stem}.brch").write_bytes(payload)
     valid = str(oracle).lower()
     source = "guest-signal" if oracle else "unavailable"
@@ -206,16 +211,36 @@ def mutation_inputs(tmp_path, work, *, torn=False, oracle=True, unknown=False,
     return run
 
 
-@pytest.mark.parametrize("family", ["ERM generic", "ERM CWE-805"])
-def test_imports_committed_mutation_and_typed_oracle(tmp_path, family):
-    config, work, concrete = preparation_inputs(tmp_path, family)
+@pytest.mark.parametrize("family,stack_size", [
+    ("ERM generic", 0), ("ERM generic", 4), ("ERM CWE-805", 8),
+])
+def test_imports_committed_mutation_and_typed_oracle(tmp_path, family, stack_size):
+    config, work, concrete = preparation_inputs(tmp_path, family, stack_size=stack_size)
     mutation = mutation_inputs(tmp_path, work)
     dataset = prepare_dataset(config, work, concrete, mutation, output=tmp_path / "dataset")
     capture = dataset.case("function:2")["capture"]
     assert capture["same_crash"] is True
     assert capture["branches"] == [0]
-    assert len(dataset.snapshots(capture)) == 1
+    assert [state.stack for state in dataset.snapshots(capture)] == [bytes(range(stack_size))]
     assert dataset.manifest["oracles"]["mutation_reference"]["address"] == 0x1234
+
+
+def test_prepared_generic_capture_rejects_wrong_stack_size(tmp_path):
+    from taosc_llm.evaluation import _snapshots
+
+    config, work, concrete = preparation_inputs(tmp_path, stack_size=4)
+    mutation = mutation_inputs(tmp_path, work)
+    dataset = prepare_dataset(config, work, concrete, mutation, output=tmp_path / "dataset")
+    capture = dataset.case("function:2")["capture"]
+    payload = bytearray((dataset.root / capture["path"]).read_bytes()[:-1])
+    struct.pack_into("<Q", payload, 16, 3)
+    path = dataset.root / "wrong-stack.brch"
+    path.write_bytes(payload)
+    changed = {**capture, "sha256": sha256(path)}
+    with pytest.raises(ValueError, match="capture family/stack mismatch"):
+        dataset.snapshots({**changed, "path": path.name})
+    with pytest.raises(ValueError, match="capture-family-or-stack-mismatch"):
+        _snapshots(dataset, {**changed, "path": str(path)})
 
 
 @pytest.mark.parametrize("oracle", [False, True])

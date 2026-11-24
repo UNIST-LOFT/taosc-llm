@@ -109,7 +109,7 @@ class FakeServer:
         clamps = (100).to_bytes(8, "little") + (200).to_bytes(8, "little") + b"\0" * (predicates.CACHED_SNAPSHOT_CLAMPS.size - 16)
         def state(branch):
             return (predicates.CACHED_SNAPSHOT_HEADER.pack(
-                predicates.CACHED_SNAPSHOT_MAGIC, 1, 1, branch, 0, 2 if cwe else 0)
+                predicates.CACHED_SNAPSHOT_MAGIC, 2, 1, branch, 0, 2 if cwe else 0)
                 + (clamps if cwe else b"")
                 + registers)
         snapshots, error = predicates.parse_cached_snapshots(state(0))
@@ -891,7 +891,7 @@ def capture_row(dataset, run_dir, *, branches=(1, 1), selector=1,
             "s->rbx >= i->begin && s->rbx < i->end" if cwe else "rax < 0").descriptor
     payload = b"".join(
         predicates.CACHED_SNAPSHOT_HEADER.pack(
-            predicates.CACHED_SNAPSHOT_MAGIC, 1, selector, branch, 0, 2 if cwe else 0)
+            predicates.CACHED_SNAPSHOT_MAGIC, 2, selector, branch, 0, 2 if cwe else 0)
         + ((100).to_bytes(8, "little") + (200).to_bytes(8, "little")
            + b"\0" * (predicates.CACHED_SNAPSHOT_CLAMPS.size - 16) if cwe else b"")
         + predicates.CACHED_SNAPSHOT_REGS.pack(150 if cwe else (1 << 64) - 3, *([0] * 15))

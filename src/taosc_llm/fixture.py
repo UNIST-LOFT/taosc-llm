@@ -101,6 +101,7 @@ def prepare_fixture(directory: Path, *, pie: bool = False, rea: str | None = Non
     (workdir / "patch-location").write_text(f"{addresses['patch_site']:x}\n")
     (workdir / "patch-destination").write_text(f"{addresses['error_handler']:x}\n")
     (workdir / "patch-format").write_text("ERM generic\n")
+    (workdir / "stack-size").write_text("0\n")
     (workdir / "poc").mkdir()
     (workdir / "poc/input").write_text("-7\n")
     config = directory / "config.env"

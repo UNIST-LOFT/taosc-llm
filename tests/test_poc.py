@@ -31,7 +31,7 @@ def prepared(root, *, family='ERM generic', matches=(), recorded=True, captured=
                'observation': ORIGINAL if recorded else None, 'capture': None}
         if captured is True or (isinstance(captured, tuple) and number in captured):
             raw = (predicates.CACHED_SNAPSHOT_HEADER.pack(
-                predicates.CACHED_SNAPSHOT_MAGIC, 1, 0, 0, 0, 2 if family == 'ERM CWE-805' else 0)
+                predicates.CACHED_SNAPSHOT_MAGIC, 2, 0, 0, 0, 2 if family == 'ERM CWE-805' else 0)
                 + (b'\0' * predicates.CACHED_SNAPSHOT_CLAMPS.size if family == 'ERM CWE-805' else b'')
                 + predicates.CACHED_SNAPSHOT_REGS.pack(17, *([0] * 15)))
             state = root / 'poc.brch'
@@ -164,7 +164,7 @@ def test_absent_poc_fresh_capture_is_reused_and_candidate_evaluated(tmp_path, mo
         assert (ds.root / case['input_path']).read_bytes() == ds.artifact('poc').read_bytes()
         branch = 0 if descriptor == 'p0' else 1
         raw = (predicates.CACHED_SNAPSHOT_HEADER.pack(
-            predicates.CACHED_SNAPSHOT_MAGIC, 1, 0, branch, 0, 2 if family == 'ERM CWE-805' else 0)
+            predicates.CACHED_SNAPSHOT_MAGIC, 2, 0, branch, 0, 2 if family == 'ERM CWE-805' else 0)
             + (b'\0' * predicates.CACHED_SNAPSHOT_CLAMPS.size if family == 'ERM CWE-805' else b'')
             + predicates.CACHED_SNAPSHOT_REGS.pack(17, *([0] * 15)))
         directory.mkdir(parents=True, exist_ok=True)

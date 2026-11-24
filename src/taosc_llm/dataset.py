@@ -180,7 +180,7 @@ class PreparedDataset:
             raise ValueError("capture branch vector mismatch")
         cwe805 = self.patch_format == "ERM CWE-805"
         stack = int(self.execution_environment().get("BRCACHE_STACK_SIZE", "0"), 0)
-        if any(item.is_CWE805 != cwe805 or len(item.stack) != (stack if cwe805 else 0)
+        if any(item.is_CWE805 != cwe805 or len(item.stack) != stack
                for item in snapshots):
             raise ValueError("capture family/stack mismatch")
         if not isinstance(capture.get("descriptor"), str) or not capture["descriptor"]:
@@ -265,7 +265,7 @@ class PreparedDataset:
                 raise ValueError("capture and family stack sizes disagree")
             result["BRCACHE_STACK_SIZE"] = stack_text
         stack = int(result.get("BRCACHE_STACK_SIZE", "0"), 0)
-        if not 0 <= stack <= 0x100000:
+        if not 0 <= stack <= predicates.CACHED_SNAPSHOT_MAX_STACK_SIZE:
             raise ValueError("invalid capture stack size")
         return result
 

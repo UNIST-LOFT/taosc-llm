@@ -181,7 +181,7 @@ def _read_validated_snapshots(dataset, capture, metadata):
     if any(state.patch_id != expected_id for state in snapshots):
         raise ValueError('capture-id-mismatch')
     if any(s.is_CWE805 != metadata.cwe
-           or (metadata.cwe and len(s.stack) != metadata.stack_bytes) for s in snapshots):
+           or len(s.stack) != metadata.stack_bytes for s in snapshots):
         raise ValueError('capture-family-or-stack-mismatch')
     return snapshots
 

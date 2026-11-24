@@ -222,7 +222,7 @@ def _case_detail(context, dataset, args):
                                for name, position in predicates.REGISTER_TO_VAR.items()}}
         if state.clamps:
             value["clamps"] = [[str(begin), str(end)] for begin, end in state.clamps]
-        if state.stack:
+        if state.is_CWE805 and state.stack:
             value["stack_bytes"] = len(state.stack)
         return value
 
@@ -238,13 +238,14 @@ def _case_detail(context, dataset, args):
     if index >= len(states) or state_id != prefix + str(index):
         raise ToolError("out_of_scope", "state does not belong to this observation")
     state = states[index]
+    stack = state.stack if state.is_CWE805 else b""
     offset = _offset(context, "stack:" + state_id, args.get("cursor"))
-    if offset >= len(state.stack) and offset:
+    if offset >= len(stack) and offset:
         raise ToolError("invalid_cursor", "cursor outside captured stack")
-    end = min(offset + 4096, len(state.stack))
+    end = min(offset + 4096, len(stack))
     result["state"] = project(index)
-    result["stack"] = {"hex": state.stack[offset:end].hex(), "byte_offset": offset, "total_bytes": len(state.stack)}
-    if end < len(state.stack):
+    result["stack"] = {"hex": stack[offset:end].hex(), "byte_offset": offset, "total_bytes": len(stack)}
+    if end < len(stack):
         result["stack"]["next_cursor"] = _cursor(context, "stack:" + state_id, end)
     return result
 

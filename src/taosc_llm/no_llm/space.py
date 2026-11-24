@@ -337,6 +337,7 @@ class Space:
     def update(self, snapshots_by_case: dict[str, list[predicates.CachedSnapshot]]) -> None:
         """Add/replace cases; retain caches only for identical prediction inputs."""
         updated = dict(self._snapshots)
+        cwe = self.patch_format == "ERM CWE-805"
         changed = False
         for case, rows in snapshots_by_case.items():
             if self._check is not None:
@@ -348,11 +349,10 @@ class Space:
                 for index, (old, new) in enumerate(zip(prior, rows)):
                     if self._check is not None and index % 256 == 0:
                         self._check()
-                    # Captured branch/id authenticate outcomes, but are not
-                    # inputs to prediction. A new descriptor alone is not a
-                    # new predictive frontier.
+                    # Branch/id and generic stack bytes are evidence, not
+                    # inputs to prediction, and do not reopen the frontier.
                     if (old.registers != new.registers or old.clamps != new.clamps
-                            or old.stack != new.stack):
+                            or (cwe and old.stack != new.stack)):
                         same = False
                         break
             if not same:
