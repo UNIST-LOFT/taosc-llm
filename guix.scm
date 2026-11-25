@@ -102,6 +102,19 @@ This package supplies SDK imports, not npm CLI executable shims.")
 ;; preparation/patch-stage contract from this same checkout.
 (define local-taosc taosc)
 
+(define local-stacktrace
+  (package
+    (inherit aflplusplus-for-binradar-stacktrace)
+    (arguments
+     (substitute-keyword-arguments
+         (package-arguments aflplusplus-for-binradar-stacktrace)
+       ((#:phases phases)
+        #~(modify-phases #$phases
+            (add-after 'install 'install-observer-qasan-sibling
+              (lambda _
+                (symlink "../lib/afl/libqasan.so"
+                         (string-append #$output "/bin/libqasan.so"))))))))))
+
 ;; The pinned Loftix package supplies the native dependency closure, but this
 ;; stage uses the current checkout's parser, metadata API and runtime resources.
 ;; Its Python inputs must propagate: BinRadar normally wraps only its own CLIs.
@@ -132,6 +145,15 @@ This package supplies SDK imports, not npm CLI executable shims.")
             (add-after 'patch-paths 'patch-current-resource-paths
               (lambda _
                 (substitute* "binradar/paths.py"
+                  ;; Inherited gexps retain the parent's this-package-input.
+                  ;; Bind the sibling-library dependency explicitly in the local phase.
+                  (("^QASAN_QEMU_BIN = .*\n")
+                   (string-append "QASAN_QEMU_BIN = \"" #$local-stacktrace
+                                  "/bin/afl-qemu-trace\"\n"))
+                  ;; The upstream phase inlines e9tool()/e9compile() returns.
+                  ;; Retain current Python's explicit executable overrides.
+                  (("return \"[^\"]+/bin/(e9tool|e9compile)\"" _ name)
+                   (string-append "return _e9_executable(\"" name "\")"))
                   (("^BRPATCH_SOURCE = .*\n")
                    (string-append "BRPATCH_SOURCE = Path(\"" #$output
                                   "/share/binradar/brpatch.c\")\n"))
@@ -146,6 +168,9 @@ This package supplies SDK imports, not npm CLI executable shims.")
                               (string-append #$output "/share/binradar"))
                 (install-file "benchmarks/loftix/brpatch-cached.c"
                               (string-append #$output "/share/binradar"))))))))
+    (inputs
+     (modify-inputs (package-inputs binradar)
+       (replace "aflplusplus-for-binradar-stacktrace" local-stacktrace)))
     (propagated-inputs
      (append (package-propagated-inputs binradar)
              (filter (lambda (input)
@@ -183,6 +208,8 @@ This package supplies SDK imports, not npm CLI executable shims.")
                                    ,(string-append #$e9patch "/bin")
                                    ,(string-append #$local-taosc "/bin")
                                    ,(string-append #$coreutils "/bin")
+                                   ,(string-append #$grep "/bin")
+                                   ,(string-append #$sed "/bin")
                                    ,(string-append #$bash-minimal "/bin")
                                    ,(string-append #$analysis-node "/bin")
                                    ,(string-append #$analysis-jdk "/bin")
@@ -202,7 +229,7 @@ This package supplies SDK imports, not npm CLI executable shims.")
                     "taosc-llm-setup" "taosc-llm-evaluate" "taosc-llm-fixture")))))))
   (inputs (list local-taosc analysis-node pi-sdk rea-runtime ghidra-runtime
                 `(,openjdk21 "jdk") gcc-toolchain binutils e9patch
-                coreutils bash-minimal))
+                coreutils grep sed bash-minimal))
   (native-inputs (list python-setuptools python-pytest gcc-toolchain e9patch))
   (propagated-inputs (list local-binradar))
   (supported-systems '("x86_64-linux"))

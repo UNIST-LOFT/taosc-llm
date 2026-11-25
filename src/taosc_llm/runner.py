@@ -481,10 +481,30 @@ class Experiment:
             "verified", "binradar_verification") if key in result}
         return 0
 
-    def verify_single(self, selection: dict) -> int:
+    def _observe_single_final(self) -> dict | None:
+        """Retain actual FINAL evidence without promoting incomplete execution."""
         from binradar.binradar_collect_results import (
             parse_final_coverage, parse_final_sbsv, parse_sbsv_line,
         )
+        from .dataset import sha256
+
+        verification = self.record["verification"]
+        final = Path(verification["run_directory"]) / "final.sbsv"
+        if not final.is_file():
+            return None
+        verification.update(final_observed=True, final_result=str(final),
+                            final_sha256=sha256(final))
+        done = None
+        for line in final.read_text().splitlines():
+            row = parse_sbsv_line(line)
+            if row and row.get("_phase") == "final" and row.get("_action") == "done":
+                done = row
+        verifier, mutation, _ = parse_final_sbsv(str(final))
+        verification.update(verifier=verifier.get(1), binradar=mutation.get(1, {}).get("res"),
+                            coverage=parse_final_coverage(str(final)))
+        return done
+
+    def verify_single(self, selection: dict) -> int:
         from binradar.binradar_setup import load_env
         from .dataset import sha256
 
@@ -503,7 +523,7 @@ class Experiment:
         # Every attempt gets fresh scratch, including resumed verification.
         for artifact in selection["artifacts"].values():
             relative = Path(artifact["path"])
-            if relative.parts[0] in ("out", "trials"):
+            if relative.parts[0] in ("out", "trials", "concrete"):
                 continue
             target = private / relative
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -541,23 +561,14 @@ class Experiment:
             if args.binradar_representative_budget is not None:
                 command.extend(("--binradar-representative-budget", str(args.binradar_representative_budget)))
             self.stage("single-verification", command, cwd=private, structured=False)
-            final = output / "final.sbsv"
-            if not final.is_file():
+            done = self._observe_single_final()
+            if not verification["final_observed"]:
                 raise StageFailure("ordinary BinRadar returned without final.sbsv; verification is unavailable")
-            done = None
-            for line in final.read_text().splitlines():
-                row = parse_sbsv_line(line)
-                if row and row.get("_phase") == "final" and row.get("_action") == "done":
-                    done = row
             if done is None:
                 raise StageFailure("ordinary BinRadar has no completed FINAL record")
-            verifier, mutation, _ = parse_final_sbsv(str(final))
-            coverage = parse_final_coverage(str(final))
-            concrete_verdict = verifier.get(1)
-            mutation_verdict = mutation.get(1, {}).get("res")
-            verification.update(final_observed=True, final_result=str(final),
-                                final_sha256=sha256(final), verifier=concrete_verdict,
-                                binradar=mutation_verdict, coverage=coverage)
+            concrete_verdict = verification["verifier"]
+            mutation_verdict = verification["binradar"]
+            coverage = verification["coverage"]
             if done.get("issues") == "true":
                 raise StageFailure("ordinary BinRadar FINAL reports failed evidence phases")
             if concrete_verdict not in ("verified", "rejected"):
@@ -574,7 +585,7 @@ class Experiment:
             self.record.update(verified=status == "verified", binradar_verification=status)
             self.persist()
             return 0
-        except (OSError, ValueError, RuntimeError, KeyboardInterrupt):
+        except (OSError, ValueError, RuntimeError, RunnerTimeout, RunnerInterrupted, KeyboardInterrupt):
             verification["status"] = "failed"
             self.record.update(verified=False, binradar_verification="failed")
             self.persist()
@@ -663,6 +674,14 @@ def _execute(args, root, record, *, held_fds=()) -> int:
     record["exit_code"] = code
     record["updated_at"] = time.time()
     if experiment is not None:
+        verification = record.get("verification")
+        if isinstance(verification, dict) and verification.get("status") == "failed":
+            # Observe only after owned children have stopped, including graceful
+            # shutdown output. Their partial FINAL never establishes success.
+            try:
+                experiment._observe_single_final()
+            except (OSError, ValueError, RuntimeError) as error:
+                verification["final_error"] = str(error)
         if experiment.supervisor.cleanup_error:
             record["cleanup_error"] = experiment.supervisor.cleanup_error
         experiment.attempt.update(ended_at=time.time(), exit_code=code, status=record["status"])

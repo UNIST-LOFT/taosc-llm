@@ -2,13 +2,11 @@
 
 The compatibility tracer writes control records to stderr, not stdout. Its guest
 exit syscalls preserve the guest's low-byte exit status; a nonzero *normal* exit
-is not an infrastructure failure. Stderr mixes guest and tracer diagnostics and
-is deliberately never used as a functional-output signature. Signatures cover
-only exit status and exact stdout bytes, not files, stderr or external effects.
+is not an infrastructure failure. Observations authenticate the acknowledged
+outcome and available branch capture, not target output or external effects.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import os
@@ -108,16 +106,15 @@ class _FixedRunner(_PrivateRunner):
 
 
 def _capture(runner, artifact: str, patch_id: int, environment: dict,
-             work: Path) -> tuple[object, bytes, dict | None]:
-    """Own the process session and raw output; never parse wrapper exit as proof."""
+             work: Path) -> tuple[object, bytes]:
+    """Own the process session and diagnostics; require a guest acknowledgment."""
     command = runner.get_qemu_stacktrace_command_for_binary(artifact, '.observation-input')
     process = None
-    with tempfile.TemporaryFile(dir=work) as output, tempfile.TemporaryFile(dir=work) as errors, \
-            tempfile.TemporaryFile(dir=work) as patch:
+    with tempfile.TemporaryFile(dir=work) as errors, tempfile.TemporaryFile(dir=work) as patch:
         settings = dict(environment, PATCH_FD=str(patch.fileno()))
         try:
             process = subprocess.Popen(command, cwd=work, env=settings,
-                                       stdin=subprocess.DEVNULL, stdout=output,
+                                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                        stderr=errors, pass_fds=(patch.fileno(),),
                                        start_new_session=True)
             PROCESS_REGISTRY.register(process)
@@ -157,16 +154,9 @@ def _capture(runner, artifact: str, patch_id: int, environment: dict,
                 or probe.concrete_oracle != verifier.CONCRETE_ORACLE):
             raise ExecutionUnavailable('qasan-outcome-unavailable')
         runner._normalize_probe(probe, str(work / artifact))
-        signature = None
-        if probe.exit_info == 'ok':
-            output.seek(0)
-            digest, size = hashlib.sha256(), 0
-            for chunk in iter(lambda: output.read(1024 * 1024), b''):
-                digest.update(chunk)
-                size += len(chunk)
-            signature = {'exit_code': status, 'stdout_sha256': digest.hexdigest(),
-                         'stdout_size': size}
-        return probe, text, signature
+        if probe.exit_info == 'crash' and probe.concrete_fault_addr is None:
+            raise ExecutionUnavailable('qasan-crash-identity-unavailable')
+        return probe, text
 
 
 def _branches(text: bytes, patch_id: int, hits: int) -> list[int] | None:
@@ -197,10 +187,9 @@ def observe(workdir: Path, environment: dict, input_path: Path, *, artifact: str
     artifacts require their own e9tool .json; extraction produces a fresh bound
     .e9map.json privately, never borrowing persisted execution environments.
 
-    ``normal_signature`` is exact stdout plus actual normal exit status, not
-    general functional equivalence. ``branches=None`` means the artifact has no
-    branch channel; it is not fabricated branch preservation. Infrastructure,
-    missing acknowledgment, timeout and changing source bytes fail closed.
+    ``branches=None`` means the artifact has no complete branch channel; it is
+    not fabricated branch preservation. Infrastructure, missing acknowledgment,
+    timeout and changing source bytes fail closed.
     """
     try:
         settings = {name: environment[name] for name in (
@@ -251,14 +240,21 @@ def observe(workdir: Path, environment: dict, input_path: Path, *, artifact: str
                 runner.observed_metadata = _metadata(
                     work, artifact, original, int(location, 16), runner.exec_timeout)
                 runner.load_instruction_map(str(work / artifact))
+            # CWE-823 initializes its output before the patch selector and
+            # proc maps. Supply an owned capability even when no snapshots are
+            # requested; never inherit TAOSC_OUTPUT or write into the source.
+            output_path = work / '.observation-output'
+            descriptor = os.open(output_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.close(descriptor)
             native = native_environment()
             native.update(HOME=str(work), TMPDIR=str(work), LC_ALL='C',
                           AFL_PATH=str(Path(paths.QASAN_QEMU_BIN).resolve().parent),
-                          AFL_USE_QASAN='1', PATCH_ID=str(patch_id))
+                          AFL_USE_QASAN='1', PATCH_ID=str(patch_id),
+                          TAOSC_OUTPUT=str(output_path))
             ranges, _ = runner.e9_metadata_for_binary(str(work / artifact))
             if ranges:
                 native['AFL_QEMU_INST_RANGES'] = ranges
-            probe, text, signature = _capture(runner, artifact, patch_id, native, work)
+            probe, text = _capture(runner, artifact, patch_id, native, work)
             if probe.patch_loc != int(location, 16) or type(probe.patch_hit_cnt) is not int or probe.patch_hit_cnt < 0:
                 raise ExecutionUnavailable('probe-site-or-hit-mismatch')
             branches = _branches(text, patch_id, probe.patch_hit_cnt) if artifact != original else None
@@ -271,8 +267,7 @@ def observe(workdir: Path, environment: dict, input_path: Path, *, artifact: str
                 raise ExecutionUnavailable('executed-input-changed')
             return {'artifact_sha256': originals[artifact], 'input_sha256': input_hash,
                     'outcome': concrete_result(probe), 'patch_hits': probe.patch_hit_cnt,
-                    'probe': probe.serialize(), 'branches': branches,
-                    'normal_signature': signature}
+                    'probe': probe.serialize(), 'branches': branches}
     except ExecutionUnavailable:
         raise
     except (OSError, ValueError, TypeError, KeyError, RuntimeError,

@@ -567,6 +567,7 @@ def test_fixed_single_collection_keeps_publication_separate_from_verification(
                             "verification": {"status": status, "final_observed": final}})
     row = collect(root)
     assert row["collection_error"] is None
+    assert row["mode"] == "single"
     assert row["predicate"] is None and row["publication_status"] == "published"
     assert row["artifact_kind"] == "single-patch" and row["patch_format"] == "Single CWE-617"
     assert row["artifact_path"] == str(workdir / "fixture.brpatched")
@@ -576,6 +577,35 @@ def test_fixed_single_collection_keeps_publication_separate_from_verification(
     assert row["final_observed"] is final and row["final_admission"] == "fixed-artifact"
     assert row["target_status"] == "not_observed" and row["candidate_total"] is None
     assert row["evaluation_source"] == str(workdir / "evaluation.json")
+
+
+@pytest.mark.parametrize("requested_mode", ["no-llm", "manual", "provider"])
+@pytest.mark.parametrize("collected_mode", ["single", "no-llm", "manual", "provider"])
+def test_single_runner_cli_filters_actual_artifact_not_requested_synthesis_mode(
+        tmp_path, requested_mode, collected_mode):
+    workdir = tmp_path / "selected"
+    selected = selected_single(workdir)
+    root = tmp_path / "run"
+    record = {"engine": "taosc-llm-run", "mode": requested_mode,
+              "status": "interrupted", "exit_code": 130,
+              "patch_selection": selected, "selection_workdir": str(workdir),
+              "publication": selected["publication"], "publication_status": "published",
+              "verified": False, "binradar_verification": "failed",
+              "verification": {"status": "failed", "final_observed": False}}
+    save(root / "run.json", record)
+    before = (root / "run.json").read_bytes()
+    output = tmp_path / "collected.json"
+    assert main(["--run-dir", str(root), "--mode", collected_mode,
+                 "--format", "json", "--output", str(output)]) == 0
+    rows = json.loads(output.read_text())["rows"]
+    if collected_mode == "single":
+        assert len(rows) == 1
+        assert rows[0]["mode"] == "single" and rows[0]["selection"] == "single"
+        assert rows[0]["lifecycle"] == "interrupted"
+        assert rows[0]["verified"] is False and rows[0]["verification_status"] == "failed"
+    else:
+        assert rows == []
+    assert (root / "run.json").read_bytes() == before
 
 
 def test_selected_single_without_runner_is_not_an_unsupported_or_verified_run(tmp_path):
@@ -591,6 +621,10 @@ def test_selected_single_without_runner_is_not_an_unsupported_or_verified_run(tm
     assert row["mode"] == "single" and row["publication_status"] == "published"
     assert row["verified"] is False and row["binradar_verification"] == "not_run"
     assert row["final_observed"] is False and row["predicate"] is None
+    output = tmp_path / "collected.json"
+    assert main(["--exp", str(exp), "--workdir", "workdir-patch", "--mode", "single",
+                 "--format", "json", "--output", str(output)]) == 0
+    assert json.loads(output.read_text())["rows"] == [row]
 
 
 @pytest.mark.parametrize("name", ["fixture.brpatched", "evaluation.json"])

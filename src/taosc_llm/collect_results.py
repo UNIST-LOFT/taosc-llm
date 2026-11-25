@@ -350,7 +350,7 @@ def _collect_single(row: dict, record: dict, workdir: Path) -> None:
     artifact = publication.get("artifact")
     if not isinstance(artifact, dict):
         raise ValueError("Single publication is missing its fixed artifact")
-    row.update(selection="single", artifact_kind="single-patch", publication_status="published",
+    row.update(mode="single", selection="single", artifact_kind="single-patch", publication_status="published",
                predicate=None, final_admission="fixed-artifact", artifact_sha256=artifact.get("sha256"),
                artifact_path=str(workdir / artifact.get("path", "")))
     for key in ("patch_format", "patch_location", "patch_destination"):

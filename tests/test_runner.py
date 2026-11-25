@@ -430,10 +430,19 @@ def selected_contract(tmp_path, monkeypatch):
                      f"[final] [coverage] [binradar-coverage {coverage}] [collection-complete true]\n"
                      "[final] [done] [prefix run] [id 0] [remaining_patches [1]] "
                      "[binradar_remaining_patches [1]]\n")
+            if contract.get("incomplete_final"):
+                final = final.split("[final] [done]", 1)[0]
             text = f"from pathlib import Path; p=Path({str(output)!r}); p.mkdir(); "
             if contract["outcome"] != "missing-final":
                 text += f"(p/'final.sbsv').write_text({final!r}); "
-            text += f"raise SystemExit({1 if contract['outcome'] == 'failed' else 0})"
+            if contract.get("hold_stage") != module:
+                text += f"raise SystemExit({1 if contract['outcome'] == 'failed' else 0})"
+        if contract.get("hold_stage") == module:
+            text = text.rstrip("; ") + "; import os, time; "
+            if contract.get("signal") is not None:
+                import os
+                text += f"os.kill({os.getpid()}, {contract['signal']}); "
+            text += "time.sleep(60)"
         return [sys.executable, "-c", text]
     monkeypatch.setattr(runner, "_python", command)
     return contract
@@ -463,7 +472,7 @@ def test_selected_single_all_modes_verify_without_model_or_erm_requirements(
 @pytest.mark.parametrize("outcome,code,status,final", [
     ("rejected", 0, "rejected", True), ("setup-rejected", 0, "rejected", False),
     ("partial", 0, "unavailable", True),
-    ("failed", 1, "failed", False), ("missing-final", 1, "failed", False),
+    ("failed", 1, "failed", True), ("missing-final", 1, "failed", False),
     ("changed-artifact", 1, "failed", False),
 ])
 def test_selected_single_retains_publication_without_fabricating_verification(
@@ -477,6 +486,48 @@ def test_selected_single_retains_publication_without_fabricating_verification(
     assert result["publication"] == contract["selection"]["publication"]
     assert result["publication_status"] == "published"
     assert result["status"] == ("finished" if code == 0 else "failed")
+
+
+@pytest.mark.parametrize("phase,final_kind", [
+    ("setup", None), ("verification", None),
+    ("verification", "partial"), ("verification", "complete"),
+])
+@pytest.mark.parametrize("stop", ["timeout", "sigint", "sigterm"])
+def test_selected_single_supervisory_stops_finish_verification_and_keep_actual_final(
+        tmp_path, capsys, selected_contract, phase, final_kind, stop):
+    import hashlib
+    import signal
+
+    contract = selected_contract
+    contract["hold_stage"] = "binradar.binradar_setup" if phase == "setup" else "binradar.cli"
+    contract["outcome"] = {None: "missing-final", "partial": "partial", "complete": "verified"}[final_kind]
+    contract["incomplete_final"] = final_kind == "partial"
+    if stop != "timeout":
+        contract["signal"] = signal.SIGINT if stop == "sigint" else signal.SIGTERM
+    code = 124 if stop == "timeout" else 128 + contract["signal"]
+    lifecycle = "timed-out" if stop == "timeout" else "interrupted"
+    output = tmp_path / "run"
+    assert main(arguments(contract["subject"], contract["workdir"], output) + [
+        "--stage-timeout", "1", "--graceful-timeout", "0.1"]) == code
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == lifecycle and result["exit_code"] == code
+    assert result["verified"] is False and result["binradar_verification"] == "failed"
+    verification = result["verification"]
+    assert verification["status"] == "failed"
+    assert verification["final_observed"] is (final_kind is not None)
+    assert result["publication"] == contract["selection"]["publication"]
+    assert result["publication_status"] == "published"
+    assert result["attempts"][-1]["status"] == lifecycle
+    assert result["attempts"][-1]["stages"][-1]["status"] == lifecycle
+    if final_kind is not None:
+        final = Path(verification["final_result"])
+        assert verification["final_sha256"] == hashlib.sha256(final.read_bytes()).hexdigest()
+        assert verification["verifier"] == verification["binradar"] == "verified"
+        assert verification["coverage"]["binradar-coverage"] == final_kind
+        assert ("[final] [done]" in final.read_text()) is (final_kind == "complete")
+    else:
+        assert "final_result" not in verification and "verifier" not in verification
+    assert json.loads((output / "run.json").read_text()) == result
 
 
 def test_selected_single_resume_reauthenticates_and_uses_fresh_scratch(

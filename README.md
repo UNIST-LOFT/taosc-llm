@@ -720,6 +720,10 @@ lifecycle even when verification failed. Single has no predicate and no invented
 cached-state candidate or neutral-capture metrics. Before a runner exists, its
 lifecycle is `selected`, never `finished` or verified. The collector rechecks the
 selected fixed artifact and evaluation hashes without running native code.
+`--mode single` includes both selected workdirs and their verification runner
+records, regardless of the runner's requested synthesis mode. Such records are
+not provider/manual/no-LLM synthesis rows; the saved runner options still retain
+the original request.
 
 ### Independent result axes
 
@@ -845,7 +849,8 @@ Default mode is `no-llm`; ERM provider calls require explicit mode and credentia
 For the Single-first workflow, publish a fresh sibling workdir, then consume it:
 
 ```sh
-uv run --project utils/taosc-llm taosc-llm-patch --subject SUBJECT --workdir X
+uv run --project utils/taosc-llm taosc-llm-patch --subject SUBJECT --workdir X \
+  --concrete-run X/out/br-gen-con-00000
 uv run --project utils/taosc-llm taosc-llm-run --subject SUBJECT --workdir X-patch
 ```
 
@@ -861,7 +866,12 @@ binary cannot inherit earlier observations. The source selection stays immutable
 
 A fixed publication and a completed verification are separate facts. Setup
 rejection, FINAL rejection, partial/unavailable evidence, and operational failure
-remain distinct. `verified=true` requires an actual completed FINAL, verified
+remain distinct. Timeout, SIGINT and SIGTERM end verification as `failed` with
+`verified=false`, while runner lifecycle/exit distinguish timeout from interruption.
+After child cleanup, an existing FINAL retains its path/hash, parsed verdicts and
+coverage even if incomplete; unreadable FINAL records `verification.final_error`.
+None of those failure records promotes verification success. `verified=true`
+requires an actual completed FINAL, verified
 concrete and mutation verdicts for candidate 1, and complete recorded mutation
 coverage. Missing FINAL is an error, never a skipped success. Selected publication
 survives later failure. Single requires a finite `--generation-timeout`; explicit
@@ -888,17 +898,20 @@ uv run --project utils/taosc-llm taosc-llm-patch --workdir X --concrete-run RUN 
   --output X-patch --timeout 900 --setup-timeout 3600 --workers 4
 ```
 
-Candidate order follows the prepared crash evidence: `Single CWE-617` for
-SIGABRT, `Single CWE-369`/`823`/`805` only at their applicable fault sites, then
-a clean `ERM generic`/`ERM CWE-805` preparation. Each Single trial is built by
+Candidate order is the initial site, then remaining captured `patch-candidates`
+sites in address order, retaining each site's own action order. `Single CWE-617`
+applies to SIGABRT; `Single CWE-369`/`823`/`805` require their applicable fault
+site. Exhaustion prepares clean `ERM generic`/`ERM CWE-805` at the initial site.
+Each Single trial is built by
 `taosc-patch-stage` in a private copy, filtered by ordinary `binradar-setup`, and
 then re-observed on every admitted concrete input. Acceptance requires:
 
-- the original executable still reaches the prepared site, and its saved
-  crash/normal outcome (and target fault) reproduces;
+- the original executable still reaches the initial collection site, and its
+  saved crash/normal outcome and exact fault reproduce for every input; only
+  the preparation's `trace/crash.address` defines a target crash;
 - a target-crashing input becomes candidate-normal with a fired repair branch,
-  or a normal input stays normal (exit status/stdout changes are diagnostic,
-  including intentional unconditional CWE-617 repair);
+  or a normal input stays normal (stdout and normal exit-code differences are
+  not collected or compared, including intentional unconditional CWE-617 repair);
 - an original crash at another site stays that same unrelated crash; a new or
   target fault rejects.
 
@@ -909,7 +922,30 @@ evidence is an **operational error** and publishes nothing; it is never treated
 as a successful Single or an exhausted search. `patch-selection.json` binds the
 source/workdir/corpus identities, trial verdicts and every published artifact by
 SHA-256; the concrete corpus must retain either the completed `done` or graceful
-`wall-time-reached` marker. Authentication rehashes artifacts and corpus rows.
+`wall-time-reached` marker plus producer-written `original-identity.json`.
+Its original binary, parsed invocation, PoC bytes and collection site must agree
+with the common preparation and subject configuration before trials begin.
+`args`, generation settings and subject config are compared using the runtime's
+`shlex.split` argument semantics; equivalent quoting/spacing is accepted, changed
+arguments or PoC bytes are not. The subject config checksum remains bound through
+publication and later authentication. A missing producer identity requires a fresh
+concrete run, not a consumer-created
+hash or relabelled old evidence. Authentication rehashes the producer identity,
+source preparation, original, source corpus, and selected artifacts. Older selections lacking `source_concrete`
+and complete `source.artifacts` must be regenerated; missing fields are not a
+compatibility fallback. Crashes without a proved nonzero fault are unavailable,
+never preserved merely because two unknown addresses compare equal.
+
+All selection paths re-observe the original on every source input, including
+ERM when no Single applies. Moving sites writes fresh positive-hit original rows
+under `concrete/` with a separate `selected-site-original-reobservation` identity,
+binds the unchanged producer identity/corpus separately, and retains nonhit
+observations in the all-input evaluation. It never relabels producer rows. This does not expand old-site sampling coverage.
+Single CWE-805 also publishes and authenticates its allocator `.calls`/`.returns`
+pair, required by downstream ordinary setup. The observer discards stdout;
+selection uses acknowledged outcomes and repair branches, not output signatures.
+CWE-823 receives a private owned `TAOSC_OUTPUT`. See the
+[native observation boundary](../../agent-docs/taosc-llm/TOOLS_AND_TRUST.md#private-concrete-runner-and-native-isolation).
 
 `taosc-llm-run` auto-detects the authenticated selection. Selected Single runs
 ordinary BinRadar setup/FINAL verification on a private copy; selected ERM
@@ -1191,9 +1227,11 @@ provider acceptance and final BinRadar verification.
 Eight installed wrappers are `taosc-llm`, `taosc-llm-run`, `taosc-llm-patch`,
 `taosc-llm-no-llm`, `taosc-llm-setup`, `taosc-llm-evaluate`, `taosc-llm-fixture`, and
 `taosc-llm-collect-results`. The Guix selector wrapper resolves native
-`taosc-prepare`/`taosc-patch-stage` through an explicitly packaged, allowlisted
-checkout Taosc backend on PATH, rather than an older ambient profile.
-Source allowlists and the wheel
+`taosc-prepare`/`taosc-patch-stage` through the checkout's patched Loftix Taosc
+package, rather than an older ambient profile. Wrapped PATH includes `grep` and
+`sed`, required by allocator tracing and stack measurement. The local BinRadar
+closure supplies the pinned QEMU and its sibling QASAN library; it does not carry
+a stdout-specific native patch. Source allowlists and the wheel
 exclude real `.env` files, credentials, workdirs, node_modules and caches. The
 wheel ships Python, `runtime.c`, prompts and adapter, not the SDK/native closure.
 Python 3.10+ is required; setup/evaluation/synthesis also require BinRadar native
