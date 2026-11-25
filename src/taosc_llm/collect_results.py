@@ -27,7 +27,9 @@ ROW_FIELDS = (
     "subject", "run", "run_directory", "mode", "lifecycle",
     "exit_code", "run_error", "synthesis_status", "selected_round", "predicate",
     "termination", "legacy_quality", "publication_status", "final_admission", "verified",
-    "binradar_verification", "evaluation_source", "collection_status", "collection_error",
+    "binradar_verification", "selection", "patch_format", "patch_location", "patch_destination",
+    "artifact_kind", "artifact_path", "artifact_sha256", "verification_status", "final_observed",
+    "evaluation_source", "collection_status", "collection_error",
 )
 COLUMNS = ROW_FIELDS + METRIC_FIELDS
 _COMPACT_COLUMNS = (
@@ -35,7 +37,7 @@ _COMPACT_COLUMNS = (
     "system_candidate_target_crashes", "function_candidate_target_crashes",
     "branch_comparable", "branch_regressions",
 )
-_MODES = ("provider", "manual", "no-llm")
+_MODES = ("provider", "manual", "no-llm", "single")
 _PAYLOAD = re.compile(r"payloads/([0-9a-f]{64})\.([A-Za-z0-9][A-Za-z0-9._-]{0,31})")
 
 
@@ -100,9 +102,9 @@ def discover_runs(exp_file: str | Path, *, workdir: str = "workdir",
             patch_format = directory / "patch-format"
             if patch_format.is_file():
                 value = patch_format.read_text(encoding="utf-8").strip()
-                if value.startswith("Single "):
+                if value.startswith("Single ") and not (directory / "patch-selection.json").is_file():
                     found.append(RunSpec(label, directory, "unsupported",
-                                         f"unsupported patch format: {value}"))
+                                         f"unbound Single patch format: {value}"))
                     continue
             output = directory / "out"
             candidates = []
@@ -115,8 +117,12 @@ def discover_runs(exp_file: str | Path, *, workdir: str = "workdir",
             if runs == "latest":
                 candidates = candidates[-1:]
             if not candidates:
-                found.append(RunSpec(label, output, "missing_runs",
-                                     f"no {run_prefix}-NUMERIC run directories: {output}"))
+                selection_path = directory / "patch-selection.json"
+                if selection_path.is_file() and _read_json(selection_path).get("selection") == "single":
+                    found.append(RunSpec(label, directory))
+                else:
+                    found.append(RunSpec(label, output, "missing_runs",
+                                         f"no {run_prefix}-NUMERIC run directories: {output}"))
             for _, _, child in candidates:
                 identity = child.resolve()
                 if identity not in seen:
@@ -311,6 +317,56 @@ def _collect_selected(row: dict, summary: dict, result_root: Path) -> None:
             row["legacy_quality"] = quality.get("status")
 
 
+def _selected_reference(root: Path, reference: dict) -> Path:
+    if not isinstance(reference, dict) or not isinstance(reference.get("path"), str):
+        raise ValueError("selected artifact requires a relative path and checksum")
+    relative = Path(reference["path"])
+    if relative.is_absolute() or not relative.parts or any(part in (".", "..") for part in relative.parts):
+        raise ValueError("unsafe selected artifact path")
+    path = root
+    for part in relative.parts:
+        path = path / part
+        if path.is_symlink():
+            raise ValueError("selected artifact path must not contain symlinks")
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    if digest.hexdigest() != reference.get("sha256"):
+        raise ValueError(f"selected artifact checksum mismatch: {path}")
+    return path
+
+
+def _collect_single(row: dict, record: dict, workdir: Path) -> None:
+    selection = record.get("patch_selection", record)
+    publication = selection.get("publication")
+    if (selection.get("schema_version") != 1 or selection.get("kind") != "single-first-selection"
+            or selection.get("status") != "selected" or selection.get("selection") != "single"
+            or not isinstance(publication, dict) or publication.get("kind") != "single-patch"
+            or publication.get("status") != "published"):
+        raise ValueError("invalid saved Single selection/publication")
+    if record.get("publication", publication) != publication:
+        raise ValueError("runner fixed publication disagrees with its selected artifact")
+    artifact = publication.get("artifact")
+    if not isinstance(artifact, dict):
+        raise ValueError("Single publication is missing its fixed artifact")
+    row.update(selection="single", artifact_kind="single-patch", publication_status="published",
+               predicate=None, final_admission="fixed-artifact", artifact_sha256=artifact.get("sha256"),
+               artifact_path=str(workdir / artifact.get("path", "")))
+    for key in ("patch_format", "patch_location", "patch_destination"):
+        row[key] = selection.get(key)
+    verification = record.get("verification", {})
+    if not isinstance(verification, dict):
+        raise ValueError("saved verification must be an object")
+    row.update(verification_status=verification.get("status", "not_run"),
+               final_observed=verification.get("final_observed", False))
+    # This is a fixed artifact, not a cached predicate with invented captures.
+    row.update(collect_metrics(None, candidate_present=True))
+    _selected_reference(workdir, artifact)
+    evaluation = _selected_reference(workdir, selection.get("evaluation"))
+    row["evaluation_source"] = str(evaluation)
+
+
 def collect_run(spec: RunSpec) -> dict:
     """Reduce one selected evaluation to scalars; failures cannot erase other rows."""
     row = dict.fromkeys(COLUMNS)
@@ -335,6 +391,9 @@ def collect_run(spec: RunSpec) -> dict:
             row.update(mode=_mode(record), lifecycle=record.get("status", "unknown"),
                        exit_code=record.get("exit_code"), run_error=record.get("error"))
             _apply_metadata(row, record)
+            if isinstance(record.get("patch_selection"), dict) and record["patch_selection"].get("selection") == "single":
+                _collect_single(row, record, _path(record.get("selection_workdir"), root))
+                return row
             if runner:
                 result_root = _path(record["result_directory"], root) if record.get("result_directory") else root / "result"
                 summary = record.get("synthesis")
@@ -383,6 +442,12 @@ def collect_run(spec: RunSpec) -> dict:
                 elif status in ("prepared", "refining"):
                     row["lifecycle"] = "running"
                 del record
+        elif (root / "patch-selection.json").is_file():
+            selected = _read_json(root / "patch-selection.json")
+            row.update(mode="single", lifecycle="selected", verified=False,
+                       binradar_verification="not_run")
+            _collect_single(row, selected, root)
+            return row
         elif (root / "segments").is_dir():
             summary, _ = _journal_result(root)
             result_root = root
@@ -406,7 +471,8 @@ def collect_run(spec: RunSpec) -> dict:
         row.update(collection_status="collection_error",
                    collection_error=f"{type(error).__name__}: {error}")
         row.update(collect_metrics(None, candidate_present=(row["predicate"] is not None
-                                                          or row["selected_round"] is not None)))
+                                                          or row["selected_round"] is not None
+                                                          or row["artifact_kind"] == "single-patch")))
     return row
 
 
@@ -448,7 +514,7 @@ def write_output(stream: TextIO, output_format: str, rows: list[dict], *,
                    "summary": summary}, stream, indent=2, ensure_ascii=False, allow_nan=False)
         stream.write("\n")
     else:
-        stream.write("Observed-cohort target results; not universal repair or FINAL verification.\n")
+        stream.write("Saved observed-cohort outcomes and recorded BinRadar verification; not universal repair.\n")
         for row in rows:
             if verbose == "compact":
                 stream.write("\n")

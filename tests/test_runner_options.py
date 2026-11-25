@@ -95,8 +95,6 @@ def test_normalization_preserves_lexical_symlink_parents(tmp_path, monkeypatch):
     ["--resume", "--run-id", "0", "--concrete-only"],
     ["--run-id", "l"],
     ["--resume", "--run-id", "0", "--stop-after", "warm"],
-    ["--resume", "--output", "result", "--mode", "manual", "--predicate", "1"],
-    ["--resume", "--output", "result", "--mode", "provider", "--provider-env", "provider.env"],
     ["--timeout", "1"], ["--no-llm"], ["--skip-concrete"], ["--only-concrete"], ["--outdir", "out"],
     ["--sub", "subject"], ["--max-executions", "10000"],
     ["--binradar-representative-budget", "-1"],

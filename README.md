@@ -1,10 +1,12 @@
 # taosc-llm
 
 Prepare immutable BinRadar evidence, evaluate an ERM predicate, and publish a manual
-or isolated Pi-driven predicate on the same cached runtime. Only explicit `ERM generic` and `ERM CWE-805`
-families are supported. This is a standalone backend: existing `taosc-fix` and
-`taosc-refine` orchestration is unchanged. Candidate evaluation is rejection-only,
-not final BinRadar verification or proof of repair.
+or isolated Pi-driven predicate on the same cached runtime. Predicate synthesis supports
+`ERM generic` and `ERM CWE-805`. The separate `taosc-llm-patch` selector prefers
+validated fixed Single artifacts, falling back to selected ERM metadata. Existing
+`taosc-fix` and `taosc-refine` orchestration is unchanged. Predicate evaluation is
+rejection-only, not final BinRadar verification or proof of repair; the runner's
+selected-Single path separately invokes ordinary BinRadar verification.
 
 ## Setup: import explicit producer runs
 
@@ -709,8 +711,15 @@ uv run --project utils/taosc-llm taosc-llm-collect-results \
 
 For no-LLM use its workdir and `--run-prefix taosc-llm-no-llm-out --mode no-llm`.
 Alternatively, repeat `--run-dir SAVED_RUN` to collect exact runner directories,
-standalone provider/manual outputs, or standalone no-LLM journals. This bypasses
-experiment discovery and does not select a new candidate.
+standalone provider/manual outputs, standalone no-LLM journals, or a selected
+`X-patch` workdir. This bypasses experiment discovery and does not select a new
+candidate. Authenticated Single workdirs are no longer classified as unsupported.
+Full output retains `selection`, patch family/site/destination, fixed artifact
+path/hash, publication, verification status, actual FINAL presence, and runner
+lifecycle even when verification failed. Single has no predicate and no invented
+cached-state candidate or neutral-capture metrics. Before a runner exists, its
+lifecycle is `selected`, never `finished` or verified. The collector rechecks the
+selected fixed artifact and evaluation hashes without running native code.
 
 ### Independent result axes
 
@@ -830,8 +839,82 @@ setuptools. These checks do not rerun subjects, models or FINAL.
 ## Experiment runner
 
 `taosc-llm-run` is the installed Python orchestrator; `python -m taosc_llm.runner`
-is equivalent. It replaces the Bash example, not production `taosc-fix` or FINAL.
-Default mode is `no-llm`; provider calls require explicit mode and credentials.
+is equivalent. It replaces the Bash example, not production `taosc-fix`.
+Default mode is `no-llm`; ERM provider calls require explicit mode and credentials.
+
+For the Single-first workflow, publish a fresh sibling workdir, then consume it:
+
+```sh
+uv run --project utils/taosc-llm taosc-llm-patch --subject SUBJECT --workdir X
+uv run --project utils/taosc-llm taosc-llm-run --subject SUBJECT --workdir X-patch
+```
+
+The runner authenticates `patch-selection.json` and automatically reuses its new
+selected-site concrete run. A contradictory explicit `--concrete-run` is an error.
+Selected ERM retains the normal dataset/cache/resident/synthesis path. Selected
+Single instead retains its fixed publication and runs ordinary BinRadar setup
+and verification in fresh attempt-local scratch, copying only authenticated
+inputs, never source output/cache trees. It does not request model credentials,
+REA, a dataset, a neutral cache or a resident generation server, in any mode.
+Ordinary setup must preserve the selected `.brpatched` hash; a changed rebuilt
+binary cannot inherit earlier observations. The source selection stays immutable.
+
+A fixed publication and a completed verification are separate facts. Setup
+rejection, FINAL rejection, partial/unavailable evidence, and operational failure
+remain distinct. `verified=true` requires an actual completed FINAL, verified
+concrete and mutation verdicts for candidate 1, and complete recorded mutation
+coverage. Missing FINAL is an error, never a skipped success. Selected publication
+survives later failure. Single requires a finite `--generation-timeout`; explicit
+`--stop-after generation|dataset|warm` retains the selected artifact without
+starting verification. Single cannot reuse ERM `--binradar-run`/`--replay-socket`.
+
+### Single-first selector
+
+`taosc-llm-patch` is the installed `python -m taosc_llm.patch` equivalent. It
+consumes a completed **common** `taosc-prepare` workdir (no `patch-stage.json`
+required) plus an explicit completed original-only `br-gen-con` run, and
+publishes a fresh sibling `<WORKDIR>-patch`. `taosc-patch-stage` must resolve on
+PATH (the Loftix `taosc` package or `TAOSC_PATCH_STAGE` override); a missing
+tool fails a candidate trial, and exhausting trials without an accepted Single
+publishes ERM only if its own stage succeeds. The source preparation and the
+corpus are never modified:
+
+```sh
+uv run --project utils/taosc-llm taosc-llm-patch \
+  --subject SUBJECT --workdir workdir-0.2.2-prepare \
+  --concrete-run workdir-0.2.2-prepare/out/br-gen-con-00000
+# Output selection is explicit instead of the default sibling.
+uv run --project utils/taosc-llm taosc-llm-patch --workdir X --concrete-run RUN \
+  --output X-patch --timeout 900 --setup-timeout 3600 --workers 4
+```
+
+Candidate order follows the prepared crash evidence: `Single CWE-617` for
+SIGABRT, `Single CWE-369`/`823`/`805` only at their applicable fault sites, then
+a clean `ERM generic`/`ERM CWE-805` preparation. Each Single trial is built by
+`taosc-patch-stage` in a private copy, filtered by ordinary `binradar-setup`, and
+then re-observed on every admitted concrete input. Acceptance requires:
+
+- the original executable still reaches the prepared site, and its saved
+  crash/normal outcome (and target fault) reproduces;
+- a target-crashing input becomes candidate-normal with a fired repair branch,
+  or a normal input stays normal (exit status/stdout changes are diagnostic,
+  including intentional unconditional CWE-617 repair);
+- an original crash at another site stays that same unrelated crash; a new or
+  target fault rejects.
+
+Rejection of one candidate continues to the next destination/trial; exhausting
+Single trials publishes clean ERM preparation without inventing a predicate or
+Single success. `unavailable` observation, timeout, changed artifact or malformed
+evidence is an **operational error** and publishes nothing; it is never treated
+as a successful Single or an exhausted search. `patch-selection.json` binds the
+source/workdir/corpus identities, trial verdicts and every published artifact by
+SHA-256; the concrete corpus must retain either the completed `done` or graceful
+`wall-time-reached` marker. Authentication rehashes artifacts and corpus rows.
+
+`taosc-llm-run` auto-detects the authenticated selection. Selected Single runs
+ordinary BinRadar setup/FINAL verification on a private copy; selected ERM
+continues the normal dataset/cache/synthesis path using the new selected-site
+corpus. The selector itself never runs FINAL and records `verified=false`.
 
 ```sh
 # Fresh concrete + resident producers, immutable dataset, warm, then search.
@@ -862,10 +945,10 @@ uv run --project utils/taosc-llm taosc-llm-run \
 `--subject` defaults to cwd; `--workdir` defaults to `workdir-0.1.24` relative to
 subject. Absolute workdirs are accepted; other supplied paths are relative to
 invocation cwd. Lexical symlink parents are preserved. Workdir `patch-format`
-wins, with subject fallback only when absent. Only `ERM generic`/`ERM CWE-805`
-proceed; other nonempty values emit JSON `status=skipped`, exit 0, and allocate
-nothing. Missing/invalid metadata is an error. Only concrete-only generation
-without synthesis bypasses the family check. Before reserving output or starting
+wins, with subject fallback only when absent. Without an authenticated selection,
+only `ERM generic`/`ERM CWE-805` proceed; unbound Single and unknown families are
+errors, not skipped successes. Missing/invalid metadata is an error. Only
+concrete-only generation without synthesis bypasses the family check. Before reserving output or starting
 producers, the runner checks positive 64-bit patch addresses, subject/POC settings,
 native timeout values, CWE allocator/stack metadata, and manual predicate grammar.
 A supplied dataset is authenticated. Provider synthesis parses only the explicit
@@ -985,7 +1068,8 @@ Operational warm/producer/build errors still stop the pipeline: a required
 resident that cannot establish its baseline is not a completed search outcome.
 Exit 124 means the runner killed an over-limit stage, not a cooperative search stop;
 130/143 mean SIGINT/SIGTERM; 1 means operational failure. Argparse errors use 2.
-Inspect status and synthesis evidence, not exit 0 alone. No path runs FINAL.
+Inspect status and saved evidence, not exit 0 alone. Only the authenticated
+selected-Single path runs ordinary FINAL; ERM synthesis remains scoped evaluation.
 Existing no-LLM live-mutation artifact-publication limits are unchanged.
 
 ### Resume and CLI cutover
@@ -996,7 +1080,13 @@ uv run --project utils/taosc-llm taosc-llm-run \
   --output EXISTING_RUN --resume --search-timeout 900
 ```
 
-Resume requires an initialized no-LLM search. It uses the recorded dataset,
+For selected Single, resume reauthenticates the recorded workdir, selection,
+artifacts and evaluation, preserves the publication, and starts a fresh ordinary
+verification attempt. It does not trust an old success flag or reuse old scratch.
+Repeat `--mode` for a nondefault-mode Single session. A changed selection fails
+before rewriting the saved run.
+
+Otherwise resume requires an initialized no-LLM search. It uses the recorded dataset,
 cache and result, adds a fresh attempt log directory, and never repeats setup,
 generation or warm. The engine checks code/runtime, budget and snapshot identity.
 The 10800-second/512-evaluation defaults apply to new no-LLM runs, not retroactive
@@ -1098,9 +1188,12 @@ are preserved. This is not a published Loftix release. The integration reference
 records actual package-build and installed-smoke results separately from live
 provider acceptance and final BinRadar verification.
 
-Seven installed wrappers are `taosc-llm`, `taosc-llm-run`, `taosc-llm-no-llm`,
-`taosc-llm-setup`, `taosc-llm-evaluate`, `taosc-llm-fixture`, and
-`taosc-llm-collect-results`. Source allowlists and the wheel
+Eight installed wrappers are `taosc-llm`, `taosc-llm-run`, `taosc-llm-patch`,
+`taosc-llm-no-llm`, `taosc-llm-setup`, `taosc-llm-evaluate`, `taosc-llm-fixture`, and
+`taosc-llm-collect-results`. The Guix selector wrapper resolves native
+`taosc-prepare`/`taosc-patch-stage` through an explicitly packaged, allowlisted
+checkout Taosc backend on PATH, rather than an older ambient profile.
+Source allowlists and the wheel
 exclude real `.env` files, credentials, workdirs, node_modules and caches. The
 wheel ships Python, `runtime.c`, prompts and adapter, not the SDK/native closure.
 Python 3.10+ is required; setup/evaluation/synthesis also require BinRadar native
@@ -1108,4 +1201,4 @@ resources. The read-only collector uses only the standard library. The local uv
 project uses the checkout BinRadar package. E9 overrides are `E9TOOL`/`E9COMPILE`; otherwise
 BinRadar resolves `e9patch@1.0.1`. Help does not require credentials/native discovery.
 See the [maintained reference](../../agent-docs/taosc-llm/README.md) for contracts
-and validation limits. Future Taosc orchestration remains a separate integration.
+and validation limits.

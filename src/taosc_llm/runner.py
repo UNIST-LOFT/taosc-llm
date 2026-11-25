@@ -1,4 +1,4 @@
-"""Supervise explicit evidence producers and scoped Taosc synthesis, never FINAL."""
+"""Supervise scoped ERM synthesis or authenticated Single normal verification."""
 
 from __future__ import annotations
 
@@ -134,10 +134,41 @@ def _subject_preflight(args, patch_format) -> None:
         parse_candidate(patch_format, args.predicate)
 
 
-def _preflight(args) -> str | None:
+def _bind_selection(args, expected=None) -> dict:
+    from .patch import load_patch_selection
+
+    selection = load_patch_selection(args.workdir)
+    if expected is not None and selection != expected:
+        raise ValueError("selected patch identity changed since the recorded run")
+    concrete = args.workdir / selection["concrete_run"]
+    if args.concrete_run is not None and args.concrete_run.resolve() != concrete.resolve():
+        raise ValueError("--concrete-run contradicts the authenticated selected concrete run")
+    args.concrete_run = concrete
+    args._patch_selection = selection
+    return selection
+
+
+def _synthesis_options(args) -> None:
+    if args.stop_after == "synthesis":
+        if args.mode == "manual" and args.predicate is None:
+            raise ValueError("manual synthesis requires --predicate")
+        if args.mode == "provider" and args.provider_env is None:
+            raise ValueError("provider synthesis requires explicit --provider-env")
+
+
+def _preflight(args) -> None:
     """Validate before reserving output or touching caller-owned producer data."""
     if args.resume:
         return None
+    if args.dataset is None and os.path.lexists(args.workdir / "patch-selection.json"):
+        selection = _bind_selection(args)
+        if selection["selection"] == "single":
+            if args.binradar_run is not None or args.replay_socket is not None:
+                raise ValueError("selected Single verification cannot reuse ERM mutation/replay runs")
+            if args.generation_timeout == 0:
+                raise ValueError("selected Single verification requires a finite --generation-timeout")
+            return None
+    _synthesis_options(args)
     if args.dataset is not None:
         from .dataset import load_dataset
         dataset = load_dataset(args.dataset)
@@ -156,7 +187,8 @@ def _preflight(args) -> str | None:
             if not patch_format:
                 raise ValueError(f"patch-format is empty: {format_path}")
             if patch_format not in ("ERM generic", "ERM CWE-805"):
-                return f"unsupported patch-format: {patch_format} ({format_path})"
+                raise ValueError(f"unsupported or unbound patch-format: {patch_format} ({format_path}); "
+                                 "prepare an authenticated taosc-llm-patch selection")
         if not (args.workdir / "patch-location").is_file():
             raise ValueError(f"{args.workdir} has no patch-location; prepare Taosc artifacts first")
         if not (args.subject / "config.env").is_file():
@@ -199,9 +231,27 @@ def _resume_record(root: Path, args) -> dict:
     if path.is_symlink():
         raise ValueError("runner summary must not be a symlink")
     record = _read_json(path)
-    if (record.get("schema_version") != 1 or record.get("engine") != "taosc-llm-run"
-            or record.get("mode") != "no-llm"):
-        raise ValueError("--resume requires a taosc-llm-run no-llm session")
+    if record.get("schema_version") != 1 or record.get("engine") != "taosc-llm-run":
+        raise ValueError("--resume requires a taosc-llm-run session")
+    selected = record.get("patch_selection")
+    if selected is not None:
+        source = record.get("selection_workdir")
+        if not isinstance(source, str) or not Path(source).is_absolute():
+            raise ValueError("runner selection workdir is missing")
+        if args._workdir_explicit and args.workdir.resolve() != Path(source).resolve():
+            raise ValueError("resume must preserve the recorded selection workdir")
+        args.workdir = Path(source)
+        _bind_selection(args, selected)
+        if selected["selection"] == "single":
+            if args.replay_socket is not None:
+                raise ValueError("selected Single verification cannot reuse ERM replay runs")
+            if args.mode != record.get("mode") or args.dataset is not None:
+                raise ValueError("Single resume must preserve the recorded mode and workdir selection")
+            if args.generation_timeout == 0:
+                raise ValueError("selected Single verification requires a finite --generation-timeout")
+            return record
+    if record.get("mode") != "no-llm" or args.mode != "no-llm":
+        raise ValueError("--resume requires a no-llm search or authenticated Single session")
     if not (root / "result" / "identity.json").is_file():
         raise ValueError("search was not initialized; reuse the prepared dataset in a fresh run")
     saved = record.get("options")
@@ -431,8 +481,110 @@ class Experiment:
             "verified", "binradar_verification") if key in result}
         return 0
 
+    def verify_single(self, selection: dict) -> int:
+        from binradar.binradar_collect_results import (
+            parse_final_coverage, parse_final_sbsv, parse_sbsv_line,
+        )
+        from binradar.binradar_setup import load_env
+        from .dataset import sha256
+
+        args = self.args
+        self.record["sources"] = {"concrete_run": str(args.concrete_run),
+                                  "binradar_run": None, "owns_concrete": False,
+                                  "owns_binradar": False}
+        self.record.update(verified=False, binradar_verification="not_run")
+        self.record["verification"] = {"status": "not_run", "final_observed": False}
+        self.persist()
+        if args.stop_after != "synthesis":
+            return 0
+        private = self.log / "verification-workdir"
+        private.mkdir(mode=0o700)
+        # Copy only authenticated workdir inputs, never source run/cache/trial trees.
+        # Every attempt gets fresh scratch, including resumed verification.
+        for artifact in selection["artifacts"].values():
+            relative = Path(artifact["path"])
+            if relative.parts[0] in ("out", "trials"):
+                continue
+            target = private / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(args.workdir / relative, target)
+        output = self.log / "verification"
+        verification = self.record["verification"]
+        verification.update(status="preparing", workdir=str(private), run_directory=str(output))
+        self.record["binradar_verification"] = "running"
+        self.persist()
+        try:
+            self.stage("prepare-single-verification", _python(
+                "binradar.binradar_setup", "setup", "-c", private, "-w", private),
+                cwd=private, structured=False)
+            artifact = selection["publication"]["artifact"]
+            if sha256(private / artifact["path"]) != artifact["sha256"]:
+                raise StageFailure("ordinary setup changed the selected Single artifact; "
+                                   "its earlier observations do not authenticate the rebuilt binary")
+            environment = load_env(private / "binradar.env")
+            filter_result = private / "filter.sbsv"
+            verification["setup_filter"] = {"path": str(filter_result), "sha256": sha256(filter_result)}
+            if environment.get("TOTAL_PATCHES") == "0":
+                # Actual setup rejection is an outcome, not an invented FINAL.
+                verification.update(status="rejected_setup", final_observed=False)
+                self.record["binradar_verification"] = "rejected"
+                self.persist()
+                return 0
+            if environment.get("TOTAL_PATCHES") != "1":
+                raise StageFailure("ordinary Single setup did not produce exactly candidate 1")
+            verification["status"] = "running"
+            self.persist()
+            command = _python("binradar.cli", "-w", private, "--output", output,
+                              "--timeout", args.generation_timeout)
+            if args.forkserver_child_timeout is not None:
+                command.extend(("--forkserver-child-timeout", str(args.forkserver_child_timeout)))
+            if args.binradar_representative_budget is not None:
+                command.extend(("--binradar-representative-budget", str(args.binradar_representative_budget)))
+            self.stage("single-verification", command, cwd=private, structured=False)
+            final = output / "final.sbsv"
+            if not final.is_file():
+                raise StageFailure("ordinary BinRadar returned without final.sbsv; verification is unavailable")
+            done = None
+            for line in final.read_text().splitlines():
+                row = parse_sbsv_line(line)
+                if row and row.get("_phase") == "final" and row.get("_action") == "done":
+                    done = row
+            if done is None:
+                raise StageFailure("ordinary BinRadar has no completed FINAL record")
+            verifier, mutation, _ = parse_final_sbsv(str(final))
+            coverage = parse_final_coverage(str(final))
+            concrete_verdict = verifier.get(1)
+            mutation_verdict = mutation.get(1, {}).get("res")
+            verification.update(final_observed=True, final_result=str(final),
+                                final_sha256=sha256(final), verifier=concrete_verdict,
+                                binradar=mutation_verdict, coverage=coverage)
+            if done.get("issues") == "true":
+                raise StageFailure("ordinary BinRadar FINAL reports failed evidence phases")
+            if concrete_verdict not in ("verified", "rejected"):
+                raise StageFailure("ordinary BinRadar FINAL has no concrete verdict for selected candidate 1")
+            if "rejected" in (concrete_verdict, mutation_verdict):
+                status = "rejected"
+            elif (concrete_verdict == mutation_verdict == "verified"
+                  and coverage.get("binradar-coverage") == "complete"
+                  and coverage.get("collection-complete") == "true"):
+                status = "verified"
+            else:
+                status = "unavailable"
+            verification["status"] = status
+            self.record.update(verified=status == "verified", binradar_verification=status)
+            self.persist()
+            return 0
+        except (OSError, ValueError, RuntimeError, KeyboardInterrupt):
+            verification["status"] = "failed"
+            self.record.update(verified=False, binradar_verification="failed")
+            self.persist()
+            raise
+
     def execute(self) -> int:
         args = self.args
+        selection = getattr(args, "_patch_selection", None)
+        if selection is not None and selection["selection"] == "single":
+            return self.verify_single(selection)
         dataset = args.dataset if args.dataset is not None else self.prepare()
         if dataset is None:
             return 0
@@ -476,11 +628,13 @@ def _execute(args, root, record, *, held_fds=()) -> int:
     code = 1
     try:
         with ExitStack() as lifetime:
-            if args.dataset is None and not args.resume:
-                # Hold the inode lock until every owned producer is reaped,
-                # including cleanup after exceptions and interruption.
+            selection = getattr(args, "_patch_selection", None)
+            if (args.dataset is None and not args.resume) or selection is not None:
+                # Hold source identity through every producer and verification child.
                 descriptor = lifetime.enter_context(_directory_lock(args.workdir, nofollow=False))
                 held_fds = (*held_fds, descriptor)
+                if selection is not None:
+                    _bind_selection(args, selection)
             supervisor = lifetime.enter_context(Supervisor(args.graceful_timeout, held_fds=held_fds))
             experiment = Experiment(args, root, record, supervisor)
             try:
@@ -525,17 +679,20 @@ def _execute(args, root, record, *, held_fds=()) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        skipped = _preflight(args)
-        if skipped:
-            print(json.dumps({"engine": "taosc-llm-run", "status": "skipped", "reason": skipped,
-                              "verified": False, "binradar_verification": "not_run"}))
-            return 0
+        _preflight(args)
         root = allocate_run(args)
         with _directory_lock(root) as run_lock:
             record = _resume_record(root, args) if args.resume else {
                 "schema_version": 1, "engine": "taosc-llm-run", "mode": args.mode,
                 "run_directory": str(root), "options": _options(args), "created_at": time.time(),
                 "verified": False, "binradar_verification": "not_run"}
+            selection = getattr(args, "_patch_selection", None)
+            if selection is not None:
+                record.update(patch_selection=selection, selection_workdir=str(args.workdir))
+                if selection["selection"] == "single":
+                    record.update(publication=selection["publication"], publication_status="published",
+                                  verified=False, binradar_verification="not_run",
+                                  verification={"status": "not_run", "final_observed": False})
             code = _execute(args, root, record, held_fds=(run_lock,))
             print(json.dumps(record, sort_keys=True))
             return code

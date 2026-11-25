@@ -12,6 +12,7 @@ dependencies = ["binradar>=0.2.0"]
 [project.scripts]
 taosc-llm = "taosc_llm.cli:main"
 taosc-llm-run = "taosc_llm.runner:main"
+taosc-llm-patch = "taosc_llm.patch:main"
 taosc-llm-collect-results = "taosc_llm.collect_results:main"
 taosc-llm-no-llm = "taosc_llm.no_llm.cli:main"
 taosc-llm-setup = "taosc_llm.cli:setup_main"

@@ -61,7 +61,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument("--mode", choices=("no-llm", "manual", "provider"), default="no-llm")
     parser.add_argument("--subject", type=Path)
-    parser.add_argument("--workdir", type=Path, default=Path("workdir-0.1.24"))
+    parser.add_argument("--workdir", type=Path)
     path_options = {
         "dataset": "existing immutable dataset; skip preparation and generation",
         "concrete-run": "completed concrete producer to reuse read-only; omitted: generate",
@@ -128,11 +128,6 @@ def parse_args(argv=None) -> argparse.Namespace:
         parser.error("--provider-env, --pi-sdk-root, --max-rounds and --session-feedback require --mode provider")
     if args.mode != "no-llm" and (args.search_timeout is not None or any(getattr(args, name) is not None for name in search_names)):
         parser.error("search options require --mode no-llm")
-    if args.stop_after == "synthesis":
-        if args.mode == "manual" and args.predicate is None:
-            parser.error("manual synthesis requires --predicate")
-        if args.mode == "provider" and args.provider_env is None:
-            parser.error("provider synthesis requires explicit --provider-env")
     if args.max_rounds is not None and args.max_rounds > 16:
         parser.error("--max-rounds must be between 1 and 16")
     if args.execution_workers > 32:
@@ -154,8 +149,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     if args.resume:
         if args.concrete_run is not None or args.binradar_run is not None or args.concrete_only:
             parser.error("--resume conflicts with --concrete-run, --binradar-run and --concrete-only")
-        if args.mode != "no-llm" or args.stop_after != "synthesis":
-            parser.error("--resume requires no-llm synthesis")
+        if args.stop_after != "synthesis":
+            parser.error("--resume requires synthesis")
         if args.output is None and args.run_id in (None, "n"):
             parser.error("--resume requires --output or a non-n --run-id")
 
@@ -176,13 +171,22 @@ def parse_args(argv=None) -> argparse.Namespace:
         args.run_id = "n"
     args.cwd = Path(os.getcwd())
     args.subject = _absolute(args.subject if args.subject is not None else args.cwd, args.cwd)
-    args.workdir = _absolute(args.workdir, args.subject)
+    args._workdir_explicit = args.workdir is not None
+    args.workdir = _absolute(args.workdir if args.workdir is not None else Path("workdir-0.1.24"), args.subject)
     for name in ("dataset", "concrete_run", "binradar_run", "replay_socket", "output", "provider_env", "pi_sdk_root"):
         value = getattr(args, name)
         if value is not None:
             setattr(args, name, _absolute(value, args.cwd))
     if args.rea is not None and "/" in args.rea:
         args.rea = str(_absolute(args.rea, args.cwd))
+    # Authentication belongs to preflight. The marker only defers requirements
+    # that a selected fixed artifact does not use; an invalid marker still fails.
+    selected = args.dataset is None and os.path.lexists(args.workdir / "patch-selection.json")
+    if not args.resume and not selected and args.stop_after == "synthesis":
+        if args.mode == "manual" and args.predicate is None:
+            parser.error("manual synthesis requires --predicate")
+        if args.mode == "provider" and args.provider_env is None:
+            parser.error("provider synthesis requires explicit --provider-env")
     return args
 
 

@@ -14,6 +14,7 @@
              (guix packages)
              (guix utils)
              (loftix fuzzing)
+             ((loftix synthesis) #:select (taosc))
              (srfi srfi-1)
              (srfi srfi-13))
 
@@ -95,6 +96,12 @@ This package supplies SDK imports, not npm CLI executable shims.")
                  (string-prefix? "tests/" relative))
              (string-suffix? ".py" relative)))))
 
+;; The Loftix package in this checkout applies patches/taosc-prepare.patch,
+;; which supplies taosc-prepare and taosc-patch-stage. Do not substitute the
+;; older utils/taosc tree or an ambient profile: the selector requires the
+;; preparation/patch-stage contract from this same checkout.
+(define local-taosc taosc)
+
 ;; The pinned Loftix package supplies the native dependency closure, but this
 ;; stage uses the current checkout's parser, metadata API and runtime resources.
 ;; Its Python inputs must propagate: BinRadar normally wraps only its own CLIs.
@@ -174,6 +181,7 @@ This package supplies SDK imports, not npm CLI executable shims.")
                       `("PATH" = (,(string-append #$gcc-toolchain "/bin")
                                    ,(string-append #$binutils "/bin")
                                    ,(string-append #$e9patch "/bin")
+                                   ,(string-append #$local-taosc "/bin")
                                    ,(string-append #$coreutils "/bin")
                                    ,(string-append #$bash-minimal "/bin")
                                    ,(string-append #$analysis-node "/bin")
@@ -190,9 +198,9 @@ This package supplies SDK imports, not npm CLI executable shims.")
                       `("TAOSC_LLM_NODE" = (,(string-append #$analysis-node "/bin/node")))
                       `("TAOSC_LLM_PI_SDK_ROOT" =
                         (,(string-append #$output "/share/taosc-llm/pi-sdk")))))
-                  '("taosc-llm" "taosc-llm-run" "taosc-llm-no-llm" "taosc-llm-setup" "taosc-llm-evaluate"
-                    "taosc-llm-fixture")))))))
-  (inputs (list analysis-node pi-sdk rea-runtime ghidra-runtime
+                  '("taosc-llm" "taosc-llm-run" "taosc-llm-patch" "taosc-llm-no-llm"
+                    "taosc-llm-setup" "taosc-llm-evaluate" "taosc-llm-fixture")))))))
+  (inputs (list local-taosc analysis-node pi-sdk rea-runtime ghidra-runtime
                 `(,openjdk21 "jdk") gcc-toolchain binutils e9patch
                 coreutils bash-minimal))
   (native-inputs (list python-setuptools python-pytest gcc-toolchain e9patch))

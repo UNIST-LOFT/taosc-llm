@@ -527,3 +527,77 @@ def test_negative_jobs_is_usage_error():
     with pytest.raises(SystemExit) as raised:
         main(["--jobs", "-1"])
     assert raised.value.code == 2
+
+
+def selected_single(root):
+    root.mkdir(parents=True)
+    (root / "fixture.brpatched").write_bytes(b"fixed selected artifact")
+    (root / "evaluation.json").write_text('{"status":"accepted","cases":[]}')
+    (root / "patch-format").write_text("Single CWE-617")
+    def reference(name):
+        return {"path": name, "sha256": hashlib.sha256((root / name).read_bytes()).hexdigest()}
+    selected = {"schema_version": 1, "kind": "single-first-selection", "status": "selected",
+                "selection": "single", "binary": "fixture", "patch_format": "Single CWE-617",
+                "patch_location": "0x401000", "patch_destination": "0x401010",
+                "evaluation": reference("evaluation.json"), "verified": False,
+                "binradar_verification": "not_run"}
+    selected["publication"] = {"kind": "single-patch", "status": "published",
+                               "artifact": reference("fixture.brpatched"),
+                               "verified": False, "binradar_verification": "not_run"}
+    save(root / "patch-selection.json", selected)
+    return selected
+
+
+@pytest.mark.parametrize("lifecycle,status,verified,final", [
+    ("finished", "verified", True, True), ("finished", "rejected", False, True),
+    ("finished", "unavailable", False, True), ("failed", "failed", False, False),
+    ("interrupted", "failed", False, False),
+])
+def test_fixed_single_collection_keeps_publication_separate_from_verification(
+        tmp_path, lifecycle, status, verified, final):
+    workdir = tmp_path / "selected"
+    selected = selected_single(workdir)
+    root = tmp_path / "run"
+    save(root / "run.json", {"engine": "taosc-llm-run", "mode": "provider",
+                            "status": lifecycle, "exit_code": 0 if lifecycle == "finished" else 1,
+                            "error": "native failure" if lifecycle != "finished" else None,
+                            "patch_selection": selected, "selection_workdir": str(workdir),
+                            "publication": selected["publication"], "publication_status": "published",
+                            "verified": verified, "binradar_verification": status,
+                            "verification": {"status": status, "final_observed": final}})
+    row = collect(root)
+    assert row["collection_error"] is None
+    assert row["predicate"] is None and row["publication_status"] == "published"
+    assert row["artifact_kind"] == "single-patch" and row["patch_format"] == "Single CWE-617"
+    assert row["artifact_path"] == str(workdir / "fixture.brpatched")
+    assert row["artifact_sha256"] == selected["publication"]["artifact"]["sha256"]
+    assert row["lifecycle"] == lifecycle and row["verified"] is verified
+    assert row["binradar_verification"] == row["verification_status"] == status
+    assert row["final_observed"] is final and row["final_admission"] == "fixed-artifact"
+    assert row["target_status"] == "not_observed" and row["candidate_total"] is None
+    assert row["evaluation_source"] == str(workdir / "evaluation.json")
+
+
+def test_selected_single_without_runner_is_not_an_unsupported_or_verified_run(tmp_path):
+    subject_root = tmp_path / "subject"
+    workdir = subject_root / "workdir-patch"
+    selected_single(workdir)
+    exp = tmp_path / "experiment.list"
+    exp.write_text("subject\n")
+    specs = discover_runs(exp, workdir="workdir-patch")
+    assert len(specs) == 1 and specs[0].directory == workdir
+    row = collect_all(specs)[0]
+    assert row["collection_error"] is None and row["lifecycle"] == "selected"
+    assert row["mode"] == "single" and row["publication_status"] == "published"
+    assert row["verified"] is False and row["binradar_verification"] == "not_run"
+    assert row["final_observed"] is False and row["predicate"] is None
+
+
+@pytest.mark.parametrize("name", ["fixture.brpatched", "evaluation.json"])
+def test_collector_detects_changed_selected_single_evidence(tmp_path, name):
+    selected_single(tmp_path / "selected")
+    (tmp_path / "selected" / name).write_bytes(b"tampered")
+    row = collect(tmp_path / "selected")
+    assert row["collection_status"] == "collection_error"
+    assert "checksum mismatch" in row["collection_error"]
+    assert row["predicate"] is None and row["artifact_kind"] == "single-patch"

@@ -138,16 +138,16 @@ def arguments(directory, workdir, output):
 
 
 @pytest.mark.parametrize("patch_format", ["Single CWE-805", "unknown", "  ERM CWE-119 \n"])
-def test_unsupported_family_skips_before_dependencies_or_output(tmp_path, monkeypatch, capsys, patch_format):
+def test_unbound_family_fails_before_dependencies_or_output(tmp_path, monkeypatch, capsys, patch_format):
     directory, workdir = subject(tmp_path, patch_format)
     (workdir / "patch-location").unlink()
     output = tmp_path / "result"
     monkeypatch.setenv("PATH", "")
     monkeypatch.delenv("TAOSC_LLM_REA", raising=False)
     code = main(arguments(directory, workdir, output))
-    assert code == 0
-    result = json.loads(capsys.readouterr().out)
-    assert result["status"] == "skipped" and not result["verified"]
+    assert code == 1
+    result = capsys.readouterr()
+    assert not result.out and "unsupported or unbound patch-format" in result.err
     assert not output.exists()
 
 
@@ -350,3 +350,209 @@ def test_invalid_manual_predicate_fails_before_producers(tmp_path, capsys):
     assert main(arguments(directory, workdir, output) + ["--mode", "manual", "--predicate", "rax ==="]) == 1
     assert not output.exists()
     assert "taosc-llm-run:" in capsys.readouterr().err
+
+
+@pytest.fixture
+def selected_contract(tmp_path, monkeypatch):
+    """Real supervisor children; native verification and selector auth are unit boundaries."""
+    import hashlib
+    from taosc_llm import patch, runner
+
+    directory, workdir = subject(tmp_path, "Single CWE-617")
+    (workdir / "config.env").write_bytes((directory / "config.env").read_bytes())
+    (workdir / "fixture.orig").write_bytes(b"original fixture")
+    (workdir / "fixture.brpatched").write_bytes(b"selected fixed fixture")
+    (workdir / "evaluation.json").write_text('{"status":"accepted","cases":[]}')
+    concrete = workdir / "out" / "br-gen-con"
+    concrete.mkdir(parents=True)
+    (concrete / "minimizer.sbsv").write_text("fresh selected-site evidence")
+    (workdir / "out" / "private-cache").write_text("must not copy")
+    (workdir / "trials").mkdir()
+    (workdir / "trials" / "diagnostic").write_text("must not copy")
+    def reference(path):
+        return {"path": str(path.relative_to(workdir)),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    artifacts = {path.name: reference(path) for path in workdir.iterdir() if path.is_file()}
+    selection = {"schema_version": 1, "kind": "single-first-selection", "status": "selected",
+                 "selection": "single", "binary": "fixture", "patch_format": "Single CWE-617",
+                 "patch_location": "0x401000", "patch_destination": "0x401010",
+                 "concrete_run": "out/br-gen-con", "artifacts": artifacts,
+                 "evaluation": reference(workdir / "evaluation.json"), "verified": False,
+                 "binradar_verification": "not_run"}
+    selection["publication"] = {"kind": "single-patch", "status": "published",
+                                "artifact": reference(workdir / "fixture.brpatched"),
+                                "patch_format": selection["patch_format"],
+                                "patch_location": selection["patch_location"],
+                                "patch_destination": selection["patch_destination"],
+                                "verified": False, "binradar_verification": "not_run"}
+    (workdir / "patch-selection.json").write_text(json.dumps(selection))
+    contract = {"selection": selection, "workdir": workdir, "subject": directory,
+                "outcome": "verified", "calls": [], "authentications": 0}
+    def authenticate(path):
+        assert path == workdir
+        contract["authentications"] += 1
+        record = json.loads((path / "patch-selection.json").read_text())
+        for item in record["artifacts"].values():
+            if hashlib.sha256((path / item["path"]).read_bytes()).hexdigest() != item["sha256"]:
+                raise ValueError("selected artifact checksum mismatch")
+        return record
+    monkeypatch.setattr(patch, "load_patch_selection", authenticate)
+    def forbidden(*args, **kwargs):
+        pytest.fail("selected Single must bypass ERM/provider/REA preparation")
+    contract["prepare"] = runner.Experiment.prepare
+    monkeypatch.setattr(runner, "_provider_preflight", forbidden)
+    monkeypatch.setattr(runner.Experiment, "prepare", forbidden)
+    monkeypatch.setattr(runner.Experiment, "synthesize", forbidden)
+    monkeypatch.setattr(runner, "_cli", forbidden)
+    def command(module, *values):
+        contract["calls"].append((module, tuple(map(str, values))))
+        values = list(map(str, values))
+        private = Path(values[values.index("-w") + 1])
+        assert not (private / "out").exists() and not (private / "trials").exists()
+        assert (private / "fixture.orig").read_bytes() == b"original fixture"
+        if module == "binradar.binradar_setup":
+            total = 0 if contract["outcome"] == "setup-rejected" else 1
+            passed = "false" if total == 0 else "true"
+            text = ("from pathlib import Path; "
+                    f"p=Path({str(private)!r}); "
+                    f"(p/'binradar.env').write_text('TOTAL_PATCHES={total}\\n'); "
+                    f"(p/'filter.sbsv').write_text('[filter] [res] [id 1] [pass {passed}] [new-id {1 if total else -1}]\\n')")
+            if contract["outcome"] == "changed-artifact":
+                text += "; (p/'fixture.brpatched').write_bytes(b'changed')"
+        else:
+            assert module == "binradar.cli" and "--generate-binradar" not in values
+            assert "--timeout" in values
+            output = Path(values[values.index("--output") + 1])
+            verdict = "rejected" if contract["outcome"] == "rejected" else "verified"
+            coverage = "partial" if contract["outcome"] == "partial" else "complete"
+            final = (f"[final] [verifier] [patch 1] [res {verdict}]\n"
+                     f"[final] [binradar] [patch 1] [res {verdict}] [reason none] [iter -1]\n"
+                     f"[final] [coverage] [binradar-coverage {coverage}] [collection-complete true]\n"
+                     "[final] [done] [prefix run] [id 0] [remaining_patches [1]] "
+                     "[binradar_remaining_patches [1]]\n")
+            text = f"from pathlib import Path; p=Path({str(output)!r}); p.mkdir(); "
+            if contract["outcome"] != "missing-final":
+                text += f"(p/'final.sbsv').write_text({final!r}); "
+            text += f"raise SystemExit({1 if contract['outcome'] == 'failed' else 0})"
+        return [sys.executable, "-c", text]
+    monkeypatch.setattr(runner, "_python", command)
+    return contract
+
+
+@pytest.mark.parametrize("mode", ["no-llm", "manual", "provider"])
+def test_selected_single_all_modes_verify_without_model_or_erm_requirements(
+        tmp_path, capsys, selected_contract, mode):
+    contract = selected_contract
+    workdir = contract["workdir"]
+    before = {str(path.relative_to(workdir)): path.read_bytes()
+              for path in workdir.rglob("*") if path.is_file()}
+    output = tmp_path / "run"
+    assert main(arguments(contract["subject"], workdir, output) + ["--mode", mode]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["verified"] is True and result["binradar_verification"] == "verified"
+    assert result["verification"]["final_observed"] is True
+    assert result["publication"] == contract["selection"]["publication"]
+    assert result["sources"]["concrete_run"] == str(workdir / "out/br-gen-con")
+    assert "dataset" not in result and "synthesis" not in result and "warm" not in result
+    assert not (output / "cache").exists() and not (output / "binradar").exists()
+    assert len(contract["calls"]) == 2
+    assert before == {str(path.relative_to(workdir)): path.read_bytes()
+                      for path in workdir.rglob("*") if path.is_file()}
+
+
+@pytest.mark.parametrize("outcome,code,status,final", [
+    ("rejected", 0, "rejected", True), ("setup-rejected", 0, "rejected", False),
+    ("partial", 0, "unavailable", True),
+    ("failed", 1, "failed", False), ("missing-final", 1, "failed", False),
+    ("changed-artifact", 1, "failed", False),
+])
+def test_selected_single_retains_publication_without_fabricating_verification(
+        tmp_path, capsys, selected_contract, outcome, code, status, final):
+    contract = selected_contract
+    contract["outcome"] = outcome
+    assert main(arguments(contract["subject"], contract["workdir"], tmp_path / "run")) == code
+    result = json.loads(capsys.readouterr().out)
+    assert result["verified"] is False and result["binradar_verification"] == status
+    assert result["verification"]["final_observed"] is final
+    assert result["publication"] == contract["selection"]["publication"]
+    assert result["publication_status"] == "published"
+    assert result["status"] == ("finished" if code == 0 else "failed")
+
+
+def test_selected_single_resume_reauthenticates_and_uses_fresh_scratch(
+        tmp_path, capsys, selected_contract):
+    contract = selected_contract
+    output = tmp_path / "run"
+    assert main(arguments(contract["subject"], contract["workdir"], output)) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert main(["--output", str(output), "--resume"]) == 0
+    resumed = json.loads(capsys.readouterr().out)
+    assert len(resumed["attempts"]) == 2 and contract["authentications"] == 4
+    assert resumed["verification"]["workdir"] != first["verification"]["workdir"]
+    before = (output / "run.json").read_bytes()
+    (contract["workdir"] / "fixture.brpatched").write_bytes(b"tampered")
+    assert main(["--output", str(output), "--resume"]) == 1
+    assert "checksum mismatch" in capsys.readouterr().err
+    assert (output / "run.json").read_bytes() == before
+
+
+def test_selected_concrete_handoff_refuses_explicit_other_source(
+        tmp_path, capsys, selected_contract):
+    contract = selected_contract
+    output = tmp_path / "run"
+    assert main(arguments(contract["subject"], contract["workdir"], output) + [
+        "--concrete-run", str(tmp_path / "old-concrete")]) == 1
+    assert "contradicts" in capsys.readouterr().err
+    assert not output.exists() and not contract["calls"]
+
+
+def test_selected_erm_automatically_reuses_fresh_concrete(
+        tmp_path, capsys, monkeypatch, selected_contract):
+    contract = selected_contract
+    workdir = contract["workdir"]
+    selection = contract["selection"]
+    selection.update(selection="erm", patch_format="ERM generic")
+    (workdir / "patch-format").write_text("ERM generic")
+    import hashlib
+    selection["artifacts"]["patch-format"]["sha256"] = hashlib.sha256(b"ERM generic").hexdigest()
+    selection.pop("publication")
+    (workdir / "patch-selection.json").write_text(json.dumps(selection))
+    # Generation-only handoff needs no cached artifact, resident, REA, or model.
+    from taosc_llm import runner
+    monkeypatch.setattr(runner.Experiment, "prepare", contract["prepare"])
+    assert main(arguments(contract["subject"], workdir, tmp_path / "run") + [
+        "--concrete-only", "--stop-after", "generation"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["sources"]["concrete_run"] == str(workdir / "out/br-gen-con")
+    assert result["sources"]["owns_concrete"] is False
+    assert result["patch_selection"]["selection"] == "erm"
+    other = tmp_path / "other-run"
+    assert main(arguments(contract["subject"], workdir, other) + [
+        "--concrete-only", "--stop-after", "generation",
+        "--concrete-run", str(tmp_path / "old-site")]) == 1
+    assert "contradicts" in capsys.readouterr().err and not other.exists()
+
+
+@pytest.mark.parametrize("extra", [
+    ["--generation-timeout", "0"], ["--binradar-run", "old-mutation"],
+])
+def test_selected_single_rejects_incompatible_runtime_options_before_output(
+        tmp_path, capsys, selected_contract, extra):
+    contract = selected_contract
+    output = tmp_path / "run"
+    assert main(arguments(contract["subject"], contract["workdir"], output) + extra) == 1
+    assert not output.exists() and not contract["calls"]
+    assert "selected Single verification" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("stop", ["generation", "dataset", "warm"])
+def test_selected_single_explicit_stop_keeps_unverified_publication(
+        tmp_path, capsys, selected_contract, stop):
+    contract = selected_contract
+    assert main(arguments(contract["subject"], contract["workdir"], tmp_path / "run") + [
+        "--stop-after", stop]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["publication_status"] == "published"
+    assert result["verified"] is False and result["binradar_verification"] == "not_run"
+    assert result["verification"]["final_observed"] is False
+    assert not contract["calls"]
