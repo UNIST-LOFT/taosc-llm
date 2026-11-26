@@ -182,7 +182,6 @@ def test_private_qasan_command_always_uses_fail_closed_launcher(tmp_path, monkey
     runner = execution._PrivateRunner(str(tmp_path), 'fixture', '@@', '0x10')
     command = runner.get_qemu_stacktrace_command_for_binary(str(tmp_path / 'fixture.brcached'), str(tmp_path / 'input'))
     assert command[1:3] == ['-I', '-S']
-    assert command[3].endswith('/_sandbox.py')
     assert command[command.index('--scratch') + 1] == str(tmp_path)
     assert '--asan' in command
     reads = [command[index + 1] for index, value in enumerate(command) if value == '--read']

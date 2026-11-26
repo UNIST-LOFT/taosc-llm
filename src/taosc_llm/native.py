@@ -5,9 +5,10 @@ import shutil
 import signal
 import subprocess
 import sys
-from importlib.resources import files
 from pathlib import Path
 from tempfile import TemporaryDirectory, TemporaryFile
+
+from binradar import paths
 
 _SYSTEM_READ = ("/usr", "/bin", "/lib", "/lib64", "/gnu/store", "/etc/ld.so.cache")
 
@@ -53,7 +54,7 @@ def run_native(command: list[str], scratch: Path, *, timeout: int = 300,
         raise FileNotFoundError("native executable is unavailable")
     command = [str(Path(executable).absolute()), *command[1:]]
     scratch = Path(scratch).resolve(strict=True)
-    launcher = str(files("taosc_llm").joinpath("_sandbox.py"))
+    launcher = paths.OBSERVATION_SANDBOX_SCRIPT
     roots = [Path(path) for path in _SYSTEM_READ]
     roots.extend(readable)
     roots.append(Path(command[0]))

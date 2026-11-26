@@ -8,7 +8,6 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
-from importlib.resources import files
 
 from binradar import paths
 from binradar import binradar_verifier as verifier
@@ -40,7 +39,7 @@ class _PrivateRunner(verifier.BinRadarQemuRunner):
         library = Path(command[0]).with_name('libqasan.so')
         if not library.is_file() or not os.access(library, os.R_OK | os.X_OK):
             raise ExecutionUnavailable('qasan-library-unavailable')
-        launcher = str(files('taosc_llm').joinpath('_sandbox.py'))
+        launcher = paths.OBSERVATION_SANDBOX_SCRIPT
         argv = [sys.executable, '-I', '-S', launcher, '--scratch', self.dir,
                 '--qemu-self-maps', '--timeout', str(max(1, math.ceil(self.exec_timeout)))]
         for root in (*_SYSTEM_READ, command[0], library):

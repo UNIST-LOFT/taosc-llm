@@ -1146,6 +1146,11 @@ starting or replacing producers.
 
 ## Native isolation and harmless fixture
 
+Native and QASAN workers use the sandbox launcher shipped in the `binradar`
+package through `binradar.paths.OBSERVATION_SANDBOX_SCRIPT`; install the matching
+BinRadar package rather than supplying a taosc-llm checkout resource. See the
+[shared resource contract](../../agent-docs/BINRADAR.md#native-tool-and-resource-paths).
+
 Native builds and execution require Linux x86-64 Landlock + seccomp, private
 writable scratch, bounded resources and no networking. Isolation failure is
 fatal: no unsandboxed fallback. Credentials use a separate inherited pipe to
